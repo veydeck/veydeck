@@ -1,0 +1,17 @@
+[Unit]
+Description=Veydeck Distributed Telemetry Agent
+After=network.target veydeck.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=__VEYDECK_HOME__
+Environment=VEYDECK_HOME=__VEYDECK_HOME__
+ExecStart=/usr/local/bin/veydeck-agent start
+Restart=always
+RestartSec=10
+TimeoutStopSec=20s
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=Veydeck Control Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=__VEYDECK_HOME__
+Environment=VEYDECK_HOME=__VEYDECK_HOME__
+ExecStart=/usr/local/bin/veydeck start
+Restart=always
+RestartSec=5
+TimeoutStopSec=20s
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
