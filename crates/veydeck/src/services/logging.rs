@@ -2826,6 +2826,40 @@ mod tests {
         assert!(!parameters.contains("unregistered"));
     }
 
+    /// 套件安装失败通知保留业务错误码与公开提示，供界面本地化。
+    #[tokio::test]
+    async fn suite_install_failure_notification_preserves_business_error() {
+        let pool = setup_test_db().await;
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (1, 'admin', 'hash')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut builder = OperationEventBuilder::new(
+            "admin",
+            "suite_install_failed",
+            "127.0.0.1".parse().unwrap(),
+        )
+        .user_id(1)
+        .target_type("suite_instance")
+        .target_id("instance-1")
+        .metadata(serde_json::json!({
+            "errorCode": "SUITE_RETAINED_DATA_REQUIRES_ADOPTION",
+            "error": "Adopt retained suite data and install again.",
+            "task_id": "task-1",
+        }));
+        builder.prepare_for_storage();
+        insert_event(&pool, &builder.event).await.unwrap();
+        let (code, summary): (String, String) = sqlx::query_as(
+            "SELECT error_code, error_summary FROM user_notifications WHERE recipient_user_id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(code, "SUITE_RETAINED_DATA_REQUIRES_ADOPTION");
+        assert_eq!(summary, "Adopt retained suite data and install again.");
+        assert!(!summary.contains("runtime api error"));
+    }
+
     #[tokio::test]
     async fn file_task_items_are_audited_but_not_projected_into_notification_content() {
         let pool = setup_test_db().await;

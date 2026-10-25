@@ -328,7 +328,21 @@ watch(pageSize, () => {
 })
 watch(currentPage, () => void refresh())
 
-void initHome().then(async () => {
+/** 优先打开调用方指定目录；保持已打开窗口也能接收新的目录导航。 */
+async function openRequestedDirectory() {
+  const path = props.payload?.path
+  if (typeof props.payload?.nodeId === 'string') targetNodeId.value = props.payload.nodeId
+  if (typeof path === 'string' && path.startsWith('/')) {
+    await setPath(path)
+  } else {
+    await initHome()
+  }
+}
+watch(
+  () => props.payload,
+  () => void openRequestedDirectory(),
+)
+void openRequestedDirectory().then(async () => {
   const resumed = await runFileOperation(resumeActiveTasks)
   if (resumed) await refresh()
   await runFileOperation(resumeActiveTransfers)

@@ -26,12 +26,14 @@ vi.mock('@veydeck/suite-sdk', () => ({
   },
 }))
 
+const windowActions = vi.hoisted(() => ({ openWindowWithPayload: vi.fn() }))
+
 vi.mock('@/stores/window-manager', () => ({
   useWindowManagerStore: () => ({
     openWindows: [],
     maxZIndex: 1,
     focusWindow: vi.fn(),
-    openWindowWithPayload: vi.fn(),
+    openWindowWithPayload: windowActions.openWindowWithPayload,
   }),
 }))
 
@@ -46,6 +48,33 @@ describe('SuiteWebAppView material sync', () => {
     sdk.bridge.sendLocale.mockClear()
     sdk.bridge.destroy.mockClear()
     sdk.createSuiteHostBridge.mockClear()
+  })
+
+  it('文件导航固定使用套件所在节点', async () => {
+    shallowMount(SuiteWebAppView, {
+      props: { payload: { url: 'https://suite.example.test/', nodeId: 'suite-node' } },
+      global: {
+        plugins: [createPinia(), createI18n({ legacy: false, locale: 'zh', messages: { zh: {} } })],
+      },
+    })
+    await flushPromises()
+    const options = sdk.createSuiteHostBridge.mock.calls[0]?.[0]
+    options?.onReady({ capabilities: ['navigation'] })
+    options?.onMessage({
+      type: 'suite:navigation:open',
+      payload: {
+        target: 'app',
+        value: 'file-manager',
+        payload: {
+          path: '/opt/veydeck/data/www/websites/sites/example.com/index',
+          nodeId: 'other-node',
+        },
+      },
+    })
+    expect(windowActions.openWindowWithPayload).toHaveBeenCalledWith('file-manager', {
+      path: '/opt/veydeck/data/www/websites/sites/example.com/index',
+      nodeId: 'suite-node',
+    })
   })
 
   it('sends the initial preference and resends after it changes', async () => {

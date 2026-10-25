@@ -146,6 +146,32 @@ describe('FileManagerView', () => {
     })
   })
 
+  it('打开传入的网站目录，并接收后续目录导航', async () => {
+    api.listEntries.mockImplementation(({ path }: { path: string }) =>
+      Promise.resolve(response(page(path, []))),
+    )
+    const wrapper = mount(FileManagerView, {
+      props: {
+        payload: { nodeId: 'node-a', path: '/opt/veydeck/data/www/websites/sites/a.test/index' },
+      },
+      global: { plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })] },
+    })
+    await flushPromises()
+    expect(api.home).not.toHaveBeenCalled()
+    expect(api.listEntries).toHaveBeenCalledWith(
+      expect.objectContaining({ path: '/opt/veydeck/data/www/websites/sites/a.test/index' }),
+    )
+    await wrapper.setProps({
+      payload: { nodeId: 'node-b', path: '/opt/veydeck/data/www/websites/sites/b.test/index' },
+    })
+    await flushPromises()
+    expect(api.forNode).toHaveBeenCalledWith('node-b')
+    expect(api.listEntries).toHaveBeenLastCalledWith(
+      expect.objectContaining({ path: '/opt/veydeck/data/www/websites/sites/b.test/index' }),
+    )
+    wrapper.unmount()
+  })
+
   it('固定使用窗口节点并让最新路径请求获胜', async () => {
     const wrapper = mount(FileManagerView, {
       props: { payload: { nodeId: 'node-a' } },

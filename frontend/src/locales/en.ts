@@ -134,6 +134,10 @@ const en = {
       usernameInvalid: 'Username must be 1-64 letters, digits, underscore, or hyphen.',
     },
     errors: {
+      SUITE_RETAINED_DATA_REQUIRES_ADOPTION:
+        'Retained suite data was found. Select “Adopt previously retained suite data” and install again.',
+      SUITE_RESOURCE_IN_USE:
+        'This suite’s data is in use by another instance. Uninstall that instance first.',
       controlServiceUnavailable: 'Please check whether the control service is running',
       FILE_INVALID_PATH: 'Enter a valid absolute file path.',
       FILE_NOT_FOUND: 'The file or directory no longer exists.',
@@ -221,6 +225,7 @@ const en = {
         'Delete {name} from Suite Center? This package must be imported again to reinstall it.',
       deleteMessage:
         'Delete {name} from Suite Center? You will need to import the suite package again before installing it.',
+      adoptRetainedData: 'Adopt previously retained suite data, if any',
       removeData: 'Also delete suite data',
       removeDataWarning:
         'This will delete data volumes declared by the suite and cannot be undone.',

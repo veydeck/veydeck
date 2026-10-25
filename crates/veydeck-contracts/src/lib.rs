@@ -13,6 +13,7 @@ pub mod runtime_docker;
 pub mod runtime_logs;
 pub mod scheduled_tasks;
 pub mod scripts;
+pub mod suite_resources;
 pub mod telemetry;
 pub mod terminal;
 pub mod types;

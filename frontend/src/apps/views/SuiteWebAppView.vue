@@ -135,6 +135,10 @@ function handleSuiteNavigation(payload: unknown) {
     navigation.payload && typeof navigation.payload === 'object'
       ? (navigation.payload as Record<string, unknown>)
       : {}
+  // 文件管理始终绑定发起请求的套件节点，不能由套件载荷覆盖节点。
+  if (appId === 'file-manager') {
+    appPayload.nodeId = props.payload?.nodeId
+  }
   windowManagerStore.openWindowWithPayload(appId, appPayload)
 }
 

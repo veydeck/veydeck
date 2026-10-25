@@ -72,6 +72,7 @@ export interface SuiteInstallTaskResponse {
   currentImage?: string
   isFinished: boolean
   error?: string
+  errorCode?: string
   cancelRequested: boolean
   recoveryStartedAt?: string
   createdAt: string

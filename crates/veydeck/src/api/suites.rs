@@ -4,12 +4,12 @@ use crate::api::auth::AuthenticatedAdmin;
 use crate::models::NodeRuntimeClient;
 use crate::models::desktop_apps::{delete_desktop_apps, hide_suite_desktop_apps};
 use crate::models::logging::LogModule;
-use crate::models::node_runtime_client::AgentOperationContext;
+use crate::models::node_runtime_client::{AgentOperationContext, RuntimeApiError};
 use crate::models::suites::{
     SuiteAppEntryManifest, SuiteAppEntryRecord, SuiteInstallTaskRecord, SuiteInstanceSummary,
     SuiteManifest, SuitePackageFile, SuitePackageSnapshot, delete_catalog_item, delete_instance,
-    delete_instance_app_entries, fetch_catalog_payload, fetch_install_task, fetch_instance,
-    fetch_instance_by_suite_and_node, insert_install_task, insert_instance,
+    delete_instance_app_entries, fail_install_task, fetch_catalog_payload, fetch_install_task,
+    fetch_instance, fetch_instance_by_suite_and_node, insert_install_task, insert_instance,
     install_task_cancel_requested, list_install_tasks, list_suites, mark_install_task_canceling,
     mark_install_task_recovery_pending, replace_instance_app_entries, suite_has_instances,
     update_install_task, update_instance_status, upsert_catalog_item,
@@ -80,6 +80,8 @@ pub fn suite_install_tasks_router() -> Router<Arc<AppState>> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstallSuiteRequest {
+    #[serde(default)]
+    pub adopt_retained_data: bool,
     pub node_id: Option<String>,
 }
 
@@ -115,6 +117,10 @@ pub struct UninstallSuiteRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentSuiteInstallRequest {
+    #[serde(default)]
+    adopt_retained_data: bool,
+    #[serde(default)]
+    resources: Option<veydeck_contracts::suite_resources::SuiteResources>,
     instance_id: String,
     suite_id: String,
     version: String,
@@ -493,6 +499,8 @@ pub async fn install_suite(
         compose_file: manifest.runtime.compose_file.clone(),
         runtime_images: normalize_runtime_images(&manifest.runtime.images),
         agent_access: manifest.runtime.agent.clone(),
+        resources: manifest.runtime.resources.clone(),
+        adopt_retained_data: payload.adopt_retained_data,
         files: package.files,
         app_entries: manifest.app_entries,
     };
@@ -508,6 +516,7 @@ pub async fn install_suite(
         current_image: None,
         is_finished: false,
         error: None,
+        error_code: None,
         cancel_requested: false,
         recovery_started_at: None,
         created_at: String::new(),
@@ -766,6 +775,7 @@ async fn run_suite_install_task(
             &state,
             &audit_ctx,
             SuiteInstallTaskLog {
+                error_code: None,
                 event: "suite_install_canceled",
                 task_id: &task_id,
                 node_id: &node_id,
@@ -807,6 +817,7 @@ async fn run_suite_install_task(
             &state,
             &audit_ctx,
             SuiteInstallTaskLog {
+                error_code: None,
                 event: if canceled {
                     "suite_install_canceled"
                 } else {
@@ -854,6 +865,7 @@ async fn run_suite_install_task(
                 &state,
                 &audit_ctx,
                 SuiteInstallTaskLog {
+                    error_code: None,
                     event: "suite_install_failed",
                     task_id: &task_id,
                     node_id: &node_id,
@@ -897,6 +909,7 @@ async fn run_suite_install_task(
                     &state,
                     &audit_ctx,
                     SuiteInstallTaskLog {
+                        error_code: None,
                         event: "suite_install_canceled",
                         task_id: &task_id,
                         node_id: &node_id,
@@ -906,17 +919,27 @@ async fn run_suite_install_task(
                     },
                 );
             } else {
-                update_install_progress(
+                let runtime_error = err.downcast_ref::<RuntimeApiError>();
+                let error_code = runtime_error.and_then(|error| error.error_code);
+                let summary =
+                    runtime_error
+                        .filter(|error| {
+                            matches!(error.error_code,
+                        Some(veydeck_contracts::api::ErrorCode::SuiteRetainedDataRequiresAdoption
+                            | veydeck_contracts::api::ErrorCode::SuiteResourceInUse))
+                        })
+                        .map(|error| error.message.as_str())
+                        .unwrap_or(&detail);
+                if let Err(error) = fail_install_task(
                     &state.metadata_db,
                     &task_id,
-                    100,
-                    "failed",
-                    "failed",
-                    None,
-                    true,
-                    Some(detail),
+                    summary,
+                    error_code.map(|code| code.as_str()),
                 )
-                .await;
+                .await
+                {
+                    tracing::error!(task_id, %error, "failed to persist suite installation failure");
+                }
                 let progress = fetch_install_task(&state.metadata_db, &task_id)
                     .await
                     .ok()
@@ -925,6 +948,9 @@ async fn run_suite_install_task(
                     &state,
                     &audit_ctx,
                     SuiteInstallTaskLog {
+                        error_code: progress
+                            .as_ref()
+                            .and_then(|item| item.error_code.as_deref()),
                         event: "suite_install_failed",
                         task_id: &task_id,
                         node_id: &node_id,
@@ -954,6 +980,7 @@ async fn run_suite_install_task(
             &state,
             &audit_ctx,
             SuiteInstallTaskLog {
+                error_code: None,
                 event: "suite_install_canceled",
                 task_id: &task_id,
                 node_id: &node_id,
@@ -982,6 +1009,7 @@ async fn run_suite_install_task(
                 &state,
                 &audit_ctx,
                 SuiteInstallTaskLog {
+                    error_code: None,
                     event: "suite_install_canceled",
                     task_id: &task_id,
                     node_id: &node_id,
@@ -1006,6 +1034,7 @@ async fn run_suite_install_task(
                 &state,
                 &audit_ctx,
                 SuiteInstallTaskLog {
+                    error_code: None,
                     event: "suite_install_failed",
                     task_id: &task_id,
                     node_id: &node_id,
@@ -1037,6 +1066,7 @@ async fn run_suite_install_task(
             &state,
             &audit_ctx,
             SuiteInstallTaskLog {
+                error_code: None,
                 event: "suite_install_failed",
                 task_id: &task_id,
                 node_id: &node_id,
@@ -1063,6 +1093,7 @@ async fn run_suite_install_task(
         &state,
         &audit_ctx,
         SuiteInstallTaskLog {
+            error_code: None,
             event: "suite_install_completed",
             task_id: &task_id,
             node_id: &node_id,
@@ -1176,6 +1207,7 @@ struct SuiteInstallTaskLog<'a> {
     instance_id: &'a str,
     request: &'a AgentSuiteInstallRequest,
     error: Option<&'a str>,
+    error_code: Option<&'a str>,
 }
 
 /// 写入主控侧套件安装后台任务终态日志。
@@ -1194,6 +1226,7 @@ fn finish_suite_install_task_log(
             target_type: "suite_instance",
             target_id: log.instance_id,
             metadata: serde_json::json!({
+                "errorCode": log.error_code,
                 "suite_id": log.request.suite_id,
                 "version": log.request.version,
                 "instance_id": log.instance_id,
@@ -1284,6 +1317,18 @@ async fn persist_install_progress(
     pool: &DbPool,
     progress: &SuiteInstallTaskRecord,
 ) -> sqlx::Result<()> {
+    if progress.status == "failed" && progress.error_code.is_some() {
+        return fail_install_task(
+            pool,
+            &progress.task_id,
+            progress
+                .error
+                .as_deref()
+                .unwrap_or("Suite installation failed."),
+            progress.error_code.as_deref(),
+        )
+        .await;
+    }
     update_install_task(
         pool,
         &progress.task_id,
@@ -1333,6 +1378,10 @@ fn parse_agent_install_progress(
         .unwrap_or(progress.is_finished);
     progress.error = data
         .get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    progress.error_code = data
+        .get("errorCode")
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned);
     progress.cancel_requested = data
@@ -1890,6 +1939,39 @@ fn validate_manifest(manifest: &SuiteManifest, files: &[SuitePackageFile]) -> Ap
             "suite compose file must be compose.yaml".to_string(),
         ));
     }
+    if let Some(resources) = &manifest.runtime.resources {
+        veydeck_contracts::suite_resources::SuiteResources::data_directory(
+            &manifest.metadata.suite_id,
+        )
+        .map_err(|error| ApiError::BadRequest(error.into()))?;
+        resources
+            .validate()
+            .map_err(|e| ApiError::BadRequest(e.into()))?;
+        if !manifest.runtime.agent.as_ref().is_some_and(|a| {
+            a.services.contains(&resources.manager_service)
+                && a.capabilities.iter().any(|c| c == "services.control")
+        }) {
+            return Err(ApiError::BadRequest(
+                "resource manager must declare services.control".into(),
+            ));
+        }
+        let compose = files
+            .iter()
+            .find(|f| f.path == "compose.yaml")
+            .ok_or_else(|| ApiError::BadRequest("compose.yaml is required".into()))?;
+        let bytes = STANDARD
+            .decode(&compose.content_base64)
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        let value: serde_yaml::Value =
+            serde_yaml::from_slice(&bytes).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        for name in [&resources.engine_service, &resources.manager_service] {
+            if value.get("services").and_then(|v| v.get(name)).is_none() {
+                return Err(ApiError::BadRequest(format!(
+                    "resource service does not exist: {name}"
+                )));
+            }
+        }
+    }
     validate_runtime_images(&manifest.runtime.images)?;
     validate_agent_access(manifest, files)?;
     if manifest.app_entries.is_empty() {
@@ -1962,10 +2044,11 @@ fn validate_agent_access(manifest: &SuiteManifest, files: &[SuitePackageFile]) -
             "runtime.agent.capabilities must not be empty".to_string(),
         ));
     }
-    const ALLOWED_CAPABILITIES: [&str; 3] = [
+    const ALLOWED_CAPABILITIES: [&str; 4] = [
         "workloads.manage",
         "captures.manage",
         "operation-logs.write",
+        "services.control",
     ];
     let mut capabilities = BTreeSet::new();
     for capability in &access.capabilities {
@@ -2568,6 +2651,8 @@ appEntries: []
                 "example/api:1.0".to_string(),
             ],
             agent_access: None,
+            resources: None,
+            adopt_retained_data: false,
             files: vec![SuitePackageFile {
                 path: "compose.yaml".to_string(),
                 content_base64: STANDARD.encode(compose),

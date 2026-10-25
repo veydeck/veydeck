@@ -13,10 +13,10 @@ export const suitesApi = {
       timeout: 300000,
     })
   },
-  installSuite: (suiteId: string, nodeId: string) => {
+  installSuite: (suiteId: string, nodeId: string, adoptRetainedData = false) => {
     return http.post<suites.SuiteInstallTaskResponse>(
       `/suites/${encodeURIComponent(suiteId)}/install`,
-      { nodeId },
+      { nodeId, adoptRetainedData },
     )
   },
   fetchInstallProgress: (taskId: string) => {

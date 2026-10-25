@@ -76,6 +76,10 @@ pub struct SuiteAppEntry {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SuiteInstallRequest {
+    #[serde(default)]
+    pub adopt_retained_data: bool,
+    #[serde(default)]
+    pub resources: Option<veydeck_contracts::suite_resources::SuiteResources>,
     pub instance_id: String,
     pub suite_id: String,
     pub version: String,
@@ -126,16 +130,20 @@ pub struct SuiteInstallProgress {
     pub current_image: Option<String>,
     pub is_finished: bool,
     pub error: Option<String>,
+    #[serde(default)]
+    pub error_code: Option<String>,
     pub cancel_requested: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SuiteAgentMetadata {
+    #[serde(default)]
+    pub(crate) resources: Option<veydeck_contracts::suite_resources::SuiteResources>,
     pub(crate) instance_id: String,
     pub(crate) suite_id: String,
     version: String,
-    compose_project_name: String,
+    pub(crate) compose_project_name: String,
     app_entries: Vec<SuiteAppEntry>,
     #[serde(default)]
     agent_access: Option<SuiteAgentGrant>,
@@ -296,6 +304,7 @@ pub async fn install_suite(
         current_image: None,
         is_finished: false,
         error: None,
+        error_code: None,
         cancel_requested: false,
     });
     ensure_suite_network(&state).await?;
@@ -305,19 +314,7 @@ pub async fn install_suite(
     let result = install_suite_inner(&state, &payload, &dir).await;
     if let Err(err) = result {
         let canceled = is_install_cancel_requested(&payload.instance_id);
-        update_install_progress(
-            &payload.instance_id,
-            100,
-            if canceled { "canceled" } else { "failed" },
-            if canceled { "canceled" } else { "failed" },
-            None,
-            true,
-            if canceled {
-                None
-            } else {
-                Some(err.to_string())
-            },
-        );
+        fail_install_progress(&payload.instance_id, canceled, &err);
         rollback_suite_install(&payload.compose_project_name, &dir).await;
         let error = err.to_string();
         let canceled = is_suite_install_canceled_error(&error);
@@ -405,6 +402,21 @@ fn upsert_install_progress(progress: SuiteInstallProgress) {
     sessions.insert(progress.instance_id.clone(), progress);
 }
 
+/// 原子保存安装终态和业务错误码，供 Master 重启后恢复提示。
+fn fail_install_progress(instance_id: &str, canceled: bool, error: &ApiError) {
+    let mut sessions = SUITE_INSTALL_PROGRESS.lock().unwrap();
+    if let Some(progress) = sessions.get_mut(instance_id) {
+        progress.progress_percent = 100;
+        progress.status = if canceled { "canceled" } else { "failed" }.into();
+        progress.current_step = progress.status.clone();
+        progress.current_image = None;
+        progress.is_finished = true;
+        progress.error = (!canceled).then(|| error.message.to_string());
+        progress.error_code = (!canceled).then(|| error.code.as_str().to_string());
+        progress.cancel_requested = false;
+    }
+}
+
 /// 更新当前节点内存中的安装进度，并保持百分比单调递增。
 fn update_install_progress(
     instance_id: &str,
@@ -473,11 +485,13 @@ async fn install_suite_inner(
         let compose_text = tokio::fs::read_to_string(&compose_source).await?;
         tokio::fs::write(&compose_target, compose_text).await?;
     }
+    crate::api::suite_services::prepare_resources(payload, dir).await?;
     let agent_access = prepare_suite_runtime_files(state, payload, dir).await?;
     prepare_compose_images(state, payload, &compose_target).await?;
     ensure_install_not_canceled(&payload.instance_id)?;
 
     let metadata = SuiteAgentMetadata {
+        resources: payload.resources.clone(),
         instance_id: payload.instance_id.clone(),
         suite_id: payload.suite_id.clone(),
         version: payload.version.clone(),
@@ -647,6 +661,13 @@ pub async fn uninstall_suite(
             };
             run_compose_command(&payload.compose_project_name, &compose_file, &args).await?;
         }
+        crate::api::suite_services::remove_resources(
+            &project,
+            &payload.suite_instance_id,
+            &payload.suite_id,
+            payload.remove_data,
+        )
+        .await?;
         sqlx::query("DELETE FROM docker_compose_projects WHERE name = ?1")
             .bind(&payload.compose_project_name)
             .execute(&state.metadata_db)
@@ -832,6 +853,11 @@ pub async fn proxy_suite_entry(
             crate::api::suite_operation_logs::SUITE_OPERATION_CONTEXT_HEADER,
             operation_context_id,
         );
+    }
+    if metadata.resources.is_some() {
+        let credential =
+            tokio::fs::read_to_string(suite_project_dir(&path.project).join("entry-token")).await?;
+        request = request.header("x-veydeck-entry-token", credential.trim());
     }
     let body_stream = body
         .into_data_stream()
@@ -1283,7 +1309,7 @@ fn validate_agent_access(access: Option<&SuiteAgentAccess>) -> ApiResult<()> {
     for capability in &access.capabilities {
         if !matches!(
             capability.as_str(),
-            "workloads.manage" | "captures.manage" | "operation-logs.write"
+            "workloads.manage" | "captures.manage" | "operation-logs.write" | "services.control"
         ) {
             return Err(ApiError::BadRequest(format!(
                 "unsupported suite Agent capability: {capability}"
@@ -1587,6 +1613,15 @@ async fn run_compose_command(project: &str, compose_file: &FsPath, args: &[&str]
     }
     let mut command = Command::new("docker");
     command.args(["compose", "-f"]).arg(compose_file);
+    if compose_file.with_file_name(".env").exists() {
+        command
+            .arg("--env-file")
+            .arg(compose_file.with_file_name(".env"));
+    }
+    let resource_override = compose_file.with_file_name("compose.resources.yaml");
+    if resource_override.exists() {
+        command.arg("-f").arg(resource_override);
+    }
     let runtime_override = compose_file.with_file_name(SUITE_RUNTIME_OVERRIDE_FILE);
     if tokio::fs::metadata(&runtime_override).await.is_ok() {
         command.arg("-f").arg(&runtime_override);

@@ -49,3 +49,9 @@ export function handleAxiosError(error: AxiosError): ApiResponse<null> {
     data: (responseData?.data ?? null) as null,
   }
 }
+
+/** 根据后端业务错误码解析本地化提示，未识别错误保留公开摘要。 */
+export function localizeErrorSummary(errorCode?: string | null, summary?: string | null): string {
+  const key = errorCode ? `api.errors.${errorCode}` : ''
+  return key && i18n.global.te(key) ? i18n.global.t(key) : summary || ''
+}

@@ -336,7 +336,9 @@ watch(currentNodeId, () => {
       :node-unavailable="currentNodeUnavailable"
       :polling-error="selectedCard?.task ? pollingErrors[selectedCard.task.taskId] : undefined"
       @close="closeDetail"
-      @install="selectedCard && installSuite(selectedCard.suite)"
+      @install="
+        (adoptRetainedData) => selectedCard && installSuite(selectedCard.suite, adoptRetainedData)
+      "
       @enable="
         selectedCard?.instance &&
         runInstanceAction(selectedCard.suite, selectedCard.instance, 'enable')

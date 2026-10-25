@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { localizeErrorSummary } from '@/api/error'
 import type { SuiteInstallTaskResponse } from '@/api/interface/suites'
 import { VeyButton, VeyTag } from '@/components/ui'
 
@@ -51,7 +52,7 @@ function stepLabel() {
       <div class="install-task__bar" :style="{ width: `${percent}%` }" />
     </div>
     <div v-if="error || task.error" class="install-task__error" role="alert">
-      <span>{{ error || task.error }}</span>
+      <span>{{ error || localizeErrorSummary(task.errorCode, task.error) }}</span>
       <VeyButton v-if="error" size="small" type="secondary" @click="$emit('retry')">
         {{ t('common.retry') }}
       </VeyButton>

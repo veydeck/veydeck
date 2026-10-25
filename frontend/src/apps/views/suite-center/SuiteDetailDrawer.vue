@@ -1,12 +1,19 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type {
   SuiteCatalogItem,
   SuiteInstallTaskResponse,
   SuiteInstanceSummary,
 } from '@/api/interface/suites'
-import { VeyActionMenu, VeyButton, VeyDescriptions, VeyDrawer, VeyTag } from '@/components/ui'
+import {
+  VeyActionMenu,
+  VeyButton,
+  VeyCheckbox,
+  VeyDescriptions,
+  VeyDrawer,
+  VeyTag,
+} from '@/components/ui'
 import AppIcon from '@/components/icons/AppIcon.vue'
 import SuiteInstallProgress from './SuiteInstallProgress.vue'
 
@@ -24,7 +31,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   close: []
-  install: []
+  install: [adoptRetainedData: boolean]
   enable: []
   disable: []
   uninstall: []
@@ -34,6 +41,14 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+/** 每次打开默认不接管保留数据，由操作者明确选择。 */
+const adoptRetainedData = ref(false)
+watch(
+  () => props.suite?.suiteId,
+  () => {
+    adoptRetainedData.value = false
+  },
+)
 const visible = computed({
   get: () => props.suite !== null,
   set: (value) => {
@@ -133,6 +148,14 @@ const secondaryActions = computed(() => {
       />
     </div>
     <template #footer>
+      <VeyCheckbox
+        v-if="canInstall"
+        v-model="adoptRetainedData"
+        :disabled="busy"
+        data-ui="suite-adopt-retained-data"
+      >
+        {{ t('app.suiteCenter.adoptRetainedData') }}
+      </VeyCheckbox>
       <div class="suite-detail__actions" data-slot="suite-detail-actions">
         <VeyButton
           v-if="canInstall"
@@ -140,7 +163,7 @@ const secondaryActions = computed(() => {
           :loading="busy"
           :disabled="nodeUnavailable"
           data-ui="suite-install-action"
-          @click="$emit('install')"
+          @click="$emit('install', adoptRetainedData)"
         >
           {{ t('app.suiteCenter.actions.install') }}
         </VeyButton>

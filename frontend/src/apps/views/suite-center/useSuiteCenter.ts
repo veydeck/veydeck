@@ -1,5 +1,6 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { localizeErrorSummary } from '@/api/error'
 import type {
   SuiteCatalogItem,
   SuiteInstallTaskResponse,
@@ -213,7 +214,10 @@ export function useSuiteCenter() {
     } else if (task.status === 'canceled') {
       toastStore.success(t('app.suiteCenter.messages.cancelInstallSuccess'))
     } else {
-      toastStore.error(task.error || t('app.suiteCenter.messages.installFailed'))
+      toastStore.error(
+        localizeErrorSummary(task.errorCode, task.error) ||
+          t('app.suiteCenter.messages.installFailed'),
+      )
     }
     await Promise.all([...refreshSubscribers].map((refresh) => refresh(task.nodeId)))
     await windowStore.refreshDesktopState()
@@ -267,12 +271,12 @@ export function useSuiteCenter() {
     startInstallPolling(taskId)
   }
 
-  async function installSuite(suite: SuiteCatalogItem) {
+  async function installSuite(suite: SuiteCatalogItem, adoptRetainedData = false) {
     const nodeId = currentNodeId.value
     if (currentNodeUnavailable.value || isOperating(suite.suiteId, nodeId)) return false
     setOperating(suite.suiteId, nodeId, true)
     try {
-      const response = await suitesApi.installSuite(suite.suiteId, nodeId)
+      const response = await suitesApi.installSuite(suite.suiteId, nodeId, adoptRetainedData)
       if (!response.success || !response.data) {
         toastStore.error(response.message || t('app.suiteCenter.messages.installFailed'))
         setOperating(suite.suiteId, nodeId, false)

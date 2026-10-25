@@ -31,6 +31,27 @@ struct RuntimeErrorResponse {
     error_code: Option<Value>,
 }
 
+/// Agent 返回的结构化业务错误，保留错误码与可公开的消息。
+#[derive(Debug)]
+pub struct RuntimeApiError {
+    pub status: u16,
+    pub error_code: Option<ErrorCode>,
+    pub message: String,
+    detail: String,
+}
+
+impl std::fmt::Display for RuntimeApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "runtime api error: status={}; message={}; detail={}",
+            self.status, self.message, self.detail
+        )
+    }
+}
+
+impl std::error::Error for RuntimeApiError {}
+
 /// 封装与节点运行时的 HTTP/WS 通讯与认证。
 #[derive(Debug, Clone)]
 pub struct NodeRuntimeClient {
@@ -555,11 +576,15 @@ fn decode_json_body<T: DeserializeOwned>(
             response_body = %preview_body(body),
             "node runtime returned api error response"
         );
-        return Err(anyhow::anyhow!(
-            "runtime api error: status={}; message={}; detail={detail}",
-            status.as_u16(),
-            error_response.message
-        ));
+        return Err(RuntimeApiError {
+            status: status.as_u16(),
+            error_code: error_response
+                .error_code
+                .and_then(|value| serde_json::from_value(value).ok()),
+            message: error_response.message,
+            detail,
+        }
+        .into());
     }
 
     if !status.is_success() {
@@ -760,6 +785,25 @@ mod tests {
         let error = result.unwrap_err().to_string();
         assert!(error.contains("status=403"));
         assert!(error.contains("AUTH_FORBIDDEN"));
+    }
+
+    /// 通用 Runtime 调用保留业务错误码，调用方可分离用户消息与诊断细节。
+    #[test]
+    fn suite_resource_error_preserves_code_and_public_message() {
+        let error = decode_json_body::<Value>(
+            "POST",
+            "/api/v1/agent/docker/suites/install",
+            StatusCode::CONFLICT,
+            r#"{"success":false,"code":409,"message":"Select adoption and install again.","errorCode":"SUITE_RETAINED_DATA_REQUIRES_ADOPTION"}"#,
+        ).unwrap_err();
+        let typed = error.downcast_ref::<super::RuntimeApiError>().unwrap();
+        assert_eq!(
+            typed.error_code,
+            Some(ErrorCode::SuiteRetainedDataRequiresAdoption)
+        );
+        assert_eq!(typed.message, "Select adoption and install again.");
+        assert!(!typed.message.contains("runtime api error"));
+        assert!(error.to_string().contains("status=409"));
     }
 
     #[test]

@@ -85,6 +85,9 @@ pub struct SuiteAppEntryLocaleOverride {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SuiteRuntime {
+    /// 套件持久化命名空间和受限服务声明。
+    #[serde(default)]
+    pub resources: Option<veydeck_contracts::suite_resources::SuiteResources>,
     #[serde(rename = "type")]
     pub runtime_type: String,
     pub compose_file: String,
@@ -215,6 +218,7 @@ pub struct SuiteInstallTaskRecord {
     pub current_image: Option<String>,
     pub is_finished: bool,
     pub error: Option<String>,
+    pub error_code: Option<String>,
     pub cancel_requested: bool,
     pub recovery_started_at: Option<String>,
     pub created_at: String,
@@ -828,6 +832,29 @@ pub async fn update_install_task(
     Ok(())
 }
 
+/// 原子记录安装失败的状态、公开消息和业务错误码。
+pub async fn fail_install_task(
+    pool: &DbPool,
+    task_id: &str,
+    error: &str,
+    error_code: Option<&str>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE suite_install_tasks SET status = 'failed', current_step = 'failed',
+         progress_percent = 100, is_finished = 1, error = ?2, error_code = ?3,
+         cancel_requested = 0, recovery_started_at = NULL,
+         updated_at = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+         finished_at = COALESCE(finished_at, (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
+         WHERE task_id = ?1",
+    )
+    .bind(task_id)
+    .bind(error)
+    .bind(error_code)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 fn default_width() -> i64 {
     1024
 }
@@ -861,12 +888,70 @@ mod install_task_tests {
             current_image: None,
             is_finished: false,
             error: None,
+            error_code: None,
             cancel_requested: false,
             recovery_started_at: None,
             created_at: String::new(),
             updated_at: String::new(),
             finished_at: None,
         }
+    }
+
+    /// 安装失败提示与错误码在数据库重新打开后仍能恢复。
+    #[tokio::test]
+    async fn installation_failure_code_survives_database_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("veydeck-suite-error-{}.db", uuid::Uuid::now_v7()));
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        insert_install_task(&pool, &task("failed-task", "suite-1"))
+            .await
+            .unwrap();
+        fail_install_task(
+            &pool,
+            "failed-task",
+            "Adopt retained data and install again.",
+            Some("SUITE_RETAINED_DATA_REQUIRES_ADOPTION"),
+        )
+        .await
+        .unwrap();
+        pool.close().await;
+        let reopened = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let task = fetch_install_task(&reopened, "failed-task")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, "failed");
+        assert!(task.is_finished);
+        assert_eq!(
+            task.error.as_deref(),
+            Some("Adopt retained data and install again.")
+        );
+        assert_eq!(
+            task.error_code.as_deref(),
+            Some("SUITE_RETAINED_DATA_REQUIRES_ADOPTION")
+        );
+        assert!(
+            list_install_tasks(&reopened, None, true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let json = serde_json::to_value(&task).unwrap();
+        assert_eq!(json["errorCode"], "SUITE_RETAINED_DATA_REQUIRES_ADOPTION");
+        reopened.close().await;
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]

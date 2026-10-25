@@ -201,6 +201,15 @@ pub fn data_dir() -> PathBuf {
     to_absolute_path(path)
 }
 
+/// 返回网站业务数据专用根目录，与 Compose 部署目录隔离。
+pub fn suite_resource_root_dir() -> PathBuf {
+    to_absolute_path(if use_production_layout() {
+        production_home().join("data/www")
+    } else {
+        dev_base_dir().join("data/www")
+    })
+}
+
 /// 返回 Compose 项目根目录路径。
 pub fn compose_root_dir() -> PathBuf {
     let path = if let Some(path) = get().compose_root_dir.as_ref() {

@@ -64,6 +64,7 @@ fn state_api_router(state: Arc<AppState>) -> Router {
         .merge(controller_routes)
         .merge(suite_operation_logs::router())
         .merge(suite_workloads::suite_workloads_router())
+        .merge(crate::api::suite_services::router())
         .with_state(state)
 }
 

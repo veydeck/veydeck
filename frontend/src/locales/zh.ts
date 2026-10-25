@@ -134,6 +134,9 @@ const zh: typeof en = {
       usernameInvalid: '用户名只能包含字母、数字、下划线或连字符，长度 1-64 位。',
     },
     errors: {
+      SUITE_RETAINED_DATA_REQUIRES_ADOPTION:
+        '检测到此前保留的套件数据，请勾选“接管此前保留的套件数据”后重新安装。',
+      SUITE_RESOURCE_IN_USE: '该套件的数据正在被其他实例使用，请先卸载原实例。',
       controlServiceUnavailable: '请检查主控服务是否运行',
       FILE_INVALID_PATH: '请输入有效的绝对文件路径。',
       FILE_NOT_FOUND: '文件或目录已不存在。',
@@ -212,8 +215,9 @@ const zh: typeof en = {
       deleteTitle: '删除套件包',
       deleteConfirm: '确认从套件中心删除 {name} 吗？再次安装前必须重新导入套件包。',
       deleteMessage: '确认从套件中心删除 {name} 吗？删除后需要重新导入套件包才能再次安装。',
+      adoptRetainedData: '接管此前保留的套件数据（如有）',
       removeData: '同时删除套件数据',
-      removeDataWarning: '将删除该套件声明的数据卷，操作不可恢复。',
+      removeDataWarning: '将删除该套件声明的数据卷和持久化目录，操作不可恢复。',
       removeDataSecondWarningTitle: '永久删除数据',
       uninstallAndRemoveData: '卸载并删除数据',
       catalog: '套件目录',
