@@ -1,11 +1,18 @@
 <script setup lang="ts">
+import ApplicationDialog from '@/components/layout/ApplicationDialog.vue'
 import { ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import type { SuiteCatalogItem, SuiteInstanceSummary } from '@/api/interface/suites'
-import { VeyButton, VeyCheckbox, VeyDialog } from '@/components/ui'
+import type {
+  SuiteCatalogItem,
+  SuiteInstanceSummary,
+  SuitePackageOccupant,
+} from '@/api/interface/suites'
+import { VeyButton, VeyCheckbox } from '@/components/ui'
 
 const props = defineProps<{
   deleteTarget: SuiteCatalogItem | null
+  packageVersion?: string
+  occupants: SuitePackageOccupant[]
   uninstallSuite: SuiteCatalogItem | null
   uninstallInstance?: SuiteInstanceSummary
   busy: boolean
@@ -30,7 +37,8 @@ watch(
 </script>
 
 <template>
-  <VeyDialog
+  <ApplicationDialog
+    :style="{ background: 'var(--vdl-bg-panel)', color: 'var(--vdl-text-primary)' }"
     :visible="!!deleteTarget"
     :title="t('app.suiteCenter.deleteTitle')"
     width="30rem"
@@ -38,7 +46,19 @@ watch(
     @close="$emit('closeDelete')"
   >
     <div class="danger-dialog" data-ui="suite-delete-confirmation">
-      {{ t('app.suiteCenter.deleteConfirm', { name: deleteTarget?.name }) }}
+      {{
+        t(
+          packageVersion ? 'app.suiteCenter.deleteVersionConfirm' : 'app.suiteCenter.deleteConfirm',
+          { name: deleteTarget?.name, version: packageVersion },
+        )
+      }}
+      <div v-if="occupants.length" role="alert" data-ui="suite-delete-occupants">
+        <p>{{ t('app.suiteCenter.packageInUse') }}</p>
+        <div v-for="item in occupants" :key="`${item.instanceId}:${item.taskId}`">
+          {{ item.nodeId }} · {{ item.version }} · {{ item.instanceId }}
+          <span v-if="item.taskId"> · {{ item.taskId }}</span>
+        </div>
+      </div>
     </div>
     <template #footer>
       <VeyButton type="secondary" :disabled="busy" @click="$emit('closeDelete')">
@@ -48,9 +68,10 @@ watch(
         {{ t('common.delete') }}
       </VeyButton>
     </template>
-  </VeyDialog>
+  </ApplicationDialog>
 
-  <VeyDialog
+  <ApplicationDialog
+    :style="{ background: 'var(--vdl-bg-panel)', color: 'var(--vdl-text-primary)' }"
     :visible="!!uninstallSuite && !!uninstallInstance"
     :title="t('app.suiteCenter.uninstallTitle')"
     width="32rem"
@@ -84,7 +105,7 @@ watch(
         }}
       </VeyButton>
     </template>
-  </VeyDialog>
+  </ApplicationDialog>
 </template>
 
 <style scoped>

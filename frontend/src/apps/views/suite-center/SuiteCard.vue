@@ -1,7 +1,10 @@
 <script setup lang="ts">
+import { useI18n } from 'vue-i18n'
 import type { SuiteCatalogItem, SuiteInstanceSummary } from '@/api/interface/suites'
 import { VeyTag } from '@/components/ui'
 import AppIcon from '@/components/icons/AppIcon.vue'
+
+const { t } = useI18n()
 
 defineProps<{
   suite: SuiteCatalogItem
@@ -28,6 +31,14 @@ defineEmits<{
         <div class="suite-card__identity">
           <div class="suite-card__title">{{ suite.name }}</div>
           <div class="suite-card__id">{{ suite.suiteId }}</div>
+          <div data-slot="suite-version-summary">
+            {{
+              instance
+                ? t('app.suiteCenter.installedVersion', { version: instance.version })
+                : t('app.suiteCenter.notInstalled')
+            }}
+            · {{ t('app.suiteCenter.availableVersions', { count: suite.versions.length }) }}
+          </div>
         </div>
         <VeyTag :type="statusType" effect="plain">{{ statusLabel }}</VeyTag>
       </div>

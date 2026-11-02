@@ -13,10 +13,10 @@ export const suitesApi = {
       timeout: 300000,
     })
   },
-  installSuite: (suiteId: string, nodeId: string, adoptRetainedData = false) => {
+  installSuite: (suiteId: string, nodeId: string, packageId: string, adoptRetainedData = false) => {
     return http.post<suites.SuiteInstallTaskResponse>(
       `/suites/${encodeURIComponent(suiteId)}/install`,
-      { nodeId, adoptRetainedData },
+      { nodeId, packageId, adoptRetainedData },
     )
   },
   fetchInstallProgress: (taskId: string) => {
@@ -36,7 +36,12 @@ export const suitesApi = {
     )
   },
   deleteSuite: (suiteId: string) => {
-    return http.delete<unknown>(`/suites/${encodeURIComponent(suiteId)}`)
+    return http.delete<suites.SuitePackageOccupant[]>(`/suites/${encodeURIComponent(suiteId)}`)
+  },
+  deletePackage: (packageId: string) => {
+    return http.delete<suites.SuitePackageOccupant[]>(
+      `/suite-packages/${encodeURIComponent(packageId)}`,
+    )
   },
   enableInstance: (instanceId: string) => {
     return http.post<suites.SuiteInstanceSummary>(

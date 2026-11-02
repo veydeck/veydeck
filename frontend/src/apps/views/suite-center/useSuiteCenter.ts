@@ -3,6 +3,7 @@ import { useI18n } from 'vue-i18n'
 import { localizeErrorSummary } from '@/api/error'
 import type {
   SuiteCatalogItem,
+  SuitePackageOccupant,
   SuiteInstallTaskResponse,
   SuiteInstanceStatus,
   SuiteInstanceSummary,
@@ -76,6 +77,7 @@ export function useSuiteCenter() {
   const windowStore = useWindowManagerStore()
 
   const catalog = ref<SuiteCatalogItem[]>([])
+  const deleteOccupants = ref<SuitePackageOccupant[]>([])
   const instances = ref<SuiteInstanceSummary[]>([])
   const tasksById = sharedTasksById
   const pollingErrors = sharedPollingErrors
@@ -271,12 +273,26 @@ export function useSuiteCenter() {
     startInstallPolling(taskId)
   }
 
-  async function installSuite(suite: SuiteCatalogItem, adoptRetainedData = false) {
+  async function installSuite(
+    suite: SuiteCatalogItem,
+    packageId: string,
+    adoptRetainedData = false,
+  ) {
     const nodeId = currentNodeId.value
-    if (currentNodeUnavailable.value || isOperating(suite.suiteId, nodeId)) return false
+    if (
+      !suite.versions.some((item) => item.packageId === packageId) ||
+      currentNodeUnavailable.value ||
+      isOperating(suite.suiteId, nodeId)
+    )
+      return false
     setOperating(suite.suiteId, nodeId, true)
     try {
-      const response = await suitesApi.installSuite(suite.suiteId, nodeId, adoptRetainedData)
+      const response = await suitesApi.installSuite(
+        suite.suiteId,
+        nodeId,
+        packageId,
+        adoptRetainedData,
+      )
       if (!response.success || !response.data) {
         toastStore.error(response.message || t('app.suiteCenter.messages.installFailed'))
         setOperating(suite.suiteId, nodeId, false)
@@ -394,12 +410,18 @@ export function useSuiteCenter() {
     }
   }
 
-  async function deleteSuite(suite: SuiteCatalogItem) {
-    if (suite.instanceCount > 0 || isOperating(suite.suiteId)) return false
+  async function deleteSuite(suite: SuiteCatalogItem, packageId?: string) {
+    if (isOperating(suite.suiteId)) return false
+    deleteOccupants.value = []
     setOperating(suite.suiteId, currentNodeId.value, true)
     try {
-      const response = await suitesApi.deleteSuite(suite.suiteId)
+      const response = packageId
+        ? await suitesApi.deletePackage(packageId)
+        : await suitesApi.deleteSuite(suite.suiteId)
       if (!response.success) {
+        if (response.errorCode === 'SUITE_RESOURCE_IN_USE' && Array.isArray(response.data)) {
+          deleteOccupants.value = response.data
+        }
         toastStore.error(response.message || t('app.suiteCenter.messages.deleteFailed'))
         return false
       }
@@ -437,6 +459,7 @@ export function useSuiteCenter() {
     currentNodeTasks,
     currentNodeUnavailable,
     deleteSuite,
+    deleteOccupants,
     importSuite,
     installSuite,
     instances,

@@ -1,33 +1,36 @@
 -- Compose 套件中心：套件目录、实例和应用入口。
-CREATE TABLE IF NOT EXISTS suite_catalog_items (
+CREATE TABLE IF NOT EXISTS suite_catalog (
     suite_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- 每份版本包不可变，实例必须引用明确的包身份。
+CREATE TABLE IF NOT EXISTS suite_packages (
+    package_id TEXT PRIMARY KEY,
+    suite_id TEXT NOT NULL REFERENCES suite_catalog(suite_id) ON DELETE RESTRICT,
     version TEXT NOT NULL,
     name TEXT NOT NULL,
     summary TEXT NOT NULL DEFAULT '',
-    category TEXT NOT NULL DEFAULT 'uncategorized', -- 套件分类，用于套件中心筛选和展示。
-    icon TEXT NOT NULL DEFAULT '', -- 套件图标资产 URL 或包内图标路径。
     manifest_json TEXT NOT NULL,
     package_json TEXT NOT NULL,
     checksum TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'available',
-    installed_at TEXT, -- 套件首次安装时间。
-    removed_at TEXT, -- 套件从套件中心删除或移除的时间。
-    metadata TEXT NOT NULL DEFAULT '{}', -- 套件展示、来源和扩展治理信息。
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (suite_id, version),
+    UNIQUE (package_id, suite_id, version)
 );
 
-CREATE TRIGGER IF NOT EXISTS set_suite_catalog_items_updated_at
-AFTER UPDATE ON suite_catalog_items FOR EACH ROW
+CREATE TRIGGER IF NOT EXISTS suite_packages_immutable
+BEFORE UPDATE ON suite_packages
 BEGIN
-    UPDATE suite_catalog_items
-       SET updated_at = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-     WHERE suite_id = OLD.suite_id;
+    SELECT RAISE(ABORT, 'suite packages are immutable');
 END;
 
 CREATE TABLE IF NOT EXISTS suite_instances (
     instance_id TEXT PRIMARY KEY,
     suite_id TEXT NOT NULL,
+    package_id TEXT NOT NULL,
     version TEXT NOT NULL,
     platform_contract_version INTEGER NOT NULL CHECK (platform_contract_version >= 1),
     node_id TEXT NOT NULL,
@@ -44,7 +47,7 @@ CREATE TABLE IF NOT EXISTS suite_instances (
     metadata TEXT NOT NULL DEFAULT '{}', -- 套件实例运行、桌面恢复和扩展状态信息。
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    FOREIGN KEY (suite_id) REFERENCES suite_catalog_items(suite_id) ON DELETE CASCADE
+    FOREIGN KEY (package_id, suite_id, version) REFERENCES suite_packages(package_id, suite_id, version) ON DELETE RESTRICT
 );
 
 CREATE TRIGGER IF NOT EXISTS set_suite_instances_updated_at

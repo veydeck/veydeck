@@ -136,8 +136,11 @@ const en = {
     errors: {
       SUITE_RETAINED_DATA_REQUIRES_ADOPTION:
         'Retained suite data was found. Select “Adopt previously retained suite data” and install again.',
+      SUITE_VERSION_ALREADY_EXISTS: 'This suite version already exists and cannot be overwritten.',
+      SUITE_ALREADY_INSTALLED: 'This suite is already installed on the node.',
+      SUITE_OPERATION_BUSY: 'An installation task is still active for this suite.',
       SUITE_RESOURCE_IN_USE:
-        'This suite’s data is in use by another instance. Uninstall that instance first.',
+        'Suite resources are in use by an instance or task. Release them first.',
       controlServiceUnavailable: 'Please check whether the control service is running',
       FILE_INVALID_PATH: 'Enter a valid absolute file path.',
       FILE_NOT_FOUND: 'The file or directory no longer exists.',
@@ -198,6 +201,18 @@ const en = {
   },
   app: {
     suiteCenter: {
+      centralLibraryHint:
+        'Packages are uploaded to the central library for all nodes. An existing suite version cannot be uploaded again.',
+      installedVersion: 'Installed {version}',
+      notInstalled: 'Not installed',
+      availableVersions: '{count} available versions',
+      versionLibrary: 'Central version library',
+      chooseVersion: 'Choose a version to install',
+      versionInstances: '{count} node instances',
+      deleteAllVersions: 'Delete entire suite',
+      deleteVersionConfirm: 'Delete version {version} of {name} from the central library?',
+      packageInUse: 'These node instances or installation tasks are using the package:',
+
       appName: 'Suite Center',
       loading: 'Loading suites...',
       empty: 'No suites have been imported.',
@@ -255,6 +270,7 @@ const en = {
         deletePackage: 'Delete package',
       },
       fields: {
+        installedVersion: 'Installed version on this node',
         version: 'Version',
         category: 'Category',
         node: 'Node',

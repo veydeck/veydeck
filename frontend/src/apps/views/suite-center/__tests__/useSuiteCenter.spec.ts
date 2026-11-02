@@ -27,6 +27,7 @@ const api = vi.hoisted(() => ({
   disableInstance: vi.fn(),
   uninstallInstance: vi.fn(),
   deleteSuite: vi.fn(),
+  deletePackage: vi.fn(),
 }))
 const windowManager = vi.hoisted(() => ({
   registerGlobalOperation: vi.fn(),
@@ -43,6 +44,18 @@ const response = <T>(data: T) => ({ success: true, code: 200, message: '', data 
 const failedResponse = { success: false, code: 503, message: 'temporary', data: null }
 
 const suite = (suiteId: string, instanceCount = 0): SuiteCatalogItem => ({
+  versions: [
+    {
+      packageId: `package-${suiteId}`,
+      version: '1.0.0',
+      name: suiteId,
+      summary: '',
+      icon: 'package',
+      checksum: 'checksum',
+      createdAt: '',
+      instanceCount: 0,
+    },
+  ],
   suiteId,
   version: '1.0.0',
   name: suiteId,
@@ -56,6 +69,7 @@ const suite = (suiteId: string, instanceCount = 0): SuiteCatalogItem => ({
 })
 
 const instance = (suiteId: string, nodeId = 'local'): SuiteInstanceSummary => ({
+  packageId: `package-${suiteId}`,
   instanceId: `instance-${suiteId}`,
   suiteId,
   version: '1.0.0',
@@ -67,6 +81,9 @@ const instance = (suiteId: string, nodeId = 'local'): SuiteInstanceSummary => ({
 })
 
 const task = (taskId = 'task-1', finished = false): SuiteInstallTaskResponse => ({
+  packageId: 'package-suite-1',
+  version: '1.0.0',
+  checksum: 'checksum',
   taskId,
   instanceId: 'instance-suite-1',
   suiteId: 'suite-1',
@@ -288,15 +305,44 @@ describe('useSuiteCenter', () => {
     wrapper.unmount()
   })
 
-  it('仅允许删除所有节点实例数为零的套件包', async () => {
-    api.deleteSuite.mockResolvedValue(response(null))
+  it('由后端判断版本占用并保留阻塞节点信息', async () => {
+    const blockers = [
+      {
+        packageId: 'package-used-suite',
+        version: '1.0.0',
+        nodeId: 'node-a',
+        instanceId: 'instance-a',
+        taskId: null,
+      },
+    ]
+    api.deleteSuite.mockResolvedValueOnce({
+      success: false,
+      code: 409,
+      errorCode: 'SUITE_RESOURCE_IN_USE',
+      message: 'in use',
+      data: blockers,
+    })
+    api.deletePackage.mockResolvedValue(response(null))
     const { wrapper } = mountHarness()
     await flushPromises()
-
     expect(await wrapper.vm.deleteSuite(suite('used-suite', 1))).toBe(false)
-    expect(api.deleteSuite).not.toHaveBeenCalled()
-    expect(await wrapper.vm.deleteSuite(suite('empty-suite', 0))).toBe(true)
-    expect(api.deleteSuite).toHaveBeenCalledWith('empty-suite')
+    expect(wrapper.vm.deleteOccupants).toEqual(blockers)
+    expect(await wrapper.vm.deleteSuite(suite('used-suite', 1), 'unused-v2')).toBe(true)
+    expect(api.deletePackage).toHaveBeenCalledWith('unused-v2')
+    expect(wrapper.vm.deleteOccupants).toEqual([])
+    wrapper.unmount()
+  })
+
+  it('安装必须提交属于目标套件的明确版本包', async () => {
+    api.installSuite.mockResolvedValue(response(task()))
+    api.fetchInstallProgress.mockResolvedValue(response(task()))
+    const { wrapper } = mountHarness()
+    await flushPromises()
+    expect(await wrapper.vm.installSuite(suite('suite-1'), '')).toBe(false)
+    expect(await wrapper.vm.installSuite(suite('suite-1'), 'foreign-package')).toBe(false)
+    expect(api.installSuite).not.toHaveBeenCalled()
+    expect(await wrapper.vm.installSuite(suite('suite-1'), 'package-suite-1', true)).toBe(true)
+    expect(api.installSuite).toHaveBeenCalledWith('suite-1', 'local', 'package-suite-1', true)
     wrapper.unmount()
   })
 })

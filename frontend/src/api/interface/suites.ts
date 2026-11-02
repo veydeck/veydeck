@@ -30,7 +30,29 @@ export type SuiteInstallStep =
   | 'recovery_failed'
   | 'unknown'
 
+/** 中心保存的不可变套件版本包。 */
+export interface SuitePackageItem {
+  packageId: string
+  version: string
+  name: string
+  summary: string
+  icon: string
+  checksum: string
+  createdAt: string
+  instanceCount: number
+}
+
+/** 阻止删除包的节点实例或安装任务。 */
+export interface SuitePackageOccupant {
+  packageId: string
+  version: string
+  nodeId: string
+  instanceId: string
+  taskId: string | null
+}
+
 export interface SuiteCatalogItem {
+  versions: SuitePackageItem[]
   suiteId: string
   version: string
   name: string
@@ -45,6 +67,7 @@ export interface SuiteCatalogItem {
 }
 
 export interface SuiteInstanceSummary {
+  packageId: string
   instanceId: string
   suiteId: string
   version: string
@@ -62,6 +85,9 @@ export interface SuiteListResponse {
 }
 
 export interface SuiteInstallTaskResponse {
+  packageId: string
+  version: string
+  checksum: string
   taskId: string
   instanceId: string
   suiteId: string

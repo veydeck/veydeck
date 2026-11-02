@@ -123,6 +123,8 @@ pub struct SuiteInstallProgressQuery {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SuiteInstallProgress {
+    pub suite_id: String,
+    pub version: String,
     pub instance_id: String,
     pub progress_percent: u32,
     pub status: String,
@@ -297,6 +299,8 @@ pub async fn install_suite(
     validate_agent_access(payload.agent_access.as_ref())?;
     let log_metadata = install_log_metadata(&payload);
     upsert_install_progress(SuiteInstallProgress {
+        suite_id: payload.suite_id.clone(),
+        version: payload.version.clone(),
         instance_id: payload.instance_id.clone(),
         progress_percent: 1,
         status: "running".to_string(),
@@ -364,7 +368,9 @@ pub async fn install_suite(
         },
     )
     .await;
-    Ok(ApiResponse::ok("Suite installed").into_response())
+    Ok(ApiResponse::success_with_raw("Suite installed", serde_json::json!({
+        "instanceId": payload.instance_id, "suiteId": payload.suite_id, "version": payload.version,
+    })).into_response())
 }
 
 /// 查询套件安装在当前节点执行面的实时进度。

@@ -16,7 +16,7 @@ import VeyIcon from '@/components/icons/VeyIcon.vue'
 import { useNodeStore } from '@/stores/node'
 import SuiteCard from './suite-center/SuiteCard.vue'
 import SuiteDangerDialogs from './suite-center/SuiteDangerDialogs.vue'
-import SuiteDetailDrawer from './suite-center/SuiteDetailDrawer.vue'
+import SuiteDetailDialog from './suite-center/SuiteDetailDialog.vue'
 import SuiteImportWorkspace from './suite-center/SuiteImportWorkspace.vue'
 import { useSuiteCenter } from './suite-center/useSuiteCenter'
 
@@ -40,6 +40,7 @@ const {
   currentNodeId,
   currentNodeUnavailable,
   deleteSuite,
+  deleteOccupants,
   importSuite,
   installSuite,
   instances,
@@ -60,6 +61,7 @@ const searchQuery = ref('')
 const selectedSuiteId = ref('')
 const viewMode = ref<'list' | 'import'>('list')
 const deleteTarget = ref<SuiteCatalogItem | null>(null)
+const deletePackageId = ref<string>()
 const uninstallTarget = ref<SuiteCardModel | null>(null)
 
 const taskBySuite = computed(() => {
@@ -186,9 +188,16 @@ async function handleImport(file: File) {
   if (result.valid) viewMode.value = 'list'
 }
 
+/** 打开指定版本或整个套件的删除确认。 */
+function requestDelete(packageId?: string) {
+  deletePackageId.value = packageId
+  deleteTarget.value = selectedCard.value?.suite ?? null
+  deleteOccupants.value = []
+}
+
 async function confirmDelete() {
   if (!deleteTarget.value) return
-  if (await deleteSuite(deleteTarget.value)) {
+  if (await deleteSuite(deleteTarget.value, deletePackageId.value)) {
     deleteTarget.value = null
     closeDetail()
   }
@@ -213,6 +222,8 @@ watch(catalog, () => {
 })
 watch(currentNodeId, () => {
   closeDetail()
+  deleteTarget.value = null
+  uninstallTarget.value = null
   if (!activeOperations.value.import) viewMode.value = 'list'
 })
 </script>
@@ -325,7 +336,7 @@ watch(currentNodeId, () => {
       />
     </main>
 
-    <SuiteDetailDrawer
+    <SuiteDetailDialog
       :suite="selectedCard?.suite ?? null"
       :instance="selectedCard?.instance"
       :task="selectedCard?.task"
@@ -337,7 +348,8 @@ watch(currentNodeId, () => {
       :polling-error="selectedCard?.task ? pollingErrors[selectedCard.task.taskId] : undefined"
       @close="closeDetail"
       @install="
-        (adoptRetainedData) => selectedCard && installSuite(selectedCard.suite, adoptRetainedData)
+        (packageId, adoptRetainedData) =>
+          selectedCard && installSuite(selectedCard.suite, packageId, adoptRetainedData)
       "
       @enable="
         selectedCard?.instance &&
@@ -348,13 +360,17 @@ watch(currentNodeId, () => {
         runInstanceAction(selectedCard.suite, selectedCard.instance, 'disable')
       "
       @uninstall="uninstallTarget = selectedCard"
-      @delete="deleteTarget = selectedCard?.suite ?? null"
+      @delete="requestDelete"
       @cancel="cancelInstall"
       @retry="retryInstallPolling"
     />
 
     <SuiteDangerDialogs
       :delete-target="deleteTarget"
+      :package-version="
+        deleteTarget?.versions.find((item) => item.packageId === deletePackageId)?.version
+      "
+      :occupants="deleteOccupants"
       :uninstall-suite="uninstallTarget?.suite ?? null"
       :uninstall-instance="uninstallTarget?.instance"
       :busy="

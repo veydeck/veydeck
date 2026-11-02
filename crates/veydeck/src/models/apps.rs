@@ -124,7 +124,7 @@ pub async fn list_apps(
                    c.manifest_json
               FROM suite_app_entries e
               JOIN suite_instances i ON i.instance_id = e.suite_instance_id
-              JOIN suite_catalog_items c ON c.suite_id = i.suite_id
+              JOIN suite_packages c ON c.package_id = i.package_id
              WHERE e.enabled = 1
                AND i.status = 'enabled'
                AND e.node_id = ?1
@@ -153,7 +153,7 @@ pub async fn list_apps(
                    c.manifest_json
               FROM suite_app_entries e
               JOIN suite_instances i ON i.instance_id = e.suite_instance_id
-              JOIN suite_catalog_items c ON c.suite_id = i.suite_id
+              JOIN suite_packages c ON c.package_id = i.package_id
              WHERE e.enabled = 1
                AND i.status = 'enabled'
              ORDER BY e.sort_order ASC, e.app_id ASC

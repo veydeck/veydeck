@@ -64,6 +64,7 @@ pub fn state_api_router(app_state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/script-runs", scripts::script_runs_router())
         .nest("/security", security::security_router())
         .nest("/suites", suites::suites_router())
+        .nest("/suite-packages", suites::suite_packages_router())
         .nest("/suite-instances", suites::suite_instances_router())
         .nest("/suite-install-tasks", suites::suite_install_tasks_router())
         .layer(middleware::from_fn_with_state(

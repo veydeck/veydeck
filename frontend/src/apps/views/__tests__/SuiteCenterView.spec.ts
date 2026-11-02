@@ -22,6 +22,18 @@ vi.mock('@/apps/views/suite-center/useSuiteCenter', () => ({
 }))
 
 const suite = (suiteId: string, category = 'other'): SuiteCatalogItem => ({
+  versions: [
+    {
+      packageId: `package-${suiteId}`,
+      version: '1.0.0',
+      name: suiteId,
+      summary: '',
+      icon: 'package',
+      checksum: 'checksum',
+      createdAt: '',
+      instanceCount: 0,
+    },
+  ],
   suiteId,
   version: '1.0.0',
   name: suiteId === 'scanner' ? '主机扫描器' : '协议实验室',
@@ -36,6 +48,7 @@ const suite = (suiteId: string, category = 'other'): SuiteCatalogItem => ({
 })
 
 const installed: SuiteInstanceSummary = {
+  packageId: 'package-protocol',
   instanceId: 'instance-protocol',
   suiteId: 'protocol',
   version: '1.0.0',
@@ -47,6 +60,9 @@ const installed: SuiteInstanceSummary = {
 }
 
 const installingTask: SuiteInstallTaskResponse = {
+  packageId: 'package-scanner',
+  version: '1.0.0',
+  checksum: 'checksum',
   taskId: 'task-scanner',
   instanceId: 'instance-scanner',
   suiteId: 'scanner',
@@ -67,7 +83,9 @@ function setupState() {
     catalog: ref([suite('scanner', 'tools'), suite('protocol')]),
     currentNodeId: ref('local'),
     currentNodeUnavailable: ref(false),
+    deleteOccupants: ref([]),
     deleteSuite: vi.fn(),
+    deletePackage: vi.fn(),
     importSuite: vi.fn().mockResolvedValue({ valid: false }),
     installSuite: vi.fn(),
     instances: ref([installed]),
@@ -152,7 +170,7 @@ describe('SuiteCenterView', () => {
     expect(wrapper.find('[data-ui="suite-refresh"]').attributes('disabled')).toBeDefined()
   })
 
-  it('安装任务仅在详情抽屉展示进度', async () => {
+  it('安装任务仅在应用内详情窗口展示进度', async () => {
     state.value.tasksById = ref({ [installingTask.taskId]: installingTask })
     const wrapper = mountView()
 
@@ -161,7 +179,8 @@ describe('SuiteCenterView', () => {
     )
 
     await wrapper.find('[data-slot="scanner"] .suite-card__main').trigger('click')
-    expect(document.body.querySelector('[data-ui="suite-install-task"]')).not.toBeNull()
+    expect(wrapper.find('[data-ui="suite-install-task"]').exists()).toBe(true)
+    expect(document.body.querySelector('[data-ui="suite-detail-dialog"]')).toBeNull()
   })
 
   it('在右侧内容区打开导入工作台并在返回后保留筛选状态', async () => {

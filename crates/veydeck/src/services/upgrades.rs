@@ -232,7 +232,7 @@ pub async fn check_suite_compatibility(
             instance.node_id,
             instance.platform_contract_version
         FROM suite_instances AS instance
-        INNER JOIN suite_catalog_items AS catalog ON catalog.suite_id = instance.suite_id
+        INNER JOIN suite_packages AS catalog ON catalog.package_id = instance.package_id
         WHERE instance.uninstalled_at IS NULL
         ORDER BY catalog.name, instance.node_id
         "#,
@@ -2436,11 +2436,15 @@ mod tests {
         )
         .await
         .unwrap();
+        sqlx::query("INSERT INTO suite_catalog (suite_id) VALUES ('suite-contract-test')")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query(
             r#"
-            INSERT INTO suite_catalog_items (
-                suite_id, version, name, manifest_json, package_json, checksum
-            ) VALUES ('suite-contract-test', '1.0.0', '契约测试套件', '{}', '{}', 'checksum')
+            INSERT INTO suite_packages (
+                package_id, suite_id, version, name, manifest_json, package_json, checksum
+            ) VALUES ('package-contract-test', 'suite-contract-test', '1.0.0', '契约测试套件', '{}', '{}', 'checksum')
             "#,
         )
         .execute(&pool)
@@ -2453,9 +2457,9 @@ mod tests {
             sqlx::query(
                 r#"
                 INSERT INTO suite_instances (
-                    instance_id, suite_id, version, node_id, compose_project_name, status,
+                    instance_id, package_id, suite_id, version, node_id, compose_project_name, status,
                     platform_contract_version
-                ) VALUES (?, 'suite-contract-test', '1.0.0', ?, ?, 'installed', ?)
+                ) VALUES (?, 'package-contract-test', 'suite-contract-test', '1.0.0', ?, ?, 'installed', ?)
                 "#,
             )
             .bind(instance_id)

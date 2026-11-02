@@ -1,9 +1,11 @@
 //! Compose 套件中心模型：清单、目录、实例与应用入口。
 
 use crate::state::DbPool;
+use crate::types::{ApiError, ApiResult, new_uuid_v7};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use std::collections::HashMap;
+use veydeck_contracts::api::ErrorCode;
 
 /// 套件清单顶层结构。
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -167,6 +169,7 @@ pub struct SuitePackageSnapshot {
 #[derive(Debug, Serialize, Deserialize, FromRow, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SuiteCatalogItem {
+    pub versions: Vec<SuitePackageItem>,
     pub suite_id: String,
     pub version: String,
     pub name: String,
@@ -180,10 +183,25 @@ pub struct SuiteCatalogItem {
     pub instance_count: i64,
 }
 
+/// 不可变版本包的展示信息。
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SuitePackageItem {
+    pub package_id: String,
+    pub version: String,
+    pub name: String,
+    pub summary: String,
+    pub icon: String,
+    pub checksum: String,
+    pub created_at: String,
+    pub instance_count: i64,
+}
+
 /// 套件实例摘要。
 #[derive(Debug, Serialize, Deserialize, FromRow, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SuiteInstanceSummary {
+    pub package_id: String,
     pub instance_id: String,
     pub suite_id: String,
     pub version: String,
@@ -208,6 +226,9 @@ pub struct SuiteListResponse {
 #[derive(Debug, Serialize, Deserialize, FromRow, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SuiteInstallTaskRecord {
+    pub package_id: String,
+    pub version: String,
+    pub checksum: String,
     pub task_id: String,
     pub instance_id: String,
     pub suite_id: String,
@@ -254,39 +275,59 @@ pub async fn list_suites(
 ) -> sqlx::Result<SuiteListResponse> {
     let catalog_rows = sqlx::query_as::<_, SuiteCatalogRow>(
         r#"
-        SELECT suite_id,
+        SELECT package_id, suite_id,
                version,
                manifest_json,
                status,
                checksum,
                created_at,
                updated_at
-        FROM suite_catalog_items
-        ORDER BY updated_at DESC, suite_id ASC
+        FROM suite_packages
+        ORDER BY created_at DESC, package_id DESC
         "#,
     )
     .fetch_all(pool)
     .await?;
     // name/summary 需要根据请求语言从 manifest_json 解析，不能直接使用表中的默认文案。
-    let mut catalog = catalog_rows
-        .into_iter()
-        .map(|row| row.into_catalog_item(locale))
-        .collect::<sqlx::Result<Vec<_>>>()?;
-    let instance_counts = sqlx::query_as::<_, (String, i64)>(
-        "SELECT suite_id, COUNT(*) FROM suite_instances GROUP BY suite_id",
+    let counts = sqlx::query_as::<_, (String, i64)>(
+        "SELECT package_id, COUNT(*) FROM suite_instances GROUP BY package_id",
     )
     .fetch_all(pool)
     .await?
     .into_iter()
-    .collect::<std::collections::HashMap<_, _>>();
-    for item in &mut catalog {
-        item.instance_count = instance_counts.get(&item.suite_id).copied().unwrap_or(0);
+    .collect::<HashMap<_, _>>();
+    let mut catalog: Vec<SuiteCatalogItem> = Vec::new();
+    for row in catalog_rows {
+        let package_id = row.package_id.clone();
+        let mut item = row.into_catalog_item(locale)?;
+        let count = counts.get(&package_id).copied().unwrap_or(0);
+        let package = SuitePackageItem {
+            package_id,
+            version: item.version.clone(),
+            name: item.name.clone(),
+            summary: item.summary.clone(),
+            icon: item.icon.clone(),
+            checksum: item.checksum.clone(),
+            created_at: item.created_at.clone(),
+            instance_count: count,
+        };
+        if let Some(existing) = catalog
+            .iter_mut()
+            .find(|value| value.suite_id == item.suite_id)
+        {
+            existing.instance_count += count;
+            existing.versions.push(package);
+        } else {
+            item.instance_count = count;
+            item.versions.push(package);
+            catalog.push(item);
+        }
     }
 
     let instances = if let Some(node_id) = node_id {
         sqlx::query_as::<_, SuiteInstanceSummary>(
             r#"
-            SELECT instance_id,
+            SELECT instance_id, package_id,
                    suite_id,
                    version,
                    platform_contract_version,
@@ -307,7 +348,7 @@ pub async fn list_suites(
     } else {
         sqlx::query_as::<_, SuiteInstanceSummary>(
             r#"
-            SELECT instance_id,
+            SELECT instance_id, package_id,
                    suite_id,
                    version,
                    platform_contract_version,
@@ -330,6 +371,7 @@ pub async fn list_suites(
 
 #[derive(Debug, FromRow)]
 struct SuiteCatalogRow {
+    package_id: String,
     suite_id: String,
     version: String,
     manifest_json: String,
@@ -346,9 +388,10 @@ impl SuiteCatalogRow {
         // 图标路径仍使用清单原始值，只有用户可见文案参与国际化覆盖。
         let metadata = manifest.localized_metadata(locale);
         Ok(SuiteCatalogItem {
+            versions: Vec::new(),
             icon: format!(
-                "/api/v1/suites/{}/{}",
-                self.suite_id, manifest.metadata.icon
+                "/api/v1/suite-packages/{}/{}",
+                self.package_id, manifest.metadata.icon
             ),
             suite_id: self.suite_id,
             version: self.version,
@@ -424,52 +467,52 @@ fn non_empty_string(value: &str) -> Option<String> {
     }
 }
 
-/// 写入或更新套件目录项。
-pub async fn upsert_catalog_item(
+/// 导入不可变版本包，同套件同版本一律拒绝重复上传。
+pub async fn import_package(
     pool: &DbPool,
     manifest: &SuiteManifest,
     package: &SuitePackageSnapshot,
     checksum: &str,
-) -> sqlx::Result<()> {
-    let manifest_json = serde_json::to_string(manifest).unwrap_or_else(|_| "{}".to_string());
-    let package_json = serde_json::to_string(package).unwrap_or_else(|_| "{}".to_string());
-    sqlx::query(
-        r#"
-        INSERT INTO suite_catalog_items (
-            suite_id, version, name, summary, manifest_json, package_json, checksum, status
-        )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'available')
-        ON CONFLICT(suite_id) DO UPDATE SET
-            version = excluded.version,
-            name = excluded.name,
-            summary = excluded.summary,
-            manifest_json = excluded.manifest_json,
-            package_json = excluded.package_json,
-            checksum = excluded.checksum,
-            status = 'available'
-        "#,
+) -> ApiResult<String> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let package_id = new_uuid_v7();
+    sqlx::query("INSERT INTO suite_catalog (suite_id) VALUES (?) ON CONFLICT DO NOTHING")
+        .bind(&manifest.metadata.suite_id)
+        .execute(&mut *tx)
+        .await?;
+    let result = sqlx::query(
+        "INSERT INTO suite_packages (package_id, suite_id, version, name, summary, manifest_json, package_json, checksum) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(&manifest.metadata.suite_id)
-    .bind(&manifest.metadata.version)
-    .bind(&manifest.metadata.name)
-    .bind(&manifest.metadata.summary)
-    .bind(manifest_json)
-    .bind(package_json)
-    .bind(checksum)
-    .execute(pool)
-    .await?;
-    Ok(())
+    .bind(&package_id).bind(&manifest.metadata.suite_id).bind(&manifest.metadata.version)
+    .bind(&manifest.metadata.name).bind(&manifest.metadata.summary)
+    .bind(serde_json::to_string(manifest).map_err(|err| ApiError::internal(err.to_string()))?)
+    .bind(serde_json::to_string(package).map_err(|err| ApiError::internal(err.to_string()))?)
+    .bind(checksum).execute(&mut *tx).await;
+    if let Err(err) = result {
+        if err
+            .as_database_error()
+            .is_some_and(|err| err.is_unique_violation())
+        {
+            return Err(ApiError::conflict(
+                ErrorCode::SuiteVersionAlreadyExists,
+                "suite version already exists",
+            ));
+        }
+        return Err(err.into());
+    }
+    tx.commit().await?;
+    Ok(package_id)
 }
 
 /// 读取套件 manifest 与包快照。
-pub async fn fetch_catalog_payload(
+pub async fn fetch_package_payload(
     pool: &DbPool,
-    suite_id: &str,
+    package_id: &str,
 ) -> sqlx::Result<Option<(SuiteManifest, SuitePackageSnapshot)>> {
     let row = sqlx::query_as::<_, (String, String)>(
-        "SELECT manifest_json, package_json FROM suite_catalog_items WHERE suite_id = ?1",
+        "SELECT manifest_json, package_json FROM suite_packages WHERE package_id = ?1",
     )
-    .bind(suite_id)
+    .bind(package_id)
     .fetch_optional(pool)
     .await?;
 
@@ -483,24 +526,121 @@ pub async fn fetch_catalog_payload(
     Ok(Some((manifest, package)))
 }
 
-/// 删除套件目录项。调用方必须先确认该套件没有已安装实例。
-pub async fn delete_catalog_item(pool: &DbPool, suite_id: &str) -> sqlx::Result<()> {
-    sqlx::query("DELETE FROM suite_catalog_items WHERE suite_id = ?1")
-        .bind(suite_id)
-        .execute(pool)
-        .await?;
+/// 阻止删除版本包的实例或安装任务。
+#[derive(Debug, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct SuitePackageOccupant {
+    pub package_id: String,
+    pub version: String,
+    pub node_id: String,
+    pub instance_id: String,
+    pub task_id: Option<String>,
+}
+
+/// 在写事务中检查占用并删除版本包；存在占用时返回完整阻塞列表。
+pub async fn delete_packages(
+    pool: &DbPool,
+    suite_id: &str,
+    package_id: Option<&str>,
+) -> ApiResult<Vec<SuitePackageOccupant>> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let occupants = sqlx::query_as::<_, SuitePackageOccupant>(
+        "SELECT package_id, version, node_id, instance_id, NULL AS task_id FROM suite_instances
+         WHERE suite_id = ?1 AND (?2 IS NULL OR package_id = ?2)
+         UNION ALL
+         SELECT package_id, version, node_id, instance_id, task_id FROM suite_install_tasks
+         WHERE suite_id = ?1 AND (?2 IS NULL OR package_id = ?2) AND is_finished = 0",
+    )
+    .bind(suite_id)
+    .bind(package_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    if !occupants.is_empty() {
+        return Ok(occupants);
+    }
+    let result = sqlx::query(
+        "DELETE FROM suite_packages WHERE suite_id = ?1 AND (?2 IS NULL OR package_id = ?2)",
+    )
+    .bind(suite_id)
+    .bind(package_id)
+    .execute(&mut *tx)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound);
+    }
+    {
+        sqlx::query("DELETE FROM suite_catalog WHERE suite_id = ? AND NOT EXISTS (SELECT 1 FROM suite_packages WHERE suite_id = ?1)")
+            .bind(suite_id).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(occupants)
+}
+
+/// 原子预留节点实例和安装任务，防止删包与并发安装穿透检查。
+pub async fn reserve_installation(
+    pool: &DbPool,
+    instance: &SuiteInstanceSummary,
+    task: &SuiteInstallTaskRecord,
+) -> ApiResult<()> {
+    if instance.package_id != task.package_id
+        || instance.instance_id != task.instance_id
+        || instance.suite_id != task.suite_id
+        || instance.version != task.version
+        || instance.node_id != task.node_id
+        || task.is_finished
+    {
+        return Err(ApiError::validation(
+            "installation task does not match instance",
+        ));
+    }
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM suite_packages WHERE package_id = ? AND suite_id = ? AND version = ? AND checksum = ?)",
+    ).bind(&task.package_id).bind(&task.suite_id).bind(&task.version).bind(&task.checksum)
+        .fetch_one(&mut *tx).await?;
+    if !exists {
+        return Err(ApiError::NotFound);
+    }
+    if let Err(err) = insert_instance(&mut *tx, instance).await {
+        if err
+            .as_database_error()
+            .is_some_and(|err| err.is_unique_violation())
+        {
+            return Err(ApiError::conflict(
+                ErrorCode::SuiteAlreadyInstalled,
+                "suite already installed on node",
+            ));
+        }
+        return Err(err.into());
+    }
+    if let Err(err) = insert_install_task(&mut *tx, task).await {
+        if err
+            .as_database_error()
+            .is_some_and(|err| err.is_unique_violation())
+        {
+            return Err(ApiError::conflict(
+                ErrorCode::SuiteOperationBusy,
+                "suite installation is already active",
+            ));
+        }
+        return Err(err.into());
+    }
+    tx.commit().await?;
     Ok(())
 }
 
 /// 创建套件实例记录。
-pub async fn insert_instance(pool: &DbPool, instance: &SuiteInstanceSummary) -> sqlx::Result<()> {
+pub async fn insert_instance<'e>(
+    pool: impl sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    instance: &SuiteInstanceSummary,
+) -> sqlx::Result<()> {
     sqlx::query(
         r#"
         INSERT INTO suite_instances (
             instance_id, suite_id, version, platform_contract_version, node_id,
-            compose_project_name, status, last_error
+            compose_project_name, status, last_error, package_id
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
         "#,
     )
     .bind(&instance.instance_id)
@@ -511,6 +651,7 @@ pub async fn insert_instance(pool: &DbPool, instance: &SuiteInstanceSummary) -> 
     .bind(&instance.compose_project_name)
     .bind(&instance.status)
     .bind(&instance.last_error)
+    .bind(&instance.package_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -523,7 +664,7 @@ pub async fn fetch_instance(
 ) -> sqlx::Result<Option<SuiteInstanceSummary>> {
     sqlx::query_as::<_, SuiteInstanceSummary>(
         r#"
-        SELECT instance_id,
+        SELECT instance_id, package_id,
                suite_id,
                version,
                platform_contract_version,
@@ -550,7 +691,7 @@ pub async fn fetch_instance_by_suite_and_node(
 ) -> sqlx::Result<Option<SuiteInstanceSummary>> {
     sqlx::query_as::<_, SuiteInstanceSummary>(
         r#"
-        SELECT instance_id,
+        SELECT instance_id, package_id,
                suite_id,
                version,
                platform_contract_version,
@@ -570,15 +711,6 @@ pub async fn fetch_instance_by_suite_and_node(
     .bind(node_id)
     .fetch_optional(pool)
     .await
-}
-
-/// 判断套件是否仍存在任意节点实例。
-pub async fn suite_has_instances(pool: &DbPool, suite_id: &str) -> sqlx::Result<bool> {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM suite_instances WHERE suite_id = ?1")
-        .bind(suite_id)
-        .fetch_one(pool)
-        .await?;
-    Ok(count > 0)
 }
 
 /// 更新实例状态。
@@ -679,13 +811,16 @@ pub async fn delete_instance(pool: &DbPool, instance_id: &str) -> sqlx::Result<(
 }
 
 /// 创建可恢复的套件安装任务。
-pub async fn insert_install_task(pool: &DbPool, task: &SuiteInstallTaskRecord) -> sqlx::Result<()> {
+pub async fn insert_install_task<'e>(
+    pool: impl sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    task: &SuiteInstallTaskRecord,
+) -> sqlx::Result<()> {
     sqlx::query(
         r#"
         INSERT INTO suite_install_tasks (
             task_id, instance_id, suite_id, node_id, progress_percent, status,
-            current_step, current_image, is_finished, error, cancel_requested
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            current_step, current_image, is_finished, error, cancel_requested, package_id, version, checksum
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
         "#,
     )
     .bind(&task.task_id)
@@ -699,6 +834,7 @@ pub async fn insert_install_task(pool: &DbPool, task: &SuiteInstallTaskRecord) -
     .bind(task.is_finished)
     .bind(&task.error)
     .bind(task.cancel_requested)
+    .bind(&task.package_id).bind(&task.version).bind(&task.checksum)
     .execute(pool)
     .await?;
     Ok(())
@@ -817,7 +953,7 @@ pub async fn update_install_task(
             finished_at = CASE WHEN ?6 = 1
                 THEN COALESCE(finished_at, (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
                 ELSE NULL END
-        WHERE task_id = ?1
+        WHERE task_id = ?1 AND is_finished = 0
         "#,
     )
     .bind(task_id)
@@ -878,6 +1014,9 @@ mod install_task_tests {
 
     fn task(task_id: &str, suite_id: &str) -> SuiteInstallTaskRecord {
         SuiteInstallTaskRecord {
+            package_id: format!("package-{suite_id}"),
+            version: "1.0.0".to_string(),
+            checksum: "checksum".to_string(),
             task_id: task_id.to_string(),
             instance_id: format!("instance-{task_id}"),
             suite_id: suite_id.to_string(),
@@ -932,6 +1071,9 @@ mod install_task_tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(task.package_id, "package-suite-1");
+        assert_eq!(task.version, "1.0.0");
+        assert_eq!(task.checksum, "checksum");
         assert_eq!(task.status, "failed");
         assert!(task.is_finished);
         assert_eq!(
@@ -1072,11 +1214,15 @@ mod install_task_tests {
             "compatibility": { "platformContractVersion": 1 },
             "runtime": { "type": "compose", "composeFile": "compose.yaml" }
         });
+        sqlx::query("INSERT INTO suite_catalog (suite_id) VALUES ('suite-count')")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query(
             r#"
-            INSERT INTO suite_catalog_items (
-                suite_id, version, name, manifest_json, package_json, checksum
-            ) VALUES ('suite-count', '1.0.0', 'Suite Count', ?1, '{}', 'checksum')
+            INSERT INTO suite_packages (
+                package_id, suite_id, version, name, manifest_json, package_json, checksum
+            ) VALUES ('package-count', 'suite-count', '1.0.0', 'Suite Count', ?1, '{}', 'checksum')
             "#,
         )
         .bind(manifest.to_string())
@@ -1087,6 +1233,7 @@ mod install_task_tests {
             insert_instance(
                 &pool,
                 &SuiteInstanceSummary {
+                    package_id: "package-count".to_string(),
                     instance_id: format!("instance-{node_id}"),
                     suite_id: "suite-count".to_string(),
                     version: "1.0.0".to_string(),
@@ -1110,3 +1257,7 @@ mod install_task_tests {
         assert_eq!(result.catalog[0].instance_count, 2);
     }
 }
+
+#[cfg(test)]
+#[path = "suite_versions_tests.rs"]
+mod version_tests;

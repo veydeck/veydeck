@@ -136,7 +136,10 @@ const zh: typeof en = {
     errors: {
       SUITE_RETAINED_DATA_REQUIRES_ADOPTION:
         '检测到此前保留的套件数据，请勾选“接管此前保留的套件数据”后重新安装。',
-      SUITE_RESOURCE_IN_USE: '该套件的数据正在被其他实例使用，请先卸载原实例。',
+      SUITE_VERSION_ALREADY_EXISTS: '该套件版本已存在，不允许覆盖。',
+      SUITE_ALREADY_INSTALLED: '当前节点已安装该套件，请先卸载实例。',
+      SUITE_OPERATION_BUSY: '该套件有未结束的安装任务，请等待任务结束。',
+      SUITE_RESOURCE_IN_USE: '套件资源正在被实例或任务占用，请先解除占用。',
       controlServiceUnavailable: '请检查主控服务是否运行',
       FILE_INVALID_PATH: '请输入有效的绝对文件路径。',
       FILE_NOT_FOUND: '文件或目录已不存在。',
@@ -192,6 +195,18 @@ const zh: typeof en = {
   },
   app: {
     suiteCenter: {
+      centralLibraryHint:
+        '套件包上传到主控的中心版本库，供所有节点选择安装；同一套件的相同版本不允许重复上传。',
+      installedVersion: '已安装 {version}',
+      notInstalled: '未安装',
+      availableVersions: '{count} 个可用版本',
+      versionLibrary: '中心版本库',
+      chooseVersion: '请选择安装版本',
+      versionInstances: '{count} 个节点实例',
+      deleteAllVersions: '删除整个套件',
+      deleteVersionConfirm: '确认删除 {name} 的 {version} 版本包吗？此操作影响整个中心版本库。',
+      packageInUse: '以下节点实例或安装任务正在引用版本包，请先解除占用：',
+
       appName: '套件中心',
       loading: '正在加载套件...',
       empty: '还没有导入套件。',
@@ -212,8 +227,8 @@ const zh: typeof en = {
       uninstallTitle: '卸载套件',
       uninstallConfirm: '确认卸载 {name} 吗？套件程序和运行配置将被移除。',
       uninstallMessage: '确认卸载 {name} 吗？卸载会删除套件程序和运行配置，数据卷默认保留。',
-      deleteTitle: '删除套件包',
-      deleteConfirm: '确认从套件中心删除 {name} 吗？再次安装前必须重新导入套件包。',
+      deleteTitle: '删除中心库内容',
+      deleteConfirm: '确认删除中心库中 {name} 的全部版本吗？此操作影响所有节点的可用套件库。',
       deleteMessage: '确认从套件中心删除 {name} 吗？删除后需要重新导入套件包才能再次安装。',
       adoptRetainedData: '接管此前保留的套件数据（如有）',
       removeData: '同时删除套件数据',
@@ -244,6 +259,7 @@ const zh: typeof en = {
         deletePackage: '删除套件包',
       },
       fields: {
+        installedVersion: '当前节点安装版本',
         version: '版本',
         category: '分类',
         node: '节点',
