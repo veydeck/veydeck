@@ -213,7 +213,8 @@ pub struct ImagePullStartResponse {
 pub struct ImagePullProgressResponse {
     pub task_id: String,
     pub image_name: String,
-    pub tag: String,
+    pub image_ref: String,
+    pub tag: Option<String>,
     pub status: ImagePullStatus,
     pub progress_percent: u8,
     pub status_text: Option<String>,
@@ -241,8 +242,7 @@ pub struct ImagePullLayerProgress {
 
 #[derive(Debug, Clone)]
 struct ImagePullTask {
-    image_name: String,
-    tag: String,
+    target: RegistryPullTarget,
     status: ImagePullStatus,
     progress_percent: u8,
     status_text: Option<String>,
@@ -663,15 +663,7 @@ pub async fn pull_image(
     context: DockerOperationContext,
     Json(payload): Json<PullRequest>,
 ) -> ApiResult<Response> {
-    let image_ref = parse_docker_hub_image_ref(&payload.image_name)?;
-    let tag = if let Some(tag) = payload.tag.filter(|tag| !tag.trim().is_empty()) {
-        tag.trim().to_string()
-    } else if let Some(tag) = image_ref.requested_tag.clone() {
-        tag
-    } else {
-        "latest".to_string()
-    };
-    let image_name = image_ref.repository_ref();
+    let target = parse_registry_pull_target(&payload.image_name, payload.tag.as_deref())?;
     let task_id = Uuid::new_v4().to_string();
     let cancel = Arc::new(AtomicBool::new(false));
 
@@ -682,8 +674,7 @@ pub async fn pull_image(
         tasks.insert(
             task_id.clone(),
             ImagePullTask {
-                image_name: image_name.clone(),
-                tag: tag.clone(),
+                target: target.clone(),
                 status: ImagePullStatus::Pending,
                 progress_percent: 0,
                 status_text: Some("Waiting to pull image".to_string()),
@@ -697,15 +688,7 @@ pub async fn pull_image(
     let task_id_for_worker = task_id.clone();
     let worker_context = context.clone();
     tokio::spawn(async move {
-        run_image_pull_task(
-            state,
-            worker_context,
-            task_id_for_worker,
-            image_name,
-            tag,
-            cancel,
-        )
-        .await;
+        run_image_pull_task(state, worker_context, task_id_for_worker, target, cancel).await;
     });
 
     Ok(ApiResponse::success_with_raw(
@@ -756,7 +739,7 @@ pub async fn cancel_pull_image(
         }
         (
             task.to_response(task_id.clone()),
-            format!("{}:{}", task.image_name, task.tag),
+            task.target.image_ref.clone(),
         )
     };
 
@@ -781,22 +764,24 @@ async fn run_image_pull_task(
     state: Arc<AppState>,
     context: DockerOperationContext,
     task_id: String,
-    image_name: String,
-    tag: String,
+    target: RegistryPullTarget,
     cancel: Arc<AtomicBool>,
 ) {
+    let image_name = &target.repository;
+    let tag = &target.tag;
+    let image_ref = &target.image_ref;
     let image_acquisition = context.is_image_acquisition();
     let context = context.into_public_system_actor();
     update_pull_task(&task_id, |task| {
         task.status = ImagePullStatus::Pulling;
         task.progress_percent = 5;
-        task.status_text = Some(format!("Pulling {image_name}:{tag}"));
+        task.status_text = Some(format!("Pulling {image_ref}"));
     });
 
     let result = async {
         pull_registry_image(
             &state,
-            &format!("{image_name}:{tag}"),
+            image_ref,
             || cancel.load(Ordering::Relaxed),
             |info| update_pull_task_from_stream(&task_id, info),
         )
@@ -804,7 +789,7 @@ async fn run_image_pull_task(
     }
     .await;
 
-    let target = format!("{image_name}:{tag}");
+    let target = image_ref;
     let (event_code, target_kind) = image_pull_audit_descriptor(image_acquisition);
     let target_id = if image_acquisition {
         target.as_str()
@@ -905,8 +890,9 @@ pub async fn pull_registry_image(
 }
 
 fn split_registry_image_ref(image_ref: &str) -> (String, Option<String>) {
-    if image_ref.contains("@sha256:") {
-        return (image_ref.to_string(), None);
+    if let Some((name, digest)) = image_ref.split_once('@') {
+        let (repository, _) = split_registry_image_ref(name);
+        return (repository, Some(digest.to_string()));
     }
     let slash = image_ref.rfind('/').unwrap_or(0);
     if let Some(colon) = image_ref.rfind(':').filter(|colon| *colon > slash) {
@@ -984,8 +970,9 @@ impl ImagePullTask {
         layers.sort_by(|left, right| left.id.cmp(&right.id));
         ImagePullProgressResponse {
             task_id,
-            image_name: self.image_name.clone(),
-            tag: self.tag.clone(),
+            image_name: self.target.repository.clone(),
+            image_ref: self.target.image_ref.clone(),
+            tag: self.target.tag.clone(),
             status: self.status.clone(),
             progress_percent: self.progress_percent,
             status_text: self.status_text.clone(),
@@ -993,6 +980,79 @@ impl ImagePullTask {
             layers,
         }
     }
+}
+
+/// 镜像拉取目标独立于标签浏览，完整引用贯穿任务、进度和审计。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistryPullTarget {
+    repository: String,
+    tag: Option<String>,
+    image_ref: String,
+}
+
+/// 解析拉取引用；摘要优先，拒绝通过单独 tag 参数覆盖摘要。
+fn parse_registry_pull_target(
+    raw: &str,
+    tag_override: Option<&str>,
+) -> Result<RegistryPullTarget, AgentError> {
+    let raw = raw.trim();
+    if raw.chars().any(char::is_whitespace) || raw.contains("://") {
+        return Err(AgentError::BadRequest("invalid image reference".into()));
+    }
+    let tag_override = tag_override.map(str::trim).filter(|tag| !tag.is_empty());
+    let (name, digest) = match raw.split_once('@') {
+        Some((name, digest)) => {
+            let hash = digest.strip_prefix("sha256:").ok_or_else(|| {
+                AgentError::BadRequest("only sha256 image digests are supported".into())
+            })?;
+            if hash.len() != 64 || !hash.bytes().all(|value| value.is_ascii_hexdigit()) {
+                return Err(AgentError::BadRequest(
+                    "sha256 image digest must contain 64 hexadecimal characters".into(),
+                ));
+            }
+            if tag_override.is_some() {
+                return Err(AgentError::BadRequest(
+                    "tag must not be supplied separately for a digest image reference".into(),
+                ));
+            }
+            (name, Some(digest))
+        }
+        None => (raw, None),
+    };
+    let parsed = parse_docker_hub_image_ref(name)?;
+    let repository = parsed.repository_ref();
+    let tag = if digest.is_some() {
+        parsed.requested_tag
+    } else {
+        Some(
+            tag_override
+                .map(str::to_string)
+                .or(parsed.requested_tag)
+                .unwrap_or_else(|| "latest".into()),
+        )
+    };
+    if tag.as_ref().is_some_and(|value| {
+        value.len() > 128
+            || !value.bytes().enumerate().all(|(index, ch)| {
+                ch.is_ascii_alphanumeric() || ch == b'_' || (index > 0 && matches!(ch, b'.' | b'-'))
+            })
+    }) {
+        return Err(AgentError::BadRequest("invalid image tag".into()));
+    }
+    let mut image_ref = repository.clone();
+    if let Some(tag) = &tag {
+        image_ref.push(':');
+        image_ref.push_str(tag);
+    }
+    if let Some(digest) = digest {
+        image_ref.push('@');
+        image_ref.push_str(&digest.to_ascii_lowercase());
+    }
+    Ok(RegistryPullTarget {
+        repository,
+        tag,
+        image_ref,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1543,8 +1603,73 @@ mod tests {
         );
         assert_eq!(
             split_registry_image_ref("team/app@sha256:0123456789abcdef"),
-            ("team/app@sha256:0123456789abcdef".to_string(), None)
+            (
+                "team/app".to_string(),
+                Some("sha256:0123456789abcdef".to_string())
+            )
         );
+    }
+
+    /// 摘要引用从解析、任务响应直到 Engine 参数均保持相同目标。
+    #[test]
+    fn digest_pull_target_is_preserved_through_progress_and_engine_options() {
+        let digest = "sha256:a7675fcee220f59b4a99f7098c06a0d5d999c2c0ee37c0211efb780536e5cb20";
+        for name in [
+            "nginx",
+            "nginx:1.30.6-trixie",
+            "docker.io/library/nginx:1.30.6-trixie",
+        ] {
+            let target = parse_registry_pull_target(&format!("{name}@{digest}"), None).unwrap();
+            assert!(target.image_ref.ends_with(digest));
+            assert_eq!(
+                split_registry_image_ref(&target.image_ref),
+                ("library/nginx".into(), Some(digest.into()))
+            );
+            let task = ImagePullTask {
+                target: target.clone(),
+                status: ImagePullStatus::Pending,
+                progress_percent: 0,
+                status_text: None,
+                error: None,
+                layers: HashMap::new(),
+                cancel: Arc::new(AtomicBool::new(false)),
+            };
+            let progress = serde_json::to_value(task.to_response("task-1".into())).unwrap();
+            assert_eq!(progress["imageRef"], target.image_ref);
+            assert_eq!(progress["tag"], serde_json::to_value(&target.tag).unwrap());
+        }
+    }
+
+    /// 普通版本仍按现有优先级工作，非法摘要及混用参数不能降级到标签。
+    #[test]
+    fn pull_target_rejects_invalid_digests_and_conflicting_tags() {
+        assert_eq!(
+            parse_registry_pull_target("nginx", None).unwrap().image_ref,
+            "library/nginx:latest"
+        );
+        assert_eq!(
+            parse_registry_pull_target("nginx:1.30", Some("1.30.6-trixie"))
+                .unwrap()
+                .image_ref,
+            "library/nginx:1.30.6-trixie"
+        );
+        for reference in [
+            "nginx@sha256:",
+            "nginx@sha256:abc",
+            "nginx@sha512:abc",
+            "nginx@sha256:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "nginx@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@other",
+            "nginx @sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(
+                parse_registry_pull_target(reference, None).is_err(),
+                "{reference}"
+            );
+        }
+        let digest = format!("nginx@sha256:{}", "a".repeat(64));
+        assert!(parse_registry_pull_target(&digest, Some("latest")).is_err());
+        assert!(parse_registry_pull_target(&digest, Some(" ")).is_ok());
+        assert!(parse_registry_pull_target("registry.example.com/team/app:1", None).is_err());
     }
 
     #[test]
