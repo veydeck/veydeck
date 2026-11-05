@@ -249,8 +249,18 @@ async fn main() {
         shutdown_handle.graceful_shutdown(Some(GRACEFUL_SHUTDOWN_TIMEOUT));
     });
 
-    if let Err(err) = axum_server::bind_rustls(listen_addr, tls_config)
-        .handle(handle)
+    let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(tls_config)
+        .acceptor(axum_server::accept::NoDelayAcceptor::new());
+    let mut server = axum_server::Server::bind(listen_addr)
+        .acceptor(acceptor)
+        .handle(handle);
+    // 与 Master 使用相同的分块接收窗口，避免分布式上传逐帧等待流控更新。
+    server
+        .http_builder()
+        .http2()
+        .initial_stream_window_size(8 * 1024 * 1024)
+        .initial_connection_window_size(16 * 1024 * 1024);
+    if let Err(err) = server
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
     {

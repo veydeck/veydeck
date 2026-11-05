@@ -16,9 +16,9 @@ use crate::{
     types::{ApiError, ApiResponse, ApiResult},
 };
 use axum::{
-    Json, Router,
-    body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Path, Query, State},
+    Json, RequestExt, Router,
+    body::Body,
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{HeaderMap, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -430,26 +430,48 @@ async fn active_transfers(
     )
 }
 
+/// 检查声明长度并保留路由对实际字节流的限制，避免转发前整块聚合。
+fn bounded_upload_body(request: Request) -> ApiResult<Body> {
+    if let Some(length) = request.headers().get(header::CONTENT_LENGTH) {
+        let length = length
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| ApiError::validation("invalid upload content length"))?;
+        if length > MAX_CHUNK_BYTES {
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ErrorCode::ValidationFailed,
+                "upload chunk exceeds size limit",
+            ));
+        }
+    }
+    Ok(request.into_limited_body())
+}
+
 async fn upload_chunk(
     State(state): State<Arc<AppState>>,
     Path((node_id, transfer_id)): Path<(String, String)>,
     admin: AuthenticatedAdmin,
     incoming_headers: HeaderMap,
-    bytes: Bytes,
+    request: Request,
 ) -> ApiResult<Response> {
+    let body = bounded_upload_body(request)?;
     let (client, _) = node_client(&state, &node_id).await?;
     let context = operation_context(&admin, &incoming_headers)?;
     let mut headers = HeaderMap::new();
     if let Some(value) = incoming_headers.get(header::CONTENT_RANGE) {
         headers.insert(header::CONTENT_RANGE, value.clone());
     }
-    headers.insert(header::CONTENT_LENGTH, bytes.len().into());
+    if let Some(value) = incoming_headers.get(header::CONTENT_LENGTH) {
+        headers.insert(header::CONTENT_LENGTH, value.clone());
+    }
     client
         .forward_streaming_with_operation_context(
             Method::PUT,
             &format!("{AGENT_BASE_PATH}/transfer/{transfer_id}/chunk"),
             headers,
-            Body::from(bytes),
+            body,
             &context,
         )
         .await
@@ -693,5 +715,87 @@ mod tests {
             show_hidden: false,
         };
         assert!(validate_list_query(&query).is_err());
+    }
+    /// 验证上传在请求结束前即可被消费，声明长度和实际流仍受同一上限约束。
+    #[tokio::test]
+    async fn upload_body_streams_early_and_keeps_size_limits() {
+        use axum::body::Bytes;
+        use std::io;
+        use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let first_tx = Arc::new(tokio::sync::Mutex::new(Some(first_tx)));
+        let app = Router::new()
+            .route(
+                "/upload",
+                axum::routing::put(move |request: Request| {
+                    let first_tx = first_tx.clone();
+                    async move {
+                        let body = match bounded_upload_body(request) {
+                            Ok(body) => body,
+                            Err(error) => return error.into_response(),
+                        };
+                        let mut stream = body.into_data_stream();
+                        let mut received = 0;
+                        while let Some(chunk) = stream.next().await {
+                            match chunk {
+                                Ok(chunk) => {
+                                    received += chunk.len();
+                                    if let Some(sender) = first_tx.lock().await.take() {
+                                        let _ = sender.send(());
+                                    }
+                                }
+                                Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+                            }
+                        }
+                        received.to_string().into_response()
+                    }
+                }),
+            )
+            .layer(DefaultBodyLimit::max(MAX_CHUNK_BYTES));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = axum_server::Handle::new();
+        let server = axum_server::Server::from_tcp(listener).handle(handle.clone());
+        let serving = tokio::spawn(server.serve(app.into_make_service()));
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, io::Error>>(2);
+        let request = client
+            .put(format!("http://{address}/upload"))
+            .body(reqwest::Body::wrap_stream(ReceiverStream::new(receiver)))
+            .send();
+        let pending = tokio::spawn(request);
+        sender.send(Ok(Bytes::from_static(b"first"))).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), first_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        sender
+            .send(Ok(Bytes::from_static(b"second")))
+            .await
+            .unwrap();
+        drop(sender);
+        assert_eq!(pending.await.unwrap().unwrap().text().await.unwrap(), "11");
+        let oversized = Bytes::from(vec![0; MAX_CHUNK_BYTES + 1]);
+        let response = client
+            .put(format!("http://{address}/upload"))
+            .body(oversized.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let response = client
+            .put(format!("http://{address}/upload"))
+            .body(reqwest::Body::wrap_stream(tokio_stream::iter([Ok::<
+                _,
+                io::Error,
+            >(
+                oversized,
+            )])))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        handle.shutdown();
+        serving.await.unwrap().unwrap();
     }
 }

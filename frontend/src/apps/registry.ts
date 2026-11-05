@@ -72,6 +72,19 @@ export const appRegistry = {
     nodeScope: 'explicit-node',
     nodeSwitchPolicy: 'allow',
   },
+  'task-center': {
+    component: markRaw(defineAsyncComponent(() => import('@/apps/views/TaskCenterView.vue'))),
+    title: '',
+    i18nTitleKey: '',
+    icon: '',
+    minWidth: 0,
+    minHeight: 0,
+    defaultWidth: 0,
+    defaultHeight: 0,
+    nodeScope: 'global',
+    nodeSwitchPolicy: 'allow',
+    contextMenuPolicy: 'app',
+  },
   'notification-center': {
     component: markRaw(
       defineAsyncComponent(() => import('@/apps/views/NotificationCenterView.vue')),

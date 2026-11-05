@@ -1,8 +1,8 @@
-import { defineComponent, ref } from 'vue'
-import { createI18n } from 'vue-i18n'
+import { defineComponent } from 'vue'
+import { createI18n, useI18n } from 'vue-i18n'
 import { flushPromises, mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { useFileOperations } from '@/composables/useFileOperations'
+import { createFileUploadRunner } from '@/services/file-upload'
 import zh from '@/locales/zh'
 
 const client = vi.hoisted(() => ({
@@ -12,6 +12,7 @@ const client = vi.hoisted(() => ({
   uploadChunk: vi.fn(),
   completeTransfer: vi.fn(),
   cancelTransfer: vi.fn(),
+  transferDetail: vi.fn(),
 }))
 
 vi.mock('@/api/modules/fs', () => ({
@@ -36,7 +37,7 @@ const transfer = (transferId: string, path: string, sizeBytes: number, transferr
 })
 
 const Harness = defineComponent({
-  setup: () => useFileOperations(ref('node-a')),
+  setup: () => createFileUploadRunner('node-a', useI18n().t),
   template: '<div />',
 })
 const mountHarness = () =>
@@ -44,7 +45,7 @@ const mountHarness = () =>
     global: { plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })] },
   })
 
-describe('useFileOperations upload task', () => {
+describe('file upload runner', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     client.mkdir.mockResolvedValue(response({}))
@@ -170,5 +171,78 @@ describe('useFileOperations upload task', () => {
     expect(wrapper.vm.uploadTask.status).toBe('cancelled')
     expect(wrapper.vm.uploadTask.completedFiles).toBe(0)
     wrapper.unmount()
+  })
+  it('大文件按 8 MiB 分块传输并保持连续范围', async () => {
+    const wrapper = mountHarness()
+    const file = new File([new Uint8Array(8 * 1024 * 1024 + 1)], 'large.bin')
+    await wrapper.vm.startUpload('/home', {
+      kind: 'files',
+      displayName: file.name,
+      files: [{ file, relativePath: file.name }],
+    })
+    expect(client.uploadChunk).toHaveBeenCalledTimes(2)
+    expect(client.uploadChunk.mock.calls.map((call) => call.slice(2, 5))).toEqual([
+      [0, 8 * 1024 * 1024 - 1, file.size],
+      [8 * 1024 * 1024, file.size - 1, file.size],
+    ])
+    expect(wrapper.vm.uploadTask.status).toBe('completed')
+    wrapper.unmount()
+  })
+
+  it('提交响应丢失时从服务端确认完成，不误报失败', async () => {
+    client.completeTransfer.mockResolvedValueOnce({ success: false, message: 'connection lost' })
+    client.cancelTransfer.mockResolvedValueOnce({ success: false, message: 'already completed' })
+    client.transferDetail.mockResolvedValueOnce(
+      response({ ...transfer('transfer-1', '/home/file', 3, 3), status: 'completed' }),
+    )
+    const wrapper = mountHarness()
+    await wrapper.vm.startUpload('/home', {
+      kind: 'files',
+      displayName: 'file',
+      files: [{ file: new File(['abc'], 'file'), relativePath: 'file' }],
+    })
+    expect(wrapper.vm.uploadTask.status).toBe('completed')
+    expect(wrapper.vm.uploadTask.completedFiles).toBe(1)
+    wrapper.unmount()
+  })
+
+  it('取消清理失败时保持取消中，恢复连接后才进入终态', async () => {
+    vi.useFakeTimers()
+    let rejectCancel!: (error: Error) => void
+    client.cancelTransfer.mockReturnValueOnce(
+      new Promise((_resolve, reject) => {
+        rejectCancel = reject
+      }),
+    )
+    client.uploadChunk.mockImplementation(
+      (_id, _chunk, _start, _end, _total, options: { signal: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          options.signal.addEventListener('abort', () =>
+            reject(new DOMException('Aborted', 'AbortError')),
+          )
+        }),
+    )
+    const wrapper = mountHarness()
+    try {
+      const running = wrapper.vm.startUpload('/home', {
+        kind: 'files',
+        displayName: 'file',
+        files: [{ file: new File(['abc'], 'file'), relativePath: 'file' }],
+      })
+      await flushPromises()
+      const cancellation = wrapper.vm.cancelUpload()
+      rejectCancel(new Error('offline'))
+      await flushPromises()
+      expect(wrapper.vm.uploadTask.status).toBe('cancelling')
+      expect(wrapper.vm.uploadTask.connectionError).toBe('offline')
+      await vi.advanceTimersByTimeAsync(1000)
+      await cancellation
+      await running
+      expect(wrapper.vm.uploadTask.status).toBe('cancelled')
+      expect(wrapper.vm.uploadTask.connectionError).toBeUndefined()
+    } finally {
+      wrapper.unmount()
+      vi.useRealTimers()
+    }
   })
 })

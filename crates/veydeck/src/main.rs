@@ -227,9 +227,16 @@ async fn main() {
     };
 
     let acceptor = self::acceptor::HttpOrHttpsAcceptor::new(tls_config);
-    axum_server::Server::from_tcp(listener)
+    let mut server = axum_server::Server::from_tcp(listener)
         .acceptor(acceptor)
-        .handle(handle)
+        .handle(handle);
+    // 单个 8 MiB 分块可完整进入流控窗口，连接允许两份分块并行推进。
+    server
+        .http_builder()
+        .http2()
+        .initial_stream_window_size(8 * 1024 * 1024)
+        .initial_connection_window_size(16 * 1024 * 1024);
+    server
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .unwrap();

@@ -39,6 +39,8 @@ where
     fn accept(&self, stream: TcpStream, service: S) -> Self::Future {
         let rustls_acceptor = self.rustls_acceptor.clone();
         Box::pin(async move {
+            // 避免 HTTP/2 小型流控帧与分块确认响应被 Nagle 算法延迟发送。
+            stream.set_nodelay(true)?;
             // 嗅探首字节，但不从 TCP 缓冲区移除数据
             let first_byte = peek_first_byte(&stream, PROTOCOL_SNIFF_TIMEOUT).await?;
 
@@ -208,5 +210,28 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::TimedOut);
+    }
+    /// 连接进入协议识别前启用低延迟模式，覆盖 TLS 和 HTTP 重定向两条路径。
+    #[tokio::test]
+    async fn accepted_connection_disables_nagle_before_protocol_sniff() {
+        use axum_server::accept::Accept;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (mut client, server) = connected_pair().await;
+        let socket = server.into_std().unwrap();
+        let inspect = socket.try_clone().unwrap();
+        let server = tokio::net::TcpStream::from_std(socket).unwrap();
+        let cert =
+            veydeck_security::certs::issue_server_cert("nodelay-test", &["localhost".to_string()])
+                .unwrap();
+        let config = axum_server::tls_rustls::RustlsConfig::from_pem(cert.cert_pem, cert.key_pem)
+            .await
+            .unwrap();
+        let acceptor = super::HttpOrHttpsAcceptor::new(config);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let _accepted = acceptor.accept(server, ()).await.unwrap();
+        assert!(inspect.nodelay().unwrap());
     }
 }

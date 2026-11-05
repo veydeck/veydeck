@@ -1,7 +1,7 @@
 import { defineComponent, nextTick } from 'vue'
 import { createPinia } from 'pinia'
 import { createI18n } from 'vue-i18n'
-import { mount } from '@vue/test-utils'
+import { mount, flushPromises } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useNodeStore } from '@/stores/node'
 import { useWindowManagerStore } from '@/stores/window-manager'
@@ -183,6 +183,56 @@ describe('套件窗口节点切换守卫', () => {
       nodeId: 'node-a',
     })
     expect(wrapper.vm.windowStore.checkBeforeNodeSwitch().allowed).toBe(false)
+    wrapper.unmount()
+  })
+})
+
+/** 任务中心复用普通应用窗口，不占用全局节点或桌面交互。 */
+describe('任务中心窗口', () => {
+  it('允许共存、最小化和节点切换，重复打开聚焦同一窗口', async () => {
+    fetchAppsMock.mockResolvedValue({
+      success: true,
+      data: [
+        {
+          appId: 'task-center',
+          i18nTitleKey: 'taskCenter.title',
+          icon: '/images/apps/task-center.png',
+          defaultWidth: 1024,
+          defaultHeight: 640,
+          minWidth: 640,
+          minHeight: 360,
+          hidden: false,
+          sortOrder: 151,
+          sourceType: 'builtin',
+        },
+      ],
+    })
+    const pinia = createPinia()
+    const wrapper = mount(Harness, {
+      global: {
+        plugins: [pinia, createI18n({ legacy: false, locale: 'zh', messages: { zh, en } })],
+      },
+    })
+    await flushPromises()
+    const store = wrapper.vm.windowStore
+    store.openWindow('task-center')
+    const window = store.openWindows[0]!
+    expect(window.title).toBe('任务中心')
+    expect(window.width).toBe(1024)
+    expect(window.nodeContext?.nodeScope).toBe('global')
+    expect(store.checkBeforeNodeSwitch().allowed).toBe(true)
+    expect(store.checkBeforeCloseWindow(window.id).allowed).toBe(true)
+    store.minimizeWindow(window.id)
+    expect(window.isMinimized).toBe(true)
+    store.openWindow('task-center')
+    expect(window.isMinimized).toBe(false)
+    expect(store.openWindows).toHaveLength(1)
+    store.openWindow('notification-center')
+    expect(store.openWindows).toHaveLength(2)
+    store.toggleMaximize(window.id)
+    expect(window.isMaximized).toBe(true)
+    store.closeWindow(window.id)
+    expect(store.openWindows.some((item) => item.id === window.id)).toBe(false)
     wrapper.unmount()
   })
 })

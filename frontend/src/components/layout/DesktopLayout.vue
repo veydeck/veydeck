@@ -1,6 +1,12 @@
 <script setup lang="ts">
+import { onMounted, onUnmounted } from 'vue'
+import { useTaskCenterStore } from '@/stores/task-center'
 import { RouterView } from 'vue-router'
 import DesktopHeader from './DesktopHeader.vue'
+
+const taskCenter = useTaskCenterStore()
+onMounted(() => taskCenter.start())
+onUnmounted(() => taskCenter.reset())
 
 /**
  * @file DesktopLayout.vue

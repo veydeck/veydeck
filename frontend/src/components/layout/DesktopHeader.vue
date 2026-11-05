@@ -6,6 +6,7 @@ import { getLoginEntryPath } from '@/utils/login-entry'
 import { useWindowManagerStore, type WindowInstance } from '../../stores/window-manager'
 import type { AppId } from '@/apps/registry'
 import { useToastStore } from '../../stores/toast'
+import { useTaskCenterStore } from '@/stores/task-center'
 import { useNotificationCenterStore } from '../../stores/notification-center'
 import { useConfirmationModalStore } from '../../stores/confirmation-modal'
 import VeyTooltip from '../ui/VeyTooltip.vue'
@@ -21,6 +22,7 @@ const { t } = useI18n()
 const store = useWindowManagerStore()
 const toastStore = useToastStore()
 const notificationCenterStore = useNotificationCenterStore()
+const taskCenter = useTaskCenterStore()
 const confirmationModal = useConfirmationModalStore()
 const router = useRouter()
 const appLibraryOpen = ref(false)
@@ -47,6 +49,7 @@ const currentNodeLabel = computed(() => {
 const currentNodeAddress = computed(() => currentNode.value?.address || t('common.status.unknown'))
 
 function buildCloseBlockMessage() {
+  if (taskCenter.hasBrowserUploads) return t('taskCenter.leaveUpload')
   const blockers = store.checkBeforeCloseAll().blockers
   if (blockers.length === 0) return ''
   const details = blockers
@@ -124,6 +127,7 @@ async function handleLogout() {
   if (!confirmed) return
 
   await http.post('/auth/logout')
+  taskCenter.reset()
   notificationCenterStore.stopPolling(true)
   resetAuthState()
 
@@ -321,6 +325,20 @@ function isLibraryGlassActive(id: AppId) {
     </div>
 
     <div class="header-operate">
+      <VeyTooltip :text="t('taskCenter.title')" position="bottom">
+        <button
+          type="button"
+          class="notification-center-btn"
+          data-ui="desktop-task-center-button"
+          :aria-label="t('taskCenter.title')"
+          @click="taskCenter.open()"
+        >
+          <VeyIcon name="log" :size="18" />
+          <span v-if="taskCenter.activeCount" class="notification-badge" data-slot="task-count">{{
+            taskCenter.activeCount > 99 ? '99+' : taskCenter.activeCount
+          }}</span>
+        </button>
+      </VeyTooltip>
       <VeyTooltip :text="$t('desktop.header.notifications')" position="bottom">
         <button
           type="button"

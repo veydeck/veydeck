@@ -533,9 +533,11 @@ fn is_long_running_request(path: &str) -> bool {
         || is_suite_progress_stream(path)
 }
 
+/// 文件上传分块和下载内容都包含客户端传输时间，统一使用文件流超时。
 fn is_file_content_stream(path: &str) -> bool {
     path.split('?').next().is_some_and(|value| {
-        (value.contains("/agent/files/transfer/") && value.ends_with("/content"))
+        (value.contains("/agent/files/transfer/")
+            && (value.ends_with("/content") || value.ends_with("/chunk")))
             || value.ends_with("/agent/docker/images/load")
     })
 }
@@ -901,6 +903,81 @@ mod tests {
             "/api/v1/node/node-1/agent/docker/images/load"
         ));
         assert!(!is_file_content_stream("/api/v1/agent/docker/images"));
+    }
+
+    /// 上传分块沿用文件流策略，详情、完成与取消仍使用普通请求策略。
+    #[test]
+    fn file_upload_chunks_use_streaming_timeout() {
+        assert!(is_file_content_stream(
+            "/api/v1/agent/files/transfer/transfer-1/chunk"
+        ));
+        assert!(is_file_content_stream(
+            "/api/v1/agent/files/transfer/transfer-1/chunk?trace=upload"
+        ));
+        for action in ["detail", "complete", "cancel"] {
+            assert!(!is_file_content_stream(&format!(
+                "/api/v1/agent/files/transfer/transfer-1/{action}"
+            )));
+        }
+    }
+
+    /// 请求体发送超过客户端默认超时后，上传转发仍能取得 Agent 的确认响应。
+    #[tokio::test]
+    async fn slow_upload_body_outlives_default_request_timeout() {
+        use axum::{Router, body::Body, routing::put};
+        use std::{io, time::Duration};
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let path = "/api/v1/agent/files/transfer/slow-transfer/chunk";
+        let app = Router::new().route(path, put(|body: axum::body::Bytes| async move { body }));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = axum_server::Handle::new();
+        let serving = tokio::spawn(
+            axum_server::Server::from_tcp(listener)
+                .handle(handle.clone())
+                .serve(app.into_make_service()),
+        );
+        let client = NodeRuntimeClient {
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_millis(50))
+                .build()
+                .unwrap(),
+            base_url: format!("http://{address}"),
+            ws_base_url: format!("ws://{address}"),
+            command_credential: None,
+        };
+        let (sender, receiver) =
+            tokio::sync::mpsc::channel::<Result<axum::body::Bytes, io::Error>>(2);
+        let sending = tokio::spawn(async move {
+            sender
+                .send(Ok(axum::body::Bytes::from_static(b"first")))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            sender
+                .send(Ok(axum::body::Bytes::from_static(b"second")))
+                .await
+                .unwrap();
+        });
+        let response = client
+            .forward_streaming(
+                reqwest::Method::PUT,
+                path,
+                axum::http::HeaderMap::new(),
+                Body::from_stream(ReceiverStream::new(receiver)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"firstsecond");
+        sending.await.unwrap();
+        handle.shutdown();
+        serving.await.unwrap().unwrap();
     }
 
     #[tokio::test]

@@ -27,6 +27,7 @@ import ApplicationDialog from '@/components/layout/ApplicationDialog.vue'
 import ApplicationConfirmationDialog from '@/components/layout/ApplicationConfirmationDialog.vue'
 import { formatBytes } from '@/utils/units'
 import { formatDateTime } from '@/utils/time'
+import { useTaskCenterStore } from '@/stores/task-center'
 import { useFileOperations } from '@/composables/useFileOperations'
 import { useApplicationConfirmation } from '@/composables/useApplicationConfirmation'
 
@@ -40,26 +41,14 @@ const { t } = useI18n()
 const toastStore = useToastStore()
 const nodeStore = useNodeStore()
 const windowStore = useWindowManagerStore()
+const taskCenter = useTaskCenterStore()
 const { confirmationState, showConfirmation, handleConfirmationResponse } =
   useApplicationConfirmation()
 const targetNodeId = ref(
   typeof props.payload?.nodeId === 'string' ? props.payload.nodeId : nodeStore.currentNodeId,
 )
-const {
-  createFile,
-  mkdir,
-  removePath,
-  renamePath,
-  runPathTask,
-  downloadFile,
-  uploadTask,
-  uploadActive,
-  startUpload,
-  cancelUpload,
-  dismissUpload,
-  resumeActiveTasks,
-  resumeActiveTransfers,
-} = useFileOperations(targetNodeId)
+const { createFile, mkdir, removePath, renamePath, runPathTask, downloadFile, startUpload } =
+  useFileOperations(targetNodeId)
 
 const currentPath = ref('')
 const pathInput = ref('')
@@ -144,9 +133,7 @@ const currentPageStats = computed(() => ({
   files: entryCounts.value.fileCount,
 }))
 
-const fileManagerBusy = computed(
-  () => listLoading.value || fileOperationCount.value > 0 || uploadActive.value,
-)
+const fileManagerBusy = computed(() => listLoading.value || fileOperationCount.value > 0)
 
 const entryKindLabel = (kind: FsEntry['kind']) => {
   if (kind === 'directory') return t('app.fileManager.dir')
@@ -166,18 +153,14 @@ const runFileOperation = async <T,>(operation: () => Promise<T>) => {
 }
 
 watch(
-  [fileManagerBusy, uploadActive],
-  ([busy, uploadBusy]) => {
+  fileManagerBusy,
+  (busy) => {
     if (!props.windowId) return
     windowStore.updateWindowRuntimeState(props.windowId, {
       busy,
       allowsNodeSwitch: false,
       blockLevel: busy ? 'busy' : 'open',
-      blockReason: uploadBusy
-        ? t('app.fileManager.guardUpload')
-        : busy
-          ? t('app.fileManager.guardBusy')
-          : t('app.fileManager.guardOpen'),
+      blockReason: busy ? t('app.fileManager.guardBusy') : t('app.fileManager.guardOpen'),
     })
   },
   { immediate: true },
@@ -342,11 +325,14 @@ watch(
   () => props.payload,
   () => void openRequestedDirectory(),
 )
-void openRequestedDirectory().then(async () => {
-  const resumed = await runFileOperation(resumeActiveTasks)
-  if (resumed) await refresh()
-  await runFileOperation(resumeActiveTransfers)
+void openRequestedDirectory()
+
+/** 只刷新仍存活且节点、目录匹配的窗口。 */
+const unsubscribeTasks = taskCenter.subscribe((nodeId, directories) => {
+  if (nodeId === targetNodeId.value && directories.includes(currentDisplayPath.value))
+    void refresh()
 })
+onUnmounted(unsubscribeTasks)
 
 // Selection features
 const isSelected = (path: string) => selectedPaths.value.has(path)
@@ -483,22 +469,6 @@ const uploadActions = computed(() => [
     handler: () => folderInput.value?.click(),
   },
 ])
-const uploadProcessedFiles = computed(() => uploadTask.completedFiles + uploadTask.failedFiles)
-const uploadStatusText = computed(() => t(`app.fileManager.uploadTask.${uploadTask.status}`))
-const uploadStatusType = computed(() => {
-  if (uploadTask.status === 'completed') return 'success'
-  if (uploadTask.status === 'partial' || uploadTask.status === 'cancelling') return 'warning'
-  if (uploadTask.status === 'failed') return 'danger'
-  if (uploadTask.status === 'cancelled') return 'default'
-  return 'primary'
-})
-
-/** 上传进行中保持进度模态框可见，终态关闭时清理任务展示。 */
-const handleUploadDialogClose = () => {
-  if (uploadActive.value) return
-  dismissUpload()
-}
-
 /** 将浏览器选择结果转换为固定目标目录上的后台上传任务。 */
 const runSelectedUpload = async (input: HTMLInputElement, kind: 'files' | 'folder') => {
   const files = Array.from(input.files || [])
@@ -522,13 +492,12 @@ const runSelectedUpload = async (input: HTMLInputElement, kind: 'files' | 'folde
         ? files[0]!.name
         : t('app.fileManager.uploadTask.fileSelection', { count: files.length })
   const targetDirectory = currentDisplayPath.value
-  const changed = await startUpload(targetDirectory, {
+  startUpload(targetDirectory, {
     kind,
     displayName,
     files: files.map((file, index) => ({ file, relativePath: relativePaths[index]! })),
   })
   input.value = ''
-  if (changed && currentDisplayPath.value === targetDirectory) await refresh()
 }
 
 /** 接收普通文件选择结果。 */
@@ -628,7 +597,7 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
         <VeyActionMenu
           :label="t('app.fileManager.upload')"
           :actions="uploadActions"
-          :disabled="uploadActive"
+          :disabled="fileOperationCount > 0"
           data-ui="file-upload-actions"
         />
         <input
@@ -650,6 +619,9 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
           webkitdirectory=""
           @change="onFolderChange"
         />
+        <VeyButton type="secondary" data-ui="file-view-tasks" @click="taskCenter.open('files')">{{
+          t('taskCenter.view')
+        }}</VeyButton>
         <VeyButton type="primary" data-ui="file-refresh" @click="refresh">{{
           t('app.fileManager.refresh')
         }}</VeyButton>
@@ -898,120 +870,6 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
       </template>
     </ApplicationDialog>
 
-    <ApplicationDialog
-      :visible="uploadTask.visible"
-      :title="t('app.fileManager.upload')"
-      width="36rem"
-      :close-on-click-overlay="!uploadActive"
-      :close-disabled="uploadActive"
-      return-focus-selector="[data-ui='file-upload-actions'] button"
-      data-ui="file-upload-dialog"
-      :data-status="uploadTask.status"
-      @close="handleUploadDialogClose"
-    >
-      <div class="upload-task" data-slot="upload-progress">
-        <div class="upload-task-header">
-          <div class="upload-task-title-wrap">
-            <VeyIcon name="upload" :size="18" />
-            <div class="upload-task-title-content">
-              <strong class="upload-task-title">{{ uploadTask.displayName }}</strong>
-              <span class="upload-task-target" :title="uploadTask.targetDirectory">
-                {{ t('app.fileManager.uploadTask.target', { path: uploadTask.targetDirectory }) }}
-              </span>
-            </div>
-          </div>
-          <VeyTag :type="uploadStatusType" effect="plain">{{ uploadStatusText }}</VeyTag>
-        </div>
-
-        <div class="upload-task-progress-meta" aria-live="polite">
-          <span
-            v-if="uploadTask.currentFile"
-            class="upload-task-current"
-            :title="uploadTask.currentFile"
-          >
-            {{ t('app.fileManager.uploadTask.current', { path: uploadTask.currentFile }) }}
-          </span>
-          <span v-else class="upload-task-current">{{ uploadStatusText }}</span>
-          <span class="upload-task-percent">{{ uploadTask.progressPercent }}%</span>
-        </div>
-        <div
-          class="upload-task-track"
-          role="progressbar"
-          data-ui="file-upload-progress"
-          :aria-label="
-            t('app.fileManager.uploadTask.progressAria', { name: uploadTask.displayName })
-          "
-          aria-valuemin="0"
-          aria-valuemax="100"
-          :aria-valuenow="
-            uploadTask.status === 'preparing' ? undefined : uploadTask.progressPercent
-          "
-          :aria-busy="uploadTask.status === 'preparing'"
-        >
-          <div class="upload-task-value" :style="{ width: `${uploadTask.progressPercent}%` }" />
-        </div>
-
-        <div class="upload-task-summary">
-          <span>
-            {{
-              t('app.fileManager.uploadTask.fileProgress', {
-                processed: uploadProcessedFiles,
-                total: uploadTask.totalFiles,
-              })
-            }}
-          </span>
-          <span>
-            {{
-              t('app.fileManager.uploadTask.byteProgress', {
-                transferred: formatBytes(uploadTask.transferredBytes),
-                total: formatBytes(uploadTask.totalBytes),
-              })
-            }}
-          </span>
-        </div>
-
-        <div v-if="uploadTask.errorSummary" class="upload-task-error" role="alert">
-          {{ uploadTask.errorSummary }}
-        </div>
-        <ul v-if="uploadTask.failures.length" class="upload-task-failures" role="list">
-          <li v-for="failure in uploadTask.failures.slice(0, 3)" :key="failure.path">
-            <span :title="failure.path">{{ failure.path }}</span>
-            <span>{{ failure.message }}</span>
-          </li>
-          <li v-if="uploadTask.failures.length > 3">
-            {{
-              t('app.fileManager.uploadTask.moreFailures', {
-                count: uploadTask.failures.length - 3,
-              })
-            }}
-          </li>
-        </ul>
-      </div>
-      <template #footer>
-        <VeyButton
-          v-if="uploadActive"
-          type="secondary"
-          :disabled="uploadTask.status === 'cancelling'"
-          data-ui="file-upload-cancel"
-          @click="cancelUpload"
-        >
-          {{
-            uploadTask.status === 'cancelling'
-              ? t('app.fileManager.uploadTask.cancelling')
-              : t('app.fileManager.uploadTask.cancel')
-          }}
-        </VeyButton>
-        <VeyButton
-          v-else
-          type="secondary"
-          data-ui="file-upload-dismiss"
-          @click="handleUploadDialogClose"
-        >
-          {{ t('app.fileManager.uploadTask.dismiss') }}
-        </VeyButton>
-      </template>
-    </ApplicationDialog>
-
     <ApplicationConfirmationDialog
       :visible="confirmationState.visible"
       :title="confirmationState.title"
@@ -1096,109 +954,6 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
 
 .upload-input {
   display: none;
-}
-
-.upload-task {
-  display: grid;
-  gap: var(--vdl-space-3);
-}
-
-.upload-task-header,
-.upload-task-progress-meta,
-.upload-task-title-wrap,
-.upload-task-summary {
-  display: flex;
-  align-items: center;
-  gap: var(--vdl-space-3);
-}
-
-.upload-task-header,
-.upload-task-progress-meta {
-  justify-content: space-between;
-}
-
-.upload-task-title-wrap,
-.upload-task-title-content,
-.upload-task-current {
-  min-width: 0;
-}
-
-.upload-task-title-content {
-  display: grid;
-  gap: var(--vdl-space-1);
-}
-
-.upload-task-title,
-.upload-task-target,
-.upload-task-current,
-.upload-task-failures span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.upload-task-title {
-  font: var(--vdl-font-body-sm);
-}
-
-.upload-task-target,
-.upload-task-progress-meta,
-.upload-task-summary,
-.upload-task-failures,
-.upload-task-error {
-  color: var(--vdl-text-muted);
-  font: var(--vdl-font-caption);
-}
-
-.upload-task-target,
-.upload-task-current,
-.upload-task-failures li span:first-child {
-  font-family: var(--vdl-font-mono);
-}
-
-.upload-task-current {
-  flex: 1;
-}
-
-.upload-task-percent {
-  color: var(--vdl-text-primary);
-  font-family: var(--vdl-font-mono);
-}
-
-.upload-task-track {
-  overflow: hidden;
-  height: var(--vdl-space-2);
-  border-radius: var(--vdl-radius-pill);
-  background: var(--vdl-border-default);
-}
-
-.upload-task-value {
-  height: 100%;
-  border-radius: inherit;
-  background: var(--vdl-primary);
-  transition: width 180ms ease;
-}
-
-.upload-task-summary {
-  flex-wrap: wrap;
-}
-
-.upload-task-error {
-  color: var(--vdl-danger);
-}
-
-.upload-task-failures {
-  display: grid;
-  gap: var(--vdl-space-1);
-  margin: 0;
-  padding: var(--vdl-space-2) 0 0 var(--vdl-space-5);
-  border-top: 1px solid var(--vdl-border-subtle);
-}
-
-.upload-task-failures li {
-  display: grid;
-  grid-template-columns: minmax(8rem, 1fr) minmax(8rem, 2fr);
-  gap: var(--vdl-space-3);
 }
 
 .options-bar {
@@ -1337,9 +1092,6 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
   .breadcrumb-wrap {
     flex-direction: column;
     align-items: flex-start;
-  }
-  .upload-task-summary {
-    display: grid;
   }
 }
 </style>

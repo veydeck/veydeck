@@ -18,25 +18,10 @@ const operations = vi.hoisted(() => ({
   removePath: vi.fn(),
   runPathTask: vi.fn(),
   startUpload: vi.fn(),
-  cancelUpload: vi.fn(),
-  dismissUpload: vi.fn(),
-  uploadActive: { __v_isRef: true, value: false },
-  uploadTask: {
-    visible: false,
-    kind: 'files',
-    displayName: '',
-    targetDirectory: '',
-    status: 'completed',
-    totalFiles: 0,
-    completedFiles: 0,
-    failedFiles: 0,
-    totalBytes: 0,
-    transferredBytes: 0,
-    progressPercent: 0,
-    currentFile: '',
-    failures: [],
-    errorSummary: '',
-  },
+}))
+const taskCenter = vi.hoisted(() => ({ open: vi.fn(), unsubscribe: vi.fn() }))
+vi.mock('@/stores/task-center', () => ({
+  useTaskCenterStore: () => ({ open: taskCenter.open, subscribe: () => taskCenter.unsubscribe }),
 }))
 const windowRuntime = vi.hoisted(() => ({ updateWindowRuntimeState: vi.fn() }))
 vi.mock('@/api/modules/fs', () => ({ fsApi: { forNode: api.forNode } }))
@@ -60,13 +45,7 @@ vi.mock('@/composables/useFileOperations', () => ({
     renamePath: operations.renamePath,
     runPathTask: operations.runPathTask,
     downloadFile: vi.fn(),
-    uploadTask: operations.uploadTask,
-    uploadActive: operations.uploadActive,
     startUpload: operations.startUpload,
-    cancelUpload: operations.cancelUpload,
-    dismissUpload: operations.dismissUpload,
-    resumeActiveTasks: vi.fn().mockResolvedValue(undefined),
-    resumeActiveTransfers: vi.fn().mockResolvedValue(undefined),
   }),
 }))
 
@@ -127,23 +106,6 @@ describe('FileManagerView', () => {
     operations.removePath.mockResolvedValue(true)
     operations.runPathTask.mockResolvedValue(true)
     operations.startUpload.mockResolvedValue(false)
-    operations.uploadActive.value = false
-    Object.assign(operations.uploadTask, {
-      visible: false,
-      kind: 'files',
-      displayName: '',
-      targetDirectory: '',
-      status: 'completed',
-      totalFiles: 0,
-      completedFiles: 0,
-      failedFiles: 0,
-      totalBytes: 0,
-      transferredBytes: 0,
-      progressPercent: 0,
-      currentFile: '',
-      failures: [],
-      errorSummary: '',
-    })
   })
 
   it('打开传入的网站目录，并接收后续目录导航', async () => {
@@ -452,82 +414,21 @@ describe('FileManagerView', () => {
     wrapper.unmount()
   })
 
-  it('在窗口级对话框展示可访问上传进度并用上传原因阻止关闭窗口', async () => {
-    operations.uploadActive.value = true
-    Object.assign(operations.uploadTask, {
-      visible: true,
-      kind: 'folder',
-      displayName: 'docs',
-      targetDirectory: '/home',
-      status: 'uploading',
-      totalFiles: 4,
-      completedFiles: 1,
-      failedFiles: 1,
-      totalBytes: 8,
-      transferredBytes: 4,
-      progressPercent: 50,
-      currentFile: 'docs/report.txt',
-      failures: [{ path: 'docs/failed.txt', message: 'conflict' }],
-      errorSummary: '',
-    })
+  it('上传不再弹框或阻止关闭，提供任务中心入口', async () => {
     const wrapper = mount(FileManagerView, {
       props: { payload: { nodeId: 'node-a' }, windowId: 'file-window' },
-      global: {
-        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
-      },
+      global: { plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })] },
     })
     await flushPromises()
-
-    const dialog = wrapper.element.querySelector<HTMLElement>('[data-ui="file-upload-dialog"]')
-    expect(dialog).not.toBeNull()
-    const progress = dialog!.querySelector<HTMLElement>('[role="progressbar"]')
-    expect(progress?.getAttribute('aria-valuenow')).toBe('50')
-    expect(dialog!.textContent).toContain('已处理 2 / 4 个文件')
-
-    dialog!.querySelector<HTMLButtonElement>('.application-dialog__close')?.click()
-    await flushPromises()
-    expect(operations.dismissUpload).not.toHaveBeenCalled()
-    expect(wrapper.find('[data-ui="file-upload-dialog"]').exists()).toBe(true)
-
-    dialog!.querySelector<HTMLButtonElement>('[data-ui="file-upload-cancel"]')?.click()
-    await flushPromises()
-    expect(operations.cancelUpload).toHaveBeenCalledTimes(1)
-    expect(windowRuntime.updateWindowRuntimeState).toHaveBeenCalledWith(
+    expect(wrapper.find('[data-ui="file-upload-dialog"]').exists()).toBe(false)
+    expect(wrapper.get('[data-ui="file-upload-actions"]').attributes('disabled')).toBeUndefined()
+    expect(windowRuntime.updateWindowRuntimeState).toHaveBeenLastCalledWith(
       'file-window',
-      expect.objectContaining({
-        busy: true,
-        blockLevel: 'busy',
-        blockReason: '文件正在上传，请完成或取消上传后再关闭窗口或切换节点。',
-      }),
+      expect.objectContaining({ busy: false, blockLevel: 'open' }),
     )
+    await wrapper.get('[data-ui="file-view-tasks"]').trigger('click')
+    expect(taskCenter.open).toHaveBeenCalledWith('files')
     wrapper.unmount()
-  })
-
-  it('上传终态允许从模态框关闭结果', async () => {
-    Object.assign(operations.uploadTask, {
-      visible: true,
-      displayName: 'report.txt',
-      targetDirectory: '/home',
-      status: 'completed',
-      totalFiles: 1,
-      completedFiles: 1,
-      totalBytes: 8,
-      transferredBytes: 8,
-      progressPercent: 100,
-    })
-    const wrapper = mount(FileManagerView, {
-      props: { payload: { nodeId: 'node-a' } },
-      global: {
-        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
-      },
-    })
-    await flushPromises()
-
-    const dismiss = wrapper.get<HTMLButtonElement>('[data-ui="file-upload-dismiss"]')
-    await dismiss.trigger('click')
-    await flushPromises()
-
-    expect(operations.dismissUpload).toHaveBeenCalledTimes(1)
-    wrapper.unmount()
+    expect(taskCenter.unsubscribe).toHaveBeenCalled()
   })
 })
