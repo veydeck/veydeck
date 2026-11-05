@@ -43,6 +43,7 @@ export interface CenterTask {
   finishedAt?: string
   execution: 'browser' | 'server'
   serverId?: string
+  operationItems?: FileOperationTask['items']
   affectedDirectories: string[]
 }
 
@@ -74,6 +75,7 @@ export const useTaskCenterStore = defineStore('task-center', () => {
   >()
   const runningNodes = new Set<string>()
   const listeners = new Set<(nodeId: string, directories: string[]) => void>()
+  const operationListeners = new Set<(task: CenterTask) => void>()
   const polls = new Map<
     string,
     { timer?: ReturnType<typeof setTimeout>; inFlight: boolean; delay: number }
@@ -131,9 +133,17 @@ export const useTaskCenterStore = defineStore('task-center', () => {
       listeners.delete(listener)
     }
   }
+  /** 订阅服务端文件任务的逐项终态，供会话剪贴板清理成功项。 */
+  function subscribeOperation(listener: (task: CenterTask) => void) {
+    operationListeners.add(listener)
+    return () => {
+      operationListeners.delete(listener)
+    }
+  }
   /** 发布终态变更并限制会话历史数量。 */
   function finish(task: CenterTask) {
     if (task.finishedAt) return
+    if (task.operationItems) for (const listener of operationListeners) listener(task)
     task.finishedAt = new Date().toISOString()
     task.bytesPerSecond = undefined
     speedSamples.delete(task.id)
@@ -267,6 +277,7 @@ export const useTaskCenterStore = defineStore('task-center', () => {
   /** 将服务端任务事实映射为展示摘要。 */
   function applyOperation(task: CenterTask, source: FileOperationTask) {
     Object.assign(task, {
+      operationItems: source.items,
       status: source.status,
       stage: source.stage,
       progress: ['queued', 'validating', 'preparing', 'scanning'].includes(source.stage)
@@ -480,6 +491,14 @@ export const useTaskCenterStore = defineStore('task-center', () => {
       () => void discover(),
     )
   }
+  /** 捕获提交所属会话，防止登出前的响应回流到下一次登录。 */
+  function captureSession() {
+    return session
+  }
+  /** 判断短请求返回时是否仍属于原桌面会话。 */
+  function isCurrentSession(generation: number) {
+    return session === generation
+  }
   /** 会话结束后停止所有跟踪并清空个人摘要，不取消服务端任务。 */
   function reset() {
     session += 1
@@ -499,6 +518,7 @@ export const useTaskCenterStore = defineStore('task-center', () => {
     tasks.value = []
     selectedTab.value = 'files'
     listeners.clear()
+    operationListeners.clear()
   }
 
   return {
@@ -511,8 +531,11 @@ export const useTaskCenterStore = defineStore('task-center', () => {
     remove,
     clearFinished,
     subscribe,
+    subscribeOperation,
     submitUpload,
     registerOperation,
+    captureSession,
+    isCurrentSession,
     registerDownload,
     cancel,
     start,

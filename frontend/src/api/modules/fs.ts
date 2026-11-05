@@ -9,6 +9,7 @@ import type {
   FileSaveResult,
   FileTransfer,
   FsEntry,
+  FsEntryDetail,
   HomeResponse,
   UpdateFileContentRequest,
 } from '../interface/fs'
@@ -24,20 +25,28 @@ const nodePath = (nodeId: string, path: string) =>
 
 /** 为固定节点创建文件管理 API，避免窗口跟随全局节点切换。 */
 const createScopedFsApi = (nodeId: string) => ({
-  listEntries: (params: {
-    path: string
-    page: number
-    pageSize: number
-    sortBy: 'name' | 'modifiedAt' | 'sizeBytes'
-    sortOrder: 'ascending' | 'descending'
-    showHidden: boolean
-  }) =>
-    http.get<FileListPage>(nodePath(nodeId, 'files/list'), {
-      ...params,
-      sortOrder: params.sortOrder === 'ascending' ? 'asc' : 'desc',
-    }),
+  listEntries: (
+    params: {
+      path: string
+      page: number
+      pageSize: number
+      sortBy: 'name' | 'modifiedAt' | 'sizeBytes'
+      sortOrder: 'ascending' | 'descending'
+      showHidden: boolean
+      snapshotId?: string
+    },
+    options: { signal?: AbortSignal } = {},
+  ) =>
+    http.get<FileListPage>(
+      nodePath(nodeId, 'files/list'),
+      {
+        ...params,
+        sortOrder: params.sortOrder === 'ascending' ? 'asc' : 'desc',
+      },
+      options,
+    ),
   home: () => http.get<HomeResponse>(nodePath(nodeId, 'files/home')),
-  detail: (path: string) => http.get<FsEntry>(nodePath(nodeId, 'file/detail'), { path }),
+  detail: (path: string) => http.get<FsEntryDetail>(nodePath(nodeId, 'file/detail'), { path }),
   readFile: (path: string) => http.get<FileDocument>(nodePath(nodeId, 'file/content'), { path }),
   createFile: (payload: { path: string; content?: string }) =>
     http.post<FsEntry>(nodePath(nodeId, 'files'), payload),

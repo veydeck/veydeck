@@ -18,6 +18,7 @@ declare module 'vue' {
     ApplicationWindow: typeof import('./components/layout/ApplicationWindow.vue')['default']
     DesktopHeader: typeof import('./components/layout/DesktopHeader.vue')['default']
     DesktopLayout: typeof import('./components/layout/DesktopLayout.vue')['default']
+    FileBrowserContent: typeof import('./components/files/FileBrowserContent.vue')['default']
     MonacoEditor: typeof import('./components/editor/MonacoEditor.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']

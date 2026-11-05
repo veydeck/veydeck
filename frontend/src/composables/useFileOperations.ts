@@ -19,13 +19,17 @@ export function useFileOperations(nodeId: Readonly<Ref<string>>) {
 
   /** 创建文件属于短请求，保留原有同步反馈。 */
   const createFile = async (path: string, content = '') => {
+    const generation = center.captureSession()
     const res = await fsClient.value.createFile({ path, content })
+    if (!center.isCurrentSession(generation)) return false
     if (!res.success) toastStore.error(res.message || t('app.fileManager.writeFailed'))
     return res.success
   }
   /** 创建目录属于短请求，保留原有同步反馈。 */
   const mkdir = async (path: string, recursive = false) => {
+    const generation = center.captureSession()
     const res = await fsClient.value.mkdir({ path, recursive })
+    if (!center.isCurrentSession(generation)) return false
     if (!res.success) toastStore.error(res.message || t('app.fileManager.mkdirFailed'))
     return res.success
   }
@@ -36,6 +40,7 @@ export function useFileOperations(nodeId: Readonly<Ref<string>>) {
     recursive = false,
     targetDirectory?: string,
   ) => {
+    const generation = center.captureSession()
     const fixedNodeId = nodeId.value
     const res = await fsApi.forNode(fixedNodeId).createTask({
       operation,
@@ -45,6 +50,7 @@ export function useFileOperations(nodeId: Readonly<Ref<string>>) {
       overwrite: false,
       idempotencyKey: crypto.randomUUID(),
     })
+    if (!center.isCurrentSession(generation)) return false
     if (!res.success || !res.data) {
       toastStore.error(res.message || t('app.fileManager.fetchError'))
       return false
@@ -63,6 +69,7 @@ export function useFileOperations(nodeId: Readonly<Ref<string>>) {
     runPathTask('copy', [{ path: from, targetPath: to, expectedRevision }], true)
   /** 启动浏览器原生下载，后续仅跟踪服务端传输。 */
   const downloadFile = async (path: string, fileName?: string, expectedRevision?: string) => {
+    const generation = center.captureSession()
     const fixedNodeId = nodeId.value
     const client = fsApi.forNode(fixedNodeId)
     const res = await client.createTransfer({
@@ -71,6 +78,7 @@ export function useFileOperations(nodeId: Readonly<Ref<string>>) {
       expectedRevision,
       overwrite: false,
     })
+    if (!center.isCurrentSession(generation)) return false
     if (!res.success || !res.data) {
       toastStore.error(res.message || t('app.fileManager.downloadFailed'))
       return false

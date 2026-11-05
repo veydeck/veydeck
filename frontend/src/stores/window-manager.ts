@@ -978,6 +978,16 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
         return
       }
     }
+    if (id === 'file-manager') {
+      // 每次从应用入口启动新实例；已有窗口通过任务栏恢复和聚焦。
+      const nodeStore = useNodeStore()
+      openWindowWithPayload(
+        id,
+        { nodeId: nodeStore.currentNodeId || 'local' },
+        { instanceId: `file-manager-${crypto.randomUUID()}` },
+      )
+      return
+    }
     if (id === 'terminal') {
       const timestamp = Date.now()
       const instanceId = `terminal-${timestamp}`

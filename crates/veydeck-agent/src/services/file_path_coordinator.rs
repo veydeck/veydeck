@@ -42,7 +42,7 @@ pub async fn reserve(
     paths: Vec<PathBuf>,
     ignored_transfer_id: Option<&str>,
 ) -> Result<FilePathReservation, ApiError> {
-    let paths = deduplicate_paths(paths);
+    let paths = reservation_paths(paths).await?;
     if paths.is_empty() {
         return Err(ApiError::validation("file path reservation is empty"));
     }
@@ -62,6 +62,55 @@ pub async fn reserve(
 /// 判断两个路径是否具有祖先、后代或相同关系。
 pub fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+/// 解析父路径中的链接并保留叶子身份；新建目标允许末尾父目录尚不存在。
+pub async fn physical_entry_path(path: &Path) -> Result<PathBuf, ApiError> {
+    let Some(parent) = path.parent() else {
+        return Ok(path.to_path_buf());
+    };
+    let mut suffix = vec![
+        path.file_name()
+            .ok_or_else(|| ApiError::validation("file path has no name"))?
+            .to_os_string(),
+    ];
+    let mut ancestor = parent;
+    loop {
+        match tokio::fs::canonicalize(ancestor).await {
+            Ok(mut resolved) => {
+                for segment in suffix.iter().rev() {
+                    resolved.push(segment);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = ancestor.file_name() else {
+                    return Err(crate::services::files::map_io_error(
+                        error,
+                        "resolve operation path",
+                    ));
+                };
+                suffix.push(name.to_os_string());
+                ancestor = ancestor.parent().unwrap_or(Path::new("/"));
+            }
+            Err(error) => {
+                return Err(crate::services::files::map_io_error(
+                    error,
+                    "resolve operation path",
+                ));
+            }
+        }
+    }
+}
+
+/// 同时预留逻辑路径与物理路径，兼顾父链接变更和真实目标的重叠保护。
+async fn reservation_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, ApiError> {
+    let mut expanded = Vec::with_capacity(paths.len() * 2);
+    for path in paths {
+        expanded.push(physical_entry_path(&path).await?);
+        expanded.push(path);
+    }
+    Ok(deduplicate_paths(expanded))
 }
 
 fn deduplicate_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -103,14 +152,16 @@ async fn ensure_no_task_overlap(pool: &DbPool, paths: &[PathBuf]) -> Result<(), 
     .await?;
     for row in rows {
         let source = PathBuf::from(row.try_get::<String, _>("source_path")?);
+        let mut active_paths = vec![source];
         let target = row
             .try_get::<Option<String>, _>("target_path")?
             .map(PathBuf::from);
+        active_paths.extend(target);
+        let active_paths = reservation_paths(active_paths).await?;
         if paths.iter().any(|candidate| {
-            paths_overlap(candidate, &source)
-                || target
-                    .as_ref()
-                    .is_some_and(|target| paths_overlap(candidate, target))
+            active_paths
+                .iter()
+                .any(|active| paths_overlap(candidate, active))
         }) {
             return Err(operation_conflict());
         }
@@ -135,10 +186,12 @@ async fn ensure_no_upload_overlap(
             continue;
         }
         let active = PathBuf::from(row.try_get::<String, _>("path")?);
-        if paths
-            .iter()
-            .any(|candidate| paths_overlap(candidate, &active))
-        {
+        let active_paths = reservation_paths(vec![active]).await?;
+        if paths.iter().any(|candidate| {
+            active_paths
+                .iter()
+                .any(|active| paths_overlap(candidate, active))
+        }) {
             return Err(operation_conflict());
         }
     }
@@ -160,6 +213,45 @@ mod tests {
     fn overlap_is_component_aware() {
         assert!(paths_overlap(Path::new("/tmp/a"), Path::new("/tmp/a/b")));
         assert!(!paths_overlap(Path::new("/tmp/a"), Path::new("/tmp/ab")));
+    }
+
+    #[tokio::test]
+    async fn directory_aliases_share_reservations_but_leaf_links_keep_their_identity() {
+        let pool = crate::test_support::setup_test_db().await;
+        let root = std::env::temp_dir().join(format!("veydeck-alias-lock-{}", Uuid::now_v7()));
+        tokio::fs::create_dir_all(root.join("actual"))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink("actual", root.join("alias")).unwrap();
+        assert_eq!(
+            physical_entry_path(&root.join("alias")).await.unwrap(),
+            root.join("alias")
+        );
+        assert_eq!(
+            physical_entry_path(&root.join("alias/new/sub/file"))
+                .await
+                .unwrap(),
+            root.join("actual/new/sub/file")
+        );
+        let guard = reserve(&pool, vec![root.join("alias/file")], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            reserve(&pool, vec![root.join("actual/file")], None)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::FileOperationConflict
+        );
+        assert_eq!(
+            reserve(&pool, vec![root.join("alias")], None)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::FileOperationConflict
+        );
+        drop(guard);
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
     #[tokio::test]

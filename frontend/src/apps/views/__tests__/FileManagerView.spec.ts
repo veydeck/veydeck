@@ -1,434 +1,329 @@
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest'
+import { mount, flushPromises } from '@vue/test-utils'
+import { createPinia, setActivePinia } from 'pinia'
 import { createI18n } from 'vue-i18n'
-import { flushPromises, mount } from '@vue/test-utils'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { reactive } from 'vue'
 import FileManagerView from '../FileManagerView.vue'
+import FileBrowserContent from '@/components/files/FileBrowserContent.vue'
 import zh from '@/locales/zh'
-import type { FileListPage, FsEntry } from '@/api/interface/fs'
-
+import { useToastStore } from '@/stores/toast'
+import type { FsEntry } from '@/api/interface/fs'
 const api = vi.hoisted(() => ({
+  list: vi.fn(),
   home: vi.fn(),
-  listEntries: vi.fn(),
-  forNode: vi.fn(),
-  openWindowWithPayload: vi.fn(),
+  detail: vi.fn(),
+  readFile: vi.fn(),
+  open: vi.fn(),
+  subscribe: vi.fn(() => vi.fn()),
+  upload: vi.fn(),
+  tasks: vi.fn(),
+  windows: {
+    openWindows: [{ id: 'file-window', zIndex: 2, isMinimized: false }],
+    maxZIndex: 2,
+  },
 }))
-const operations = vi.hoisted(() => ({
-  createFile: vi.fn(),
-  mkdir: vi.fn(),
-  renamePath: vi.fn(),
-  removePath: vi.fn(),
-  runPathTask: vi.fn(),
-  startUpload: vi.fn(),
+vi.mock('@/api/modules/fs', () => ({
+  fsApi: {
+    forNode: () => ({
+      listEntries: api.list,
+      home: api.home,
+      detail: api.detail,
+      readFile: api.readFile,
+    }),
+  },
 }))
-const taskCenter = vi.hoisted(() => ({ open: vi.fn(), unsubscribe: vi.fn() }))
 vi.mock('@/stores/task-center', () => ({
-  useTaskCenterStore: () => ({ open: taskCenter.open, subscribe: () => taskCenter.unsubscribe }),
-}))
-const windowRuntime = vi.hoisted(() => ({ updateWindowRuntimeState: vi.fn() }))
-vi.mock('@/api/modules/fs', () => ({ fsApi: { forNode: api.forNode } }))
-vi.mock('@/stores/node', () => ({
-  useNodeStore: () => ({ currentNodeId: 'global-node' }),
-}))
-vi.mock('@/stores/window-manager', () => ({
-  useWindowManagerStore: () => ({
-    updateWindowRuntimeState: windowRuntime.updateWindowRuntimeState,
-    openWindowWithPayload: api.openWindowWithPayload,
+  useTaskCenterStore: () => ({
+    open: vi.fn(),
+    subscribe: api.subscribe,
+    subscribeOperation: api.subscribe,
+    registerOperation: vi.fn(),
   }),
 }))
-vi.mock('@/stores/toast', () => ({
-  useToastStore: () => ({ error: vi.fn(), success: vi.fn() }),
+vi.mock('@/stores/node', () => ({ useNodeStore: () => ({ currentNodeId: 'local' }) }))
+vi.mock('@/stores/window-manager', () => ({
+  useWindowManagerStore: () => ({
+    openWindowWithPayload: api.open,
+    updateWindowRuntimeState: vi.fn(),
+    get openWindows() {
+      return api.windows.openWindows
+    },
+    get maxZIndex() {
+      return api.windows.maxZIndex
+    },
+  }),
 }))
 vi.mock('@/composables/useFileOperations', () => ({
   useFileOperations: () => ({
-    createFile: operations.createFile,
-    mkdir: operations.mkdir,
-    removePath: operations.removePath,
-    renamePath: operations.renamePath,
-    runPathTask: operations.runPathTask,
-    downloadFile: vi.fn(),
-    startUpload: operations.startUpload,
+    startUpload: api.upload,
+    runPathTask: api.tasks,
+    renamePath: vi.fn(),
+    mkdir: vi.fn(),
+    createFile: vi.fn(),
   }),
 }))
-
-const response = <T>(data: T) => ({ success: true, code: 200, message: '', data })
-
-const entry = (name: string, path: string, kind: FsEntry['kind'] = 'file'): FsEntry => ({
-  name,
-  path,
-  kind,
-  sizeBytes: 1,
-  revision: `revision-${name}`,
-  management: { kind: 'custom' },
-  capabilities: {
-    canOpen: true,
-    canRead: true,
-    canWrite: true,
-    canCreateChild: false,
-    canRename: true,
-    canCopy: true,
-    canRemove: true,
-    canUpload: false,
-    canDownload: true,
-  },
+/** 构造包含权限和版本的目录条目。 */
+const entry = (index: number) =>
+  ({
+    name: `file-${index}.txt`,
+    path: `/home/file-${index}.txt`,
+    kind: 'file',
+    revision: String(index),
+    capabilities: { canOpen: true, canCopy: true, canRemove: true, canRename: true },
+    management: { kind: 'custom' },
+  }) as FsEntry
+/** 返回稳定快照的目录页。 */
+const page = (entries: FsEntry[], total = entries.length) => ({
+  success: true,
+  data: { path: '/home', entries, total, snapshotId: 'snapshot', loadedAt: 'now', counts: {} },
 })
-
-const page = (path: string, entries: FsEntry[]): FileListPage => ({
-  path,
-  entries,
-  page: 1,
-  pageSize: 50,
-  total: entries.length,
-  counts: {
-    fileCount: entries.length,
-    directoryCount: 0,
-    symlinkCount: 0,
-    otherCount: 0,
-  },
-  loadedAt: '2026-07-16T00:00:00.000Z',
-})
-
-const deferred = <T>() => {
-  let resolve!: (value: T) => void
-  const promise = new Promise<T>((complete) => {
-    resolve = complete
+const mounted: Array<ReturnType<typeof mount>> = []
+/** 安装真实偏好与剪贴板 Store，使用当前应用的组件和国际化。 */
+function render() {
+  const wrapper = mount(FileManagerView, {
+    props: { windowId: 'file-window' },
+    attachTo: document.body,
+    global: { plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })] },
   })
-  return { promise, resolve }
+  mounted.push(wrapper)
+  return wrapper
 }
-
-describe('FileManagerView', () => {
+describe('desktop file manager', () => {
   beforeEach(() => {
+    localStorage.clear()
+    setActivePinia(createPinia())
     vi.clearAllMocks()
-    api.forNode.mockReturnValue({ home: api.home, listEntries: api.listEntries })
-    api.home.mockResolvedValue(response({ path: '/home' }))
-    api.listEntries.mockResolvedValue(response(page('/home', [])))
-    operations.createFile.mockResolvedValue(true)
-    operations.mkdir.mockResolvedValue(true)
-    operations.renamePath.mockResolvedValue(true)
-    operations.removePath.mockResolvedValue(true)
-    operations.runPathTask.mockResolvedValue(true)
-    operations.startUpload.mockResolvedValue(false)
-  })
-
-  it('打开传入的网站目录，并接收后续目录导航', async () => {
-    api.listEntries.mockImplementation(({ path }: { path: string }) =>
-      Promise.resolve(response(page(path, []))),
+    api.windows = reactive({
+      openWindows: [{ id: 'file-window', zIndex: 2, isMinimized: false }],
+      maxZIndex: 2,
+    })
+    api.home.mockResolvedValue({ success: true, data: { path: '/home' } })
+    api.detail.mockResolvedValue({
+      success: true,
+      data: { capabilities: { canCreateChild: true } },
+    })
+    api.list.mockResolvedValue(page(Array.from({ length: 10 }, (_, i) => entry(i))))
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        observe() {}
+        disconnect() {}
+      },
     )
-    const wrapper = mount(FileManagerView, {
+  })
+  afterEach(() => {
+    for (const wrapper of mounted.splice(0)) wrapper.unmount()
+    document.body.innerHTML = ''
+    vi.unstubAllGlobals()
+  })
+  it('统一单选、Ctrl 切换和 Shift 区间选择，切换视图保留选择', async () => {
+    const wrapper = render()
+    await flushPromises()
+    const items = wrapper.findAll('[data-ui="file-entry"]')
+    await items[1]!.trigger('click')
+    await items[4]!.trigger('click', { shiftKey: true })
+    expect(wrapper.findAll('[aria-selected="true"]')).toHaveLength(4)
+    await items[2]!.trigger('click', { ctrlKey: true })
+    expect(wrapper.findAll('[aria-selected="true"]')).toHaveLength(3)
+    await wrapper.get('[data-ui="file-view-menu"]').trigger('click')
+    await flushPromises()
+    document.querySelector<HTMLButtonElement>('[data-ui="file-view-details"]')!.click()
+    await flushPromises()
+    expect(wrapper.findAll('[aria-selected="true"]')).toHaveLength(3)
+  })
+  it('只处理活动窗口快捷键，输入框内复制不写入文件剪贴板，新建窗口固定节点目录', async () => {
+    const wrapper = render()
+    await flushPromises()
+    await wrapper.get('[data-ui="file-entry"]').trigger('click')
+    const input = document.createElement('input')
+    document.body.append(input)
+    input.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'n', ctrlKey: true, bubbles: true, cancelable: true }),
+    )
+    expect(api.open).not.toHaveBeenCalled()
+    document.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'n', ctrlKey: true, bubbles: true, cancelable: true }),
+    )
+    expect(api.open).toHaveBeenCalledWith(
+      'file-manager',
+      { nodeId: 'local', path: '/home' },
+      expect.objectContaining({ instanceId: expect.stringContaining('file-manager-') }),
+    )
+  })
+  it('最顶层窗口最小化后让出快捷键，恢复后重新处理', async () => {
+    const wrapper = render()
+    await flushPromises()
+    await wrapper.get('[data-ui="file-entry"]').trigger('click')
+    document.body.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'c',
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    )
+    api.windows.openWindows[0]!.isMinimized = true
+    const listCalls = api.list.mock.calls.length
+    for (const init of [
+      { key: 'n', ctrlKey: true },
+      { key: 'v', ctrlKey: true },
+      { key: 'F5' },
+      { key: 'a', ctrlKey: true },
+    ]) {
+      const event = new KeyboardEvent('keydown', { ...init, bubbles: true, cancelable: true })
+      document.body.dispatchEvent(event)
+      expect(event.defaultPrevented).toBe(false)
+    }
+    await flushPromises()
+    expect(api.open).not.toHaveBeenCalled()
+    expect(api.list).toHaveBeenCalledTimes(listCalls)
+    api.windows.openWindows[0]!.isMinimized = false
+    document.body.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'n',
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    )
+    expect(api.open).toHaveBeenCalledTimes(1)
+  })
+  it('单击地址栏空白即可编辑，目录段仍可导航，精简工具栏只保留统一视图入口', async () => {
+    const wrapper = render()
+    await flushPromises()
+    expect(wrapper.find('[data-ui="file-refresh"]').exists()).toBe(false)
+    expect(wrapper.find('[data-ui="file-view-tasks"]').exists()).toBe(false)
+    expect(wrapper.get('[data-ui="file-status"]').text()).not.toContain('Ctrl+A')
+    const toolbar = wrapper.get('[data-ui="file-manager-toolbar"]')
+    expect(toolbar.text()).not.toContain('新建窗口')
+    expect(wrapper.find('[data-ui="file-view-details"]').exists()).toBe(false)
+    await wrapper.get('[data-ui="file-address"]').trigger('click')
+    await flushPromises()
+    const input = wrapper.get('[data-ui="file-address"] input').element as HTMLInputElement
+    expect(document.activeElement).toBe(input)
+    expect(input.value).toBe('/home')
+    expect(input.selectionStart).toBe(0)
+    expect(input.selectionEnd).toBe(5)
+    await wrapper.get('[data-ui="file-address"] input').trigger('keydown', { key: 'Escape' })
+    await flushPromises()
+    expect(wrapper.find('[data-ui="file-address"] input').exists()).toBe(false)
+    const requestCount = api.list.mock.calls.length
+    await wrapper.findAll('[data-ui="file-breadcrumb"]')[0]!.trigger('click')
+    await flushPromises()
+    expect(api.list.mock.calls.length).toBe(requestCount + 1)
+    expect(wrapper.find('[data-ui="file-address"] input').exists()).toBe(false)
+  })
+  it('目录链接按目标类型打开，列表、地址栏和新窗口始终保留链接路径', async () => {
+    const link = { ...entry(0), kind: 'symlink' as const, name: 'bin', path: '/home/bin' }
+    api.list.mockResolvedValueOnce(page([link])).mockResolvedValue(page([]))
+    const wrapper = render()
+    await flushPromises()
+    api.detail.mockResolvedValueOnce({
+      success: true,
+      data: {
+        ...link,
+        symlinkTargetKind: 'directory',
+        symlinkTargetCapabilities: { canOpen: true, canCreateChild: true },
+      },
+    })
+    await wrapper.get('[data-ui="file-entry"]').trigger('dblclick')
+    await flushPromises()
+    expect(api.list.mock.calls.at(-1)?.[0].path).toBe('/home/bin')
+    expect(api.open).not.toHaveBeenCalled()
+    await wrapper.get('[data-ui="file-address"]').trigger('click')
+    await flushPromises()
+    expect((wrapper.get('[data-ui="file-address"] input').element as HTMLInputElement).value).toBe(
+      '/home/bin',
+    )
+  })
+  it('文本链接在原路径打开编辑器，失效或不可读链接不创建编辑器窗口', async () => {
+    const link = { ...entry(0), kind: 'symlink' as const, path: '/home/file-link' }
+    api.list.mockResolvedValue(page([link]))
+    const wrapper = render()
+    await flushPromises()
+    api.detail.mockResolvedValue({
+      success: true,
+      data: {
+        ...link,
+        symlinkTargetKind: 'file',
+        symlinkTargetCapabilities: { canOpen: true, canRead: true },
+      },
+    })
+    api.readFile.mockResolvedValue({ success: true, data: { path: link.path, content: 'text' } })
+    await wrapper.get('[data-ui="file-entry"]').trigger('dblclick')
+    await flushPromises()
+    expect(api.open).toHaveBeenCalledWith('file-editor', {
+      nodeId: 'local',
+      path: '/home/file-link',
+    })
+    api.open.mockClear()
+    const error = vi.spyOn(useToastStore(), 'error')
+    api.detail.mockResolvedValue({
+      success: true,
+      data: { ...link, symlinkError: 'FILE_NOT_FOUND' },
+    })
+    await wrapper.get('[data-ui="file-entry"]').trigger('dblclick')
+    await flushPromises()
+    expect(api.open).not.toHaveBeenCalled()
+    expect(error).toHaveBeenCalled()
+    api.detail.mockResolvedValue({
+      success: true,
+      data: {
+        ...link,
+        symlinkTargetKind: 'file',
+        symlinkTargetCapabilities: { canOpen: true, canRead: true },
+      },
+    })
+    api.readFile.mockResolvedValue({ success: false, message: 'permission denied' })
+    await wrapper.get('[data-ui="file-entry"]').trigger('dblclick')
+    await flushPromises()
+    expect(api.open).not.toHaveBeenCalled()
+    expect(error).toHaveBeenLastCalledWith('permission denied')
+  })
+  it('一万条记录仅渲染可视条目，切换大图标仍保持 DOM 数量有界', async () => {
+    const entries = Array.from({ length: 10000 }, (_, i) => entry(i))
+    const wrapper = mount(FileBrowserContent, {
       props: {
-        payload: { nodeId: 'node-a', path: '/opt/veydeck/data/www/websites/sites/a.test/index' },
+        entries,
+        selected: new Set(),
+        view: 'icons',
+        iconSize: 48,
+        hasMore: false,
+        loading: false,
+        location: 'local:/home',
+        cutPaths: new Set(),
+        nodeId: 'local',
       },
       global: { plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })] },
     })
-    await flushPromises()
-    expect(api.home).not.toHaveBeenCalled()
-    expect(api.listEntries).toHaveBeenCalledWith(
-      expect.objectContaining({ path: '/opt/veydeck/data/www/websites/sites/a.test/index' }),
-    )
-    await wrapper.setProps({
-      payload: { nodeId: 'node-b', path: '/opt/veydeck/data/www/websites/sites/b.test/index' },
-    })
-    await flushPromises()
-    expect(api.forNode).toHaveBeenCalledWith('node-b')
-    expect(api.listEntries).toHaveBeenLastCalledWith(
-      expect.objectContaining({ path: '/opt/veydeck/data/www/websites/sites/b.test/index' }),
-    )
-    wrapper.unmount()
+    mounted.push(wrapper)
+    expect(wrapper.findAll('[data-ui="file-entry"]').length).toBeLessThan(100)
+    await wrapper.setProps({ iconSize: 64, view: 'details' })
+    expect(wrapper.findAll('[data-ui="file-entry"]').length).toBeLessThan(30)
   })
-
-  it('固定使用窗口节点并让最新路径请求获胜', async () => {
-    const wrapper = mount(FileManagerView, {
-      props: { payload: { nodeId: 'node-a' } },
-      global: {
-        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
-      },
-    })
+  it('连续加载携带快照，关闭窗口会取消请求和释放目录变更订阅', async () => {
+    api.list
+      .mockResolvedValueOnce(
+        page(
+          Array.from({ length: 30 }, (_, i) => entry(i)),
+          60,
+        ),
+      )
+      .mockResolvedValue(
+        page(
+          Array.from({ length: 30 }, (_, i) => entry(i + 30)),
+          60,
+        ),
+      )
+    const wrapper = render()
     await flushPromises()
-    expect(api.forNode).toHaveBeenCalledWith('node-a')
-    expect(wrapper.get('[data-page="file-manager"]').attributes('data-node-id')).toBe('node-a')
-
-    const slow = deferred<ReturnType<typeof response<FileListPage>>>()
-    const fast = deferred<ReturnType<typeof response<FileListPage>>>()
-    api.listEntries.mockImplementation(({ path }: { path: string }) => {
-      if (path === '/slow') return slow.promise
-      if (path === '/fast') return fast.promise
-      return Promise.resolve(response(page(path, [])))
-    })
-    const input = wrapper.get('input[name="fileManagerPath"]')
-    await input.setValue('/slow')
-    await input.trigger('keyup.enter')
-    await input.setValue('/fast')
-    await input.trigger('keyup.enter')
-    fast.resolve(response(page('/fast', [entry('fast.txt', '/fast/fast.txt')])))
+    await wrapper.get('button').trigger('click')
+    wrapper.findComponent(FileBrowserContent).vm.$emit('more')
     await flushPromises()
-    slow.resolve(response(page('/slow', [entry('slow.txt', '/slow/slow.txt')])))
-    await flushPromises()
-
-    expect(wrapper.text()).toContain('fast.txt')
-    expect(wrapper.text()).not.toContain('slow.txt')
+    expect(api.list.mock.calls.at(-1)?.[0]).toMatchObject({ snapshotId: 'snapshot', page: 2 })
+    const signal = api.list.mock.calls.at(-1)?.[1].signal as AbortSignal
     wrapper.unmount()
-  })
-
-  it('打开文件编辑器时保留可响应语言变化的标题键', async () => {
-    api.listEntries.mockResolvedValue(
-      response(page('/home', [entry('notes.txt', '/home/notes.txt')])),
-    )
-    const wrapper = mount(FileManagerView, {
-      props: { payload: { nodeId: 'node-a' } },
-      global: {
-        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
-      },
-    })
-    await flushPromises()
-
-    await wrapper.get('.entry-name').trigger('dblclick')
-
-    expect(api.openWindowWithPayload).toHaveBeenCalledWith(
-      'file-editor',
-      { path: '/home/notes.txt', nodeId: 'node-a' },
-      {
-        title: '文件编辑',
-        i18nTitleKey: 'app.fileEditor.appName',
-      },
-    )
-    wrapper.unmount()
-  })
-
-  it('后台刷新失败保留已有目录数据', async () => {
-    api.listEntries.mockResolvedValue(
-      response(page('/home', [entry('retained.txt', '/home/retained.txt')])),
-    )
-    const wrapper = mount(FileManagerView, {
-      props: { payload: { nodeId: 'node-a' } },
-      global: {
-        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
-      },
-    })
-    await flushPromises()
-    api.listEntries.mockResolvedValue({
-      success: false,
-      code: 503,
-      message: 'node unavailable',
-      data: null,
-    })
-    await wrapper.get('[data-ui="file-refresh"]').trigger('click')
-    await flushPromises()
-
-    expect(wrapper.text()).toContain('retained.txt')
-    expect(wrapper.text()).toContain('node unavailable')
-    wrapper.unmount()
-  })
-
-  it('取消目录删除确认时不调用删除接口', async () => {
-    const directory = entry('archive', '/home/archive', 'directory')
-    api.listEntries.mockResolvedValue(response(page('/home', [directory])))
-    const wrapper = mount(FileManagerView, {
-      props: { payload: { nodeId: 'node-a' } },
-      global: {
-        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
-      },
-    })
-    await flushPromises()
-
-    const deletion = (
-      wrapper.vm as unknown as { handleDelete: (item: FsEntry) => Promise<void> }
-    ).handleDelete(directory)
-    await flushPromises()
-
-    const confirmationDialog = wrapper.get('[data-ui="file-confirmation-dialog"]')
-    expect(confirmationDialog.text()).toContain('/home/archive')
-    const cancelButton = confirmationDialog
-      .findAll('button')
-      .find((button) => button.text() === '取消')
-    expect(cancelButton).toBeDefined()
-    await cancelButton!.trigger('click')
-    await deletion
-    expect(operations.removePath).not.toHaveBeenCalled()
-    wrapper.unmount()
-  })
-
-  it('确认单项删除时保留路径、递归参数和 revision', async () => {
-    const file = entry('report.txt', '/home/report.txt')
-    api.listEntries.mockResolvedValue(response(page('/home', [file])))
-    const wrapper = mount(FileManagerView, {
-      props: { payload: { nodeId: 'node-a' } },
-      global: {
-        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
-      },
-    })
-    await flushPromises()
-
-    const deletion = (
-      wrapper.vm as unknown as { handleDelete: (item: FsEntry) => Promise<void> }
-    ).handleDelete(file)
-    await flushPromises()
-    const confirmButton = wrapper
-      .get('[data-ui="file-confirmation-dialog"]')
-      .findAll('button')
-      .find((button) => button.text() === '确认删除')
-    expect(confirmButton).toBeDefined()
-    await confirmButton!.trigger('click')
-    await deletion
-    await flushPromises()
-
-    expect(operations.removePath).toHaveBeenCalledWith(
-      '/home/report.txt',
-      true,
-      'revision-report.txt',
-    )
-    wrapper.unmount()
-  })
-
-  it('批量删除只使用确认弹窗打开时的路径快照', async () => {
-    const wrapper = mount(FileManagerView, {
-      props: { payload: { nodeId: 'node-a' } },
-      global: {
-        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
-      },
-    })
-    await flushPromises()
-    const view = wrapper.vm as unknown as {
-      toggleSelection: (path: string, checked: boolean) => void
-      handleBatchDelete: () => Promise<void>
-    }
-    view.toggleSelection('/home/a', true)
-    view.toggleSelection('/home/b', true)
-
-    const deletion = view.handleBatchDelete()
-    await flushPromises()
-    view.toggleSelection('/home/c', true)
-    const confirmButton = wrapper
-      .get('[data-ui="file-confirmation-dialog"]')
-      .findAll('button')
-      .find((button) => button.text() === '确认删除')
-    expect(confirmButton).toBeDefined()
-    await confirmButton!.trigger('click')
-    await deletion
-    await flushPromises()
-
-    expect(operations.runPathTask).toHaveBeenCalledWith(
-      'remove',
-      [{ path: '/home/a' }, { path: '/home/b' }],
-      true,
-    )
-    wrapper.unmount()
-  })
-
-  it('通过“新建”菜单打开文件和文件夹表单', async () => {
-    const wrapper = mount(FileManagerView, {
-      attachTo: document.body,
-      props: { payload: { nodeId: 'node-a' } },
-      global: {
-        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
-      },
-    })
-    await flushPromises()
-
-    expect(wrapper.find('[data-ui="file-operation-dialog"]').exists()).toBe(false)
-    const createButton = wrapper.findAll('button').find((button) => button.text().trim() === '新建')
-    expect(createButton).toBeDefined()
-    await createButton!.trigger('click')
-    await flushPromises()
-
-    const menuItems = Array.from(
-      document.body.querySelectorAll<HTMLButtonElement>('button'),
-    ).filter((button) => ['新建文件', '新建文件夹'].includes(button.textContent?.trim() || ''))
-    expect(menuItems.map((button) => button.textContent?.trim())).toEqual([
-      '新建文件',
-      '新建文件夹',
-    ])
-
-    menuItems[0]!.click()
-    await flushPromises()
-    expect(wrapper.get('[data-ui="file-operation-dialog"]').text()).toContain('新建文件')
-    expect(document.activeElement?.getAttribute('name')).toBe('fileManagerDialogInput')
-    wrapper.unmount()
-  })
-
-  it('创建失败时保留表单，成功后关闭并刷新列表', async () => {
-    operations.createFile.mockResolvedValueOnce(false).mockResolvedValueOnce(true)
-    const wrapper = mount(FileManagerView, {
-      props: { payload: { nodeId: 'node-a' } },
-      global: {
-        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
-      },
-    })
-    await flushPromises()
-
-    const view = wrapper.vm as unknown as {
-      openDialog: (type: 'file') => void
-    }
-    view.openDialog('file')
-    await flushPromises()
-    const input = wrapper.get('input[name="fileManagerDialogInput"]')
-    await input.setValue('draft.txt')
-
-    const confirm = () =>
-      wrapper
-        .get('[data-ui="file-operation-dialog"]')
-        .findAll('button')
-        .find((button) => button.text() === '确定')!
-
-    await confirm().trigger('click')
-    await flushPromises()
-    expect(operations.createFile).toHaveBeenLastCalledWith('/home/draft.txt', '')
-    expect(wrapper.find('[data-ui="file-operation-dialog"]').exists()).toBe(true)
-    expect(input.element.value).toBe('draft.txt')
-
-    await confirm().trigger('click')
-    await flushPromises()
-    expect(wrapper.find('[data-ui="file-operation-dialog"]').exists()).toBe(false)
-    expect(api.listEntries).toHaveBeenCalledTimes(2)
-    wrapper.unmount()
-  })
-
-  it('提供多文件与保留相对路径的文件夹上传入口', async () => {
-    const wrapper = mount(FileManagerView, {
-      props: { payload: { nodeId: 'node-a' } },
-      global: {
-        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
-      },
-    })
-    await flushPromises()
-
-    expect(wrapper.get('input[name="fileManagerUploadFiles"]').attributes()).toHaveProperty(
-      'multiple',
-    )
-    const folderInput = wrapper.get('input[name="fileManagerUploadFolder"]')
-    expect(folderInput.attributes()).toHaveProperty('multiple')
-    expect(folderInput.attributes()).toHaveProperty('webkitdirectory')
-
-    const file = new File(['content'], 'guide.md')
-    Object.defineProperty(file, 'webkitRelativePath', { value: 'docs/guide.md' })
-    const input = { files: [file], value: 'selected' } as unknown as HTMLInputElement
-    await (
-      wrapper.vm as unknown as {
-        runSelectedUpload: (input: HTMLInputElement, kind: 'folder') => Promise<void>
-      }
-    ).runSelectedUpload(input, 'folder')
-
-    expect(operations.startUpload).toHaveBeenCalledWith('/home', {
-      kind: 'folder',
-      displayName: 'docs',
-      files: [{ file, relativePath: 'docs/guide.md' }],
-    })
-    expect(input.value).toBe('')
-    wrapper.unmount()
-  })
-
-  it('上传不再弹框或阻止关闭，提供任务中心入口', async () => {
-    const wrapper = mount(FileManagerView, {
-      props: { payload: { nodeId: 'node-a' }, windowId: 'file-window' },
-      global: { plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })] },
-    })
-    await flushPromises()
-    expect(wrapper.find('[data-ui="file-upload-dialog"]').exists()).toBe(false)
-    expect(wrapper.get('[data-ui="file-upload-actions"]').attributes('disabled')).toBeUndefined()
-    expect(windowRuntime.updateWindowRuntimeState).toHaveBeenLastCalledWith(
-      'file-window',
-      expect.objectContaining({ busy: false, blockLevel: 'open' }),
-    )
-    await wrapper.get('[data-ui="file-view-tasks"]').trigger('click')
-    expect(taskCenter.open).toHaveBeenCalledWith('files')
-    wrapper.unmount()
-    expect(taskCenter.unsubscribe).toHaveBeenCalled()
+    mounted.splice(mounted.indexOf(wrapper), 1)
+    expect(signal.aborted).toBe(true)
   })
 })

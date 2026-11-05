@@ -81,6 +81,12 @@ pub struct FileEntryDetail {
     pub user_name: Option<String>,
     pub group_name: Option<String>,
     pub symlink_target: Option<String>,
+    /// 按需解析后的最终目标类型；逻辑路径保持不变。
+    pub symlink_target_kind: Option<FileEntryKind>,
+    /// 目标能力仅用于打开和目录内操作，不替代链接本身的复制、移动能力。
+    pub symlink_target_capabilities: Option<FileCapabilities>,
+    /// 失效、循环或不可访问的链接仍返回其自身详情。
+    pub symlink_error: Option<crate::api::ErrorCode>,
 }
 
 /// 当前目录的真实条目统计。
@@ -99,6 +105,8 @@ pub struct FileEntryCounts {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "files/")]
 pub struct FileListPage {
+    /// 后续分页必须携带的内存目录快照标识。
+    pub snapshot_id: String,
     pub path: String,
     pub entries: Vec<FileEntrySummary>,
     pub page: u32,

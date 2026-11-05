@@ -121,6 +121,31 @@ pub async fn create(
             planned_bytes: 0,
         });
     }
+    let mut physical_items = Vec::with_capacity(normalized.len());
+    for item in &normalized {
+        let source = file_path_coordinator::physical_entry_path(&item.source).await?;
+        let target = match &item.target {
+            Some(target) => Some(file_path_coordinator::physical_entry_path(target).await?),
+            None => None,
+        };
+        if target
+            .as_ref()
+            .is_some_and(|target| target == &source || target.starts_with(&source))
+        {
+            return Err(ApiError::conflict(
+                ErrorCode::FileOperationConflict,
+                "resolved target conflicts with source",
+            ));
+        }
+        physical_items.push(TaskItem {
+            ordinal: item.ordinal,
+            source,
+            target,
+            expected_revision: item.expected_revision.clone(),
+            planned_bytes: 0,
+        });
+    }
+    ensure_no_internal_overlap(&physical_items)?;
     ensure_no_internal_overlap(&normalized)?;
     let reservation_paths = normalized
         .iter()
@@ -1221,6 +1246,76 @@ mod tests {
             },
         ];
         assert!(ensure_no_internal_overlap(&items).is_err());
+    }
+
+    #[tokio::test]
+    async fn copy_rejects_destination_inside_source_through_a_directory_link() {
+        let pool = crate::test_support::setup_test_db().await;
+        let root = TestDirectory::new("linked-destination").await;
+        let source = root.0.join("source");
+        tokio::fs::create_dir_all(source.join("sub")).await.unwrap();
+        std::os::unix::fs::symlink("source/sub", root.0.join("alias")).unwrap();
+        let result = create(
+            &pool,
+            "local",
+            actor(),
+            CreateFileOperationTaskRequest {
+                operation: FileOperation::Copy,
+                items: vec![FileOperationItemRequest {
+                    path: source.to_string_lossy().into_owned(),
+                    expected_revision: None,
+                    target_path: Some(root.0.join("alias/copy").to_string_lossy().into_owned()),
+                }],
+                target_directory: None,
+                recursive: true,
+                overwrite: false,
+                idempotency_key: Uuid::now_v7().to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(result.code, ErrorCode::FileOperationConflict);
+        assert!(!source.join("sub/copy").exists());
+    }
+
+    #[tokio::test]
+    async fn removing_directory_link_never_removes_its_target() {
+        let pool = crate::test_support::setup_test_db().await;
+        let root = TestDirectory::new("remove-link").await;
+        tokio::fs::create_dir(root.0.join("actual")).await.unwrap();
+        tokio::fs::write(root.0.join("actual/keep.txt"), b"keep")
+            .await
+            .unwrap();
+        let link = root.0.join("alias");
+        std::os::unix::fs::symlink("actual", &link).unwrap();
+        let task = create(
+            &pool,
+            "local",
+            actor(),
+            CreateFileOperationTaskRequest {
+                operation: FileOperation::Remove,
+                items: vec![FileOperationItemRequest {
+                    path: link.to_string_lossy().into_owned(),
+                    expected_revision: None,
+                    target_path: None,
+                }],
+                target_directory: None,
+                recursive: true,
+                overwrite: false,
+                idempotency_key: Uuid::now_v7().to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let ended = wait_for_terminal(&pool, &task.task_id).await;
+        assert_eq!(ended.status, FileTaskStatus::Succeeded);
+        assert_eq!(
+            tokio::fs::read(root.0.join("actual/keep.txt"))
+                .await
+                .unwrap(),
+            b"keep"
+        );
+        assert!(tokio::fs::symlink_metadata(&link).await.is_err());
     }
 
     #[tokio::test]

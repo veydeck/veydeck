@@ -10,7 +10,8 @@ use std::{
     io,
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Component, Path, PathBuf},
-    time::SystemTime,
+    sync::{Arc, LazyLock, Mutex},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
@@ -51,6 +52,106 @@ pub struct FileListOptions {
     pub sort_by: FileSortBy,
     pub sort_order: FileSortOrder,
     pub show_hidden: bool,
+    /// 后续分页复用的目录快照；空值创建新快照。
+    pub snapshot_id: Option<String>,
+}
+
+/// Agent 内存快照预算；过期和淘汰均不静默重建分页。
+const SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
+const SNAPSHOT_MAX_COUNT: usize = 16;
+const SNAPSHOT_IDLE: Duration = Duration::from_secs(120);
+static SNAPSHOT_SCAN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+static DIRECTORY_SNAPSHOTS: LazyLock<Mutex<SnapshotCache>> =
+    LazyLock::new(|| Mutex::new(SnapshotCache::default()));
+
+/// 一次目录扫描的不可变、已排序结果。
+struct DirectorySnapshot {
+    id: String,
+    path: PathBuf,
+    sort_by: FileSortBy,
+    sort_order: FileSortOrder,
+    show_hidden: bool,
+    entries: Vec<FileEntrySummary>,
+    counts: FileEntryCounts,
+    loaded_at: String,
+    bytes: usize,
+}
+impl DirectorySnapshot {
+    /// 只克隆当前页，分页不会重新访问目录中的文件。
+    fn page(&self, options: &FileListOptions) -> FileListPage {
+        let start = ((options.page - 1) as usize)
+            .saturating_mul(options.page_size as usize)
+            .min(self.entries.len());
+        let end = start
+            .saturating_add(options.page_size as usize)
+            .min(self.entries.len());
+        FileListPage {
+            snapshot_id: self.id.clone(),
+            path: self.path.to_string_lossy().into_owned(),
+            entries: self.entries[start..end].to_vec(),
+            page: options.page,
+            page_size: options.page_size,
+            total: self.entries.len() as u64,
+            counts: self.counts.clone(),
+            loaded_at: self.loaded_at.clone(),
+        }
+    }
+}
+
+/// 带空闲过期和 LRU 淘汰的有界目录缓存。
+#[derive(Default)]
+struct SnapshotCache {
+    entries: Vec<(Arc<DirectorySnapshot>, Instant)>,
+}
+impl SnapshotCache {
+    /// 移除空闲过期快照。
+    fn expire(&mut self) {
+        self.entries
+            .retain(|(_, used)| used.elapsed() < SNAPSHOT_IDLE);
+    }
+    /// 获取并延长快照空闲期限。
+    fn get(&mut self, id: &str) -> Result<Arc<DirectorySnapshot>, ApiError> {
+        self.expire();
+        let Some((snapshot, used)) = self.entries.iter_mut().find(|(s, _)| s.id == id) else {
+            return Err(ApiError::new(
+                StatusCode::GONE,
+                ErrorCode::FileListSnapshotExpired,
+                "directory snapshot expired",
+            ));
+        };
+        *used = Instant::now();
+        Ok(snapshot.clone())
+    }
+    /// 按数量与内存双重预算淘汰最久未使用的快照。
+    fn insert(&mut self, snapshot: DirectorySnapshot) -> Result<(), ApiError> {
+        if snapshot.bytes > SNAPSHOT_MAX_BYTES {
+            return Err(snapshot_limit());
+        }
+        self.expire();
+        while self.entries.len() >= SNAPSHOT_MAX_COUNT
+            || self.entries.iter().map(|(s, _)| s.bytes).sum::<usize>() + snapshot.bytes
+                > SNAPSHOT_MAX_BYTES
+        {
+            let oldest = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(i, _)| i)
+                .unwrap();
+            self.entries.remove(oldest);
+        }
+        self.entries.push((Arc::new(snapshot), Instant::now()));
+        Ok(())
+    }
+}
+/// 返回可识别的快照资源上限错误。
+fn snapshot_limit() -> ApiError {
+    ApiError::new(
+        StatusCode::INSUFFICIENT_STORAGE,
+        ErrorCode::FileListSnapshotLimit,
+        "directory snapshot capacity exceeded",
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -96,7 +197,7 @@ pub fn home() -> FileHome {
 
 /// 返回稳定排序并分页的当前目录摘要。
 pub async fn list(pool: &DbPool, options: FileListOptions) -> Result<FileListPage, ApiError> {
-    let metadata = tokio::fs::symlink_metadata(&options.path)
+    let metadata = tokio::fs::metadata(&options.path)
         .await
         .map_err(|error| map_io_error(error, "list directory"))?;
     if !metadata.is_dir() {
@@ -107,7 +208,24 @@ pub async fn list(pool: &DbPool, options: FileListOptions) -> Result<FileListPag
         ));
     }
 
+    if let Some(id) = options.snapshot_id.as_deref().filter(|id| !id.is_empty()) {
+        let snapshot = DIRECTORY_SNAPSHOTS.lock().unwrap().get(id)?;
+        if snapshot.path != options.path
+            || snapshot.sort_by != options.sort_by
+            || snapshot.sort_order != options.sort_order
+            || snapshot.show_hidden != options.show_hidden
+        {
+            return Err(ApiError::validation("snapshot parameters do not match"));
+        }
+        return Ok(snapshot.page(&options));
+    }
+    // 串行建立快照，避免多个大目录扫描同时占用不受限的临时内存。
+    let _scan = SNAPSHOT_SCAN
+        .acquire()
+        .await
+        .map_err(|_| snapshot_limit())?;
     let roots = management_roots(pool).await?;
+    let mut estimated_bytes = 0;
     let mut counts = FileEntryCounts::default();
     let mut entries = Vec::new();
     let mut reader = tokio::fs::read_dir(&options.path)
@@ -133,28 +251,42 @@ pub async fn list(pool: &DbPool, options: FileListOptions) -> Result<FileListPag
             FileEntryKind::Symlink => counts.symlink_count += 1,
             FileEntryKind::Other => counts.other_count += 1,
         }
+        estimated_bytes += std::mem::size_of::<FileEntrySummary>()
+            + summary.path.len()
+            + summary.name.len()
+            + summary.revision.len()
+            + summary
+                .management
+                .owner_name
+                .as_ref()
+                .map_or(0, String::len)
+            + summary
+                .management
+                .manage_via
+                .as_ref()
+                .map_or(0, String::len)
+            + 128;
+        if estimated_bytes > SNAPSHOT_MAX_BYTES {
+            return Err(snapshot_limit());
+        }
         entries.push(summary);
     }
 
     entries.sort_by(|left, right| compare_entries(left, right, &options));
-    let total = entries.len() as u64;
-    let start = usize::try_from((options.page - 1).saturating_mul(options.page_size))
-        .unwrap_or(usize::MAX)
-        .min(entries.len());
-    let end = start
-        .saturating_add(options.page_size as usize)
-        .min(entries.len());
-    let entries = entries[start..end].to_vec();
-
-    Ok(FileListPage {
-        path: options.path.to_string_lossy().into_owned(),
-        entries,
-        page: options.page,
-        page_size: options.page_size,
-        total,
+    let snapshot = DirectorySnapshot {
+        id: Uuid::now_v7().to_string(),
+        path: options.path.clone(),
+        sort_by: options.sort_by,
+        sort_order: options.sort_order,
+        show_hidden: options.show_hidden,
         counts,
         loaded_at: timestamp(SystemTime::now()).unwrap_or_default(),
-    })
+        entries,
+        bytes: estimated_bytes,
+    };
+    let page = snapshot.page(&options);
+    DIRECTORY_SNAPSHOTS.lock().unwrap().insert(snapshot)?;
+    Ok(page)
 }
 
 /// 返回单个文件系统条目的按需详情。
@@ -178,6 +310,26 @@ pub async fn detail(pool: &DbPool, path: &Path) -> Result<FileEntryDetail, ApiEr
     } else {
         None
     };
+    let (symlink_target_kind, symlink_target_capabilities, symlink_error) =
+        if symlink_target.is_some() {
+            match tokio::fs::metadata(path).await {
+                Ok(target) => {
+                    let target_kind = kind(&target);
+                    (
+                        Some(target_kind),
+                        Some(capabilities_from_metadata(target_kind, &target)),
+                        None,
+                    )
+                }
+                Err(error) => (
+                    None,
+                    None,
+                    Some(map_io_error(error, "resolve symbolic link").code),
+                ),
+            }
+        } else {
+            (None, None, None)
+        };
     Ok(FileEntryDetail {
         summary: summary_from_metadata(path, name, &metadata, &roots),
         mode: metadata.mode(),
@@ -186,6 +338,9 @@ pub async fn detail(pool: &DbPool, path: &Path) -> Result<FileEntryDetail, ApiEr
         user_name: None,
         group_name: None,
         symlink_target,
+        symlink_target_kind,
+        symlink_target_capabilities,
+        symlink_error,
     })
 }
 
@@ -729,6 +884,13 @@ fn invalid_path(message: &'static str) -> ApiError {
 }
 
 pub fn map_io_error(error: io::Error, operation: &'static str) -> ApiError {
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            ErrorCode::FileSymlinkLoop,
+            "symbolic link resolution loop",
+        );
+    }
     match error.kind() {
         io::ErrorKind::NotFound => {
             ApiError::not_found(ErrorCode::FileNotFound, "file or directory does not exist")
@@ -841,6 +1003,44 @@ mod tests {
         assert!(capabilities_for(FileEntryKind::File).can_remove);
     }
 
+    /// 构造无文件条目的快照，独立验证预算和时钟行为。
+    fn empty_snapshot(id: &str, bytes: usize) -> DirectorySnapshot {
+        DirectorySnapshot {
+            id: id.to_string(),
+            path: PathBuf::from("/"),
+            sort_by: FileSortBy::Name,
+            sort_order: FileSortOrder::Asc,
+            show_hidden: false,
+            entries: Vec::new(),
+            counts: FileEntryCounts::default(),
+            loaded_at: String::new(),
+            bytes,
+        }
+    }
+    #[test]
+    fn snapshot_cache_expires_and_evicts_by_lru_and_memory_budget() {
+        let mut cache = SnapshotCache::default();
+        cache.insert(empty_snapshot("old", 1)).unwrap();
+        cache.entries[0].1 = Instant::now() - SNAPSHOT_IDLE - Duration::from_secs(1);
+        assert!(cache.get("old").is_err());
+        for index in 0..SNAPSHOT_MAX_COUNT {
+            cache.insert(empty_snapshot(&index.to_string(), 1)).unwrap();
+        }
+        cache.get("0").unwrap();
+        cache.insert(empty_snapshot("new", 1)).unwrap();
+        assert!(cache.get("0").is_ok());
+        assert!(cache.get("1").is_err());
+        cache
+            .insert(empty_snapshot("large", SNAPSHOT_MAX_BYTES))
+            .unwrap();
+        assert_eq!(cache.entries.len(), 1);
+        assert!(
+            cache
+                .insert(empty_snapshot("oversized", SNAPSHOT_MAX_BYTES + 1))
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn list_uses_stable_server_pagination_and_real_counts() {
         let pool = crate::test_support::setup_test_db().await;
@@ -863,6 +1063,7 @@ mod tests {
                 sort_by: FileSortBy::Name,
                 sort_order: FileSortOrder::Asc,
                 show_hidden: false,
+                snapshot_id: None,
             },
         )
         .await
@@ -873,6 +1074,11 @@ mod tests {
         assert_eq!(page.entries[0].name, "directory");
         assert_eq!(page.entries[1].name, "a.txt");
 
+        // 目录在翻页期间改变，后续页仍应读取原快照。
+        tokio::fs::remove_file(root.0.join("b.txt")).await.unwrap();
+        tokio::fs::write(root.0.join("0.txt"), b"new")
+            .await
+            .unwrap();
         let second = list(
             &pool,
             FileListOptions {
@@ -882,6 +1088,7 @@ mod tests {
                 sort_by: FileSortBy::Name,
                 sort_order: FileSortOrder::Asc,
                 show_hidden: false,
+                snapshot_id: Some(page.snapshot_id.clone()),
             },
         )
         .await
@@ -965,6 +1172,76 @@ mod tests {
             b"preserved"
         );
         assert_eq!(result.document.content, "replacement");
+    }
+
+    #[tokio::test]
+    async fn linked_directories_keep_logical_paths_and_resolve_relative_chains() {
+        let pool = crate::test_support::setup_test_db().await;
+        let root = TestDirectory::new("linked-directory").await;
+        let actual = root.0.join("actual");
+        tokio::fs::create_dir(&actual).await.unwrap();
+        tokio::fs::write(actual.join("note.txt"), b"text")
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink("actual", root.0.join("alias")).unwrap();
+        std::os::unix::fs::symlink("alias", root.0.join("chain")).unwrap();
+        let logical = root.0.join("chain");
+        let info = detail(&pool, &logical).await.unwrap();
+        assert_eq!(info.summary.kind, FileEntryKind::Symlink);
+        assert_eq!(info.symlink_target_kind, Some(FileEntryKind::Directory));
+        assert!(info.symlink_target_capabilities.unwrap().can_create_child);
+        assert_eq!(info.symlink_target.as_deref(), Some("alias"));
+        let page = list(
+            &pool,
+            FileListOptions {
+                path: logical.clone(),
+                page: 1,
+                page_size: 50,
+                sort_by: FileSortBy::Name,
+                sort_order: FileSortOrder::Asc,
+                show_hidden: false,
+                snapshot_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.path, logical.to_string_lossy());
+        assert_eq!(
+            page.entries[0].path,
+            logical.join("note.txt").to_string_lossy()
+        );
+        std::os::unix::fs::symlink("chain/note.txt", root.0.join("file-link")).unwrap();
+        let file_link = root.0.join("file-link");
+        assert_eq!(
+            detail(&pool, &file_link).await.unwrap().symlink_target_kind,
+            Some(FileEntryKind::File)
+        );
+        let document = read_content(&file_link).await.unwrap();
+        assert_eq!(document.path, file_link.to_string_lossy());
+        assert_eq!(document.content, "text");
+    }
+
+    #[tokio::test]
+    async fn broken_and_looping_links_keep_their_own_details_and_return_target_errors() {
+        let pool = crate::test_support::setup_test_db().await;
+        let root = TestDirectory::new("bad-links").await;
+        std::os::unix::fs::symlink("missing", root.0.join("broken")).unwrap();
+        std::os::unix::fs::symlink("second", root.0.join("first")).unwrap();
+        std::os::unix::fs::symlink("first", root.0.join("second")).unwrap();
+        let broken = detail(&pool, &root.0.join("broken")).await.unwrap();
+        assert_eq!(broken.summary.kind, FileEntryKind::Symlink);
+        assert_eq!(broken.symlink_error, Some(ErrorCode::FileNotFound));
+        assert!(broken.summary.capabilities.can_remove);
+        let looping = detail(&pool, &root.0.join("first")).await.unwrap();
+        assert_eq!(looping.symlink_error, Some(ErrorCode::FileSymlinkLoop));
+        assert_eq!(
+            map_io_error(
+                io::Error::from_raw_os_error(libc::EACCES),
+                "resolve symbolic link"
+            )
+            .code,
+            ErrorCode::FilePermissionDenied
+        );
     }
 
     #[tokio::test]

@@ -236,3 +236,30 @@ describe('任务中心窗口', () => {
     wrapper.unmount()
   })
 })
+
+describe('文件管理桌面入口', () => {
+  it('每次启动创建独立实例，已有窗口仍由任务栏恢复，不覆盖原目录', async () => {
+    const pinia = createPinia()
+    const wrapper = mount(Harness, {
+      global: {
+        plugins: [pinia, createI18n({ legacy: false, locale: 'zh', messages: { zh, en } })],
+      },
+    })
+    const nodes = useNodeStore(pinia)
+    nodes.setNodes([{ id: 'node-a', name: '节点 A', address: '', status: 'online', tags: [] }])
+    nodes.setCurrentNode('node-a')
+    const store = wrapper.vm.windowStore
+    store.openWindow('file-manager')
+    const first = store.openWindows[0]!
+    first.payload = { ...first.payload, path: '/source' }
+    store.minimizeWindow(first.id)
+    store.openWindow('file-manager')
+    const second = store.openWindows[1]!
+    expect(first.id).not.toBe(second.id)
+    expect(first.isMinimized).toBe(true)
+    expect(first.payload).toEqual({ nodeId: 'node-a', path: '/source' })
+    expect(second.payload).toEqual({ nodeId: 'node-a' })
+    expect(second.nodeContext?.nodeId).toBe('node-a')
+    wrapper.unmount()
+  })
+})

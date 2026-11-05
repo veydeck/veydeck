@@ -102,6 +102,7 @@ struct ListQuery {
     sort_order: String,
     #[serde(default)]
     show_hidden: bool,
+    snapshot_id: Option<String>,
 }
 
 async fn home() -> Response {
@@ -532,6 +533,7 @@ fn validate_list_query(query: ListQuery) -> ApiResult<FileListOptions> {
         sort_by,
         sort_order,
         show_hidden: query.show_hidden,
+        snapshot_id: query.snapshot_id,
     })
 }
 
@@ -609,6 +611,7 @@ mod tests {
             sort_by: "name".to_string(),
             sort_order: "asc".to_string(),
             show_hidden: false,
+            snapshot_id: None,
         };
         assert!(validate_list_query(query).is_err());
     }

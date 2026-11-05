@@ -36,6 +36,14 @@ export interface FsEntry {
   capabilities: FileCapabilities
 }
 
+/** 文件详情保留链接本身的摘要，目标类型与能力仅按需解析。 */
+export interface FsEntryDetail extends FsEntry {
+  symlinkTarget?: string | null
+  symlinkTargetKind?: FileEntryKind | null
+  symlinkTargetCapabilities?: FileCapabilities | null
+  symlinkError?: import('@/api/generated').ErrorCode | null
+}
+
 export interface FileEntryCounts {
   fileCount: number
   directoryCount: number
@@ -44,6 +52,7 @@ export interface FileEntryCounts {
 }
 
 export interface FileListPage {
+  snapshotId: string
   path: string
   entries: FsEntry[]
   page: number

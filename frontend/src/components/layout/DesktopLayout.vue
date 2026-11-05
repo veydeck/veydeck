@@ -1,12 +1,20 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted } from 'vue'
+import { useFileBrowserStore } from '@/stores/file-browser'
 import { useTaskCenterStore } from '@/stores/task-center'
 import { RouterView } from 'vue-router'
 import DesktopHeader from './DesktopHeader.vue'
 
 const taskCenter = useTaskCenterStore()
-onMounted(() => taskCenter.start())
-onUnmounted(() => taskCenter.reset())
+const fileBrowser = useFileBrowserStore()
+onMounted(() => {
+  taskCenter.start()
+  fileBrowser.start()
+})
+onUnmounted(() => {
+  fileBrowser.reset()
+  taskCenter.reset()
+})
 
 /**
  * @file DesktopLayout.vue

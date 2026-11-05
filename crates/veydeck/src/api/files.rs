@@ -60,6 +60,7 @@ struct FileListQuery {
     sort_order: String,
     #[serde(default)]
     show_hidden: bool,
+    snapshot_id: Option<String>,
 }
 
 /// 构建 node-scoped 文件管理公共路由。
@@ -140,6 +141,7 @@ async fn list(
             ("sortBy", query.sort_by),
             ("sortOrder", query.sort_order),
             ("showHidden", query.show_hidden.to_string()),
+            ("snapshotId", query.snapshot_id.unwrap_or_default()),
         ],
     )?;
     let data: FileListPage = client.get_domain(&path).await?;
@@ -713,6 +715,7 @@ mod tests {
             sort_by: "name".to_string(),
             sort_order: "asc".to_string(),
             show_hidden: false,
+            snapshot_id: None,
         };
         assert!(validate_list_query(&query).is_err());
     }
