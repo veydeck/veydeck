@@ -284,6 +284,8 @@ const zh: typeof en = {
       PROCESS_CONFIRMATION_INVALID: '强制结束确认已失效，请重新确认。',
       PROCESS_SIGNAL_UNAVAILABLE: '当前内核无法提供安全的进程信号操作。',
       PROCESS_SAMPLER_UNAVAILABLE: '进程采样暂不可用。',
+      PROCESS_SNAPSHOT_EXPIRED: '进程列表快照已过期，正在重新加载。',
+      PROCESS_SNAPSHOT_LIMIT: '进程列表快照超出缓存容量，请缩小查询范围。',
       NETWORK_SAMPLER_UNAVAILABLE: '网络连接采样暂不可用。',
     },
     upgrades: {

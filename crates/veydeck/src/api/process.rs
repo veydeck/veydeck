@@ -686,6 +686,7 @@ fn operation_context(
 
 fn process_query_path(query: &ProcessListQuery) -> ApiResult<String> {
     let mut pairs = Vec::new();
+    push_option(&mut pairs, "snapshotId", query.snapshot_id.clone());
     push_option(&mut pairs, "query", query.query.as_ref().cloned());
     push_option(&mut pairs, "status", query.status.map(process_state_key));
     push_option(
@@ -860,11 +861,13 @@ mod tests {
     #[test]
     fn query_builder_uses_camel_case_contract_values() {
         let query = ProcessListQuery {
+            snapshot_id: Some("snapshot-a".to_string()),
             sort_by: Some(ProcessSortBy::CpuPercent),
             sort_order: Some(SortOrder::Desc),
             ..ProcessListQuery::default()
         };
         let path = process_query_path(&query).expect("query path");
+        assert!(path.contains("snapshotId=snapshot-a"));
         assert!(path.contains("sortBy=cpuPercent"));
         assert!(path.contains("sortOrder=desc"));
     }

@@ -36,6 +36,12 @@ export const useProcessManager = (nodeId: string) => {
   const activeView = ref<ProcessManagerActiveView>('process')
   const processPage = ref<ProcessListPage | null>(null)
   const networkPage = ref<NetworkConnectionListPage | null>(null)
+  const processLoadingMore = ref(false)
+  const processLoadMoreError = ref<string | null>(null)
+  const processGeneration = ref(0)
+  const processBusy = ref(false)
+  let loadedProcessPages = 0
+  const processHasMore = ref(false)
   const processPhase = ref<ProcessLoadPhase>('idle')
   const networkPhase = ref<ProcessLoadPhase>('idle')
   const processError = ref<string | null>(null)
@@ -81,48 +87,79 @@ export const useProcessManager = (nodeId: string) => {
     }, delay)
   }
 
-  const loadProcesses = async (background = false): Promise<boolean | undefined> => {
+  /** 串行加载或整体刷新已展开的进程范围，过期查询不能提交结果。 */
+  const loadProcesses = async (
+    background = false,
+    append = false,
+  ): Promise<boolean | undefined> => {
+    if (disposed) return undefined
     if (processInFlight) {
-      processRequestPending = true
+      if (!append) processRequestPending = true
       return undefined
     }
+    if (append && (!processHasMore.value || activeView.value !== 'process')) return undefined
     if (activeView.value === 'process') clearPoll()
     processInFlight = true
+    processBusy.value = true
+    processLoadingMore.value = append
     const sequence = ++processRequestSequence
     const revision = processQueryRevision
-    const requestNodeId = nodeId
     const params = { ...processQuery }
+    const isCurrent = () =>
+      !disposed && sequence === processRequestSequence && revision === processQueryRevision
     if (!processPage.value) processPhase.value = 'initialLoading'
-    else if (!background && processPhase.value !== 'stale') processPhase.value = 'refreshing'
+    else if (!background && !append && processPhase.value !== 'stale') {
+      processPhase.value = 'refreshing'
+    }
     try {
-      const response = await scopedApi.listProcesses(params)
-      if (
-        disposed ||
-        requestNodeId !== nodeId ||
-        sequence !== processRequestSequence ||
-        revision !== processQueryRevision
-      ) {
-        return undefined
+      const firstPage = append ? loadedProcessPages + 1 : 1
+      const lastPage = append ? firstPage : Math.max(1, loadedProcessPages)
+      const entries = append ? [...(processPage.value?.entries ?? [])] : []
+      let snapshotId = append ? processPage.value?.snapshotId : undefined
+      let result: ProcessListPage | undefined
+      let fetchedPage = firstPage
+      let hasMore = false
+      for (let page = firstPage; page <= lastPage; page += 1) {
+        const response = await scopedApi.listProcesses({ ...params, page, snapshotId })
+        if (!isCurrent()) return undefined
+        if (!response.success || !response.data) {
+          if (append && response.errorCode === 'PROCESS_SNAPSHOT_EXPIRED') {
+            processRequestPending = true
+          }
+          throw new Error(response.message)
+        }
+        result = response.data
+        if (snapshotId && result.snapshotId !== snapshotId) {
+          throw new Error('Process snapshot changed during pagination')
+        }
+        snapshotId = result.snapshotId
+        entries.push(...result.entries)
+        fetchedPage = page
+        hasMore = result.entries.length > 0 && entries.length < result.total
+        if (!hasMore) break
       }
-      if (!response.success || !response.data) throw new Error(response.message)
-      processPage.value = response.data
+      if (!result) return undefined
+      processPage.value = { ...result, entries }
+      loadedProcessPages = fetchedPage
+      processHasMore.value = hasMore
+      processLoadMoreError.value = null
       processError.value = null
       processPhase.value = 'ready'
       return true
     } catch (error) {
-      if (
-        disposed ||
-        requestNodeId !== nodeId ||
-        sequence !== processRequestSequence ||
-        revision !== processQueryRevision
-      ) {
-        return undefined
+      if (!isCurrent()) return undefined
+      const message = error instanceof Error ? error.message : String(error)
+      if (append) {
+        processLoadMoreError.value = message
+      } else {
+        processError.value = message
+        processPhase.value = processPage.value ? 'stale' : 'initialError'
       }
-      processError.value = error instanceof Error ? error.message : String(error)
-      processPhase.value = processPage.value ? 'stale' : 'initialError'
       return false
     } finally {
       processInFlight = false
+      processBusy.value = false
+      processLoadingMore.value = false
       if (processRequestPending) {
         processRequestPending = false
         queueMicrotask(() => void loadProcesses(false))
@@ -131,6 +168,9 @@ export const useProcessManager = (nodeId: string) => {
       }
     }
   }
+
+  /** 触底加载下一页；重复触发不会创建并发请求。 */
+  const loadMoreProcesses = () => loadProcesses(false, true)
 
   const loadNetworkConnections = async (background = false): Promise<boolean | undefined> => {
     if (networkInFlight) {
@@ -184,6 +224,7 @@ export const useProcessManager = (nodeId: string) => {
   }
 
   const setActiveView = (view: ProcessManagerActiveView) => {
+    if (activeView.value === view) return
     activeView.value = view
     clearPoll()
     if (view === 'process') void loadProcesses(false)
@@ -240,6 +281,12 @@ export const useProcessManager = (nodeId: string) => {
     () => ({ ...processQuery }),
     () => {
       processQueryRevision += 1
+      processGeneration.value += 1
+      loadedProcessPages = 0
+      processHasMore.value = false
+      processPage.value = null
+      processLoadMoreError.value = null
+      processError.value = null
       if (activeView.value === 'process') void loadProcesses(false)
     },
   )
@@ -278,6 +325,12 @@ export const useProcessManager = (nodeId: string) => {
     networkPhase,
     networkQuery,
     pendingProcessIds,
+    loadMoreProcesses,
+    processBusy,
+    processGeneration,
+    processHasMore,
+    processLoadingMore,
+    processLoadMoreError,
     processError,
     processPage,
     processPartial: computed(() => processPage.value?.coverage.status === 'partial'),

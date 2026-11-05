@@ -30,6 +30,7 @@ export type NetworkSortBy =
 export type SortOrder = 'asc' | 'desc'
 
 export interface ProcessListParams {
+  snapshotId?: string
   query?: string
   status?: ProcessSummary['state']
   page: number

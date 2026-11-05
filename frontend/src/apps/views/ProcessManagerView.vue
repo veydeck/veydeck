@@ -20,6 +20,7 @@ import {
   VeyTable,
   VeyTag,
 } from '@/components/ui'
+import ProcessVirtualTable from '@/components/process/ProcessVirtualTable.vue'
 import type { VeyTableColumn } from '@/components/ui/VeyTable.vue'
 
 const props = defineProps<{
@@ -80,14 +81,6 @@ const networkRows = computed<NetworkDisplayRow[]>(() =>
     pid: entry.owners.map((owner) => owner.pid).join(', ') || '--',
     processName: entry.owners.map((owner) => owner.processName).join(', ') || '--',
   })),
-)
-const processTotalPages = computed(() =>
-  Math.max(
-    1,
-    Math.ceil(
-      (processManager.processPage.value?.total ?? 0) / processManager.processQuery.pageSize,
-    ),
-  ),
 )
 const networkTotalPages = computed(() =>
   Math.max(
@@ -489,7 +482,18 @@ const networkColumns = computed<VeyTableColumn[]>(() => [
 
     <div v-if="activeTab === 'process'" class="content-wrapper" data-slot="process-panel">
       <VeyCard shadow="never" class="table-card" full-height>
-        <VeyTable :data="processRows" :columns="processColumns" border data-ui="process-table">
+        <ProcessVirtualTable
+          :data="processRows"
+          :columns="processColumns"
+          :generation="processManager.processGeneration.value"
+          :has-more="processManager.processHasMore.value"
+          :busy="processManager.processBusy.value"
+          :loading-more="processManager.processLoadingMore.value"
+          :load-more-error="processManager.processLoadMoreError.value"
+          :label="t('app.processManager.tabs.process')"
+          data-ui="process-table"
+          @load-more="processManager.loadMoreProcesses"
+        >
           <template #header-pid>
             <button
               class="sortable-header"
@@ -563,15 +567,8 @@ const networkColumns = computed<VeyTableColumn[]>(() => [
             </div>
           </template>
           <template #empty><VeyEmpty :description="processEmptyText" /></template>
-        </VeyTable>
+        </ProcessVirtualTable>
       </VeyCard>
-      <div class="pagination-bar" data-slot="process-pagination">
-        <VeyPagination
-          :current-page="processManager.processQuery.page"
-          :total-pages="processTotalPages"
-          @page-change="(page) => (processManager.processQuery.page = page)"
-        />
-      </div>
     </div>
 
     <div v-else class="content-wrapper" data-slot="network-panel">
@@ -663,6 +660,7 @@ const networkColumns = computed<VeyTableColumn[]>(() => [
 }
 
 .action-buttons {
+  height: 100%;
   width: 100%;
   justify-content: center;
 }

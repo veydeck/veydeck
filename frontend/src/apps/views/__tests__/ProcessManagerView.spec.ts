@@ -1,6 +1,6 @@
 import { createI18n } from 'vue-i18n'
 import { flushPromises, mount } from '@vue/test-utils'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ProcessListPage } from '@/api/generated'
 import ProcessManagerView from '../ProcessManagerView.vue'
 import zh from '@/locales/zh'
@@ -30,6 +30,7 @@ vi.mock('@/stores/toast', () => ({ useToastStore: () => notifications }))
 const response = <T>(data: T) => ({ success: true, code: 200, message: '', data })
 const processId = 'a'.repeat(64)
 const page: ProcessListPage = {
+  snapshotId: 'snapshot-view',
   entries: [
     {
       processId,
@@ -107,6 +108,46 @@ describe('ProcessManagerView', () => {
       }),
     )
     confirmation.showConfirmation.mockResolvedValue(true)
+  })
+
+  afterEach(() => vi.restoreAllMocks())
+
+  it('进程表格虚拟渲染、触底加载且筛选后回到顶部', async () => {
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(400)
+    const entries = Array.from({ length: 100 }, (_, index) => ({
+      ...page.entries[0]!,
+      processId: `process-${index}`,
+      pid: index,
+      name: `worker-${index}`,
+    }))
+    api.listProcesses.mockResolvedValueOnce(response({ ...page, entries, total: 101 }))
+    api.listProcesses.mockResolvedValueOnce(
+      response({
+        ...page,
+        page: 2,
+        total: 101,
+        entries: [{ ...page.entries[0]!, processId: 'last', name: 'last-worker' }],
+      }),
+    )
+    const wrapper = mount(ProcessManagerView, {
+      global: { plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })] },
+    })
+    await flushPromises()
+    expect(wrapper.find('[data-slot="process-pagination"]').exists()).toBe(false)
+    expect(wrapper.findAll('[data-slot="process-row"]').length).toBeLessThan(30)
+    expect(wrapper.find('[data-process-id="process-99"]').exists()).toBe(false)
+    const viewport = wrapper.get('[data-slot="process-scroll"]')
+    viewport.element.scrollTop = 4000
+    await viewport.trigger('scroll')
+    await flushPromises()
+    expect(api.listProcesses.mock.calls.at(-1)?.[0]).toMatchObject({ page: 2 })
+    expect(wrapper.text()).toContain('last-worker')
+    expect(wrapper.findAll('[data-slot="process-row"]').length).toBeLessThan(30)
+    await wrapper.get('[data-ui="process-table"] button.sortable-header').trigger('click')
+    await flushPromises()
+    expect(viewport.element.scrollTop).toBe(0)
+    expect(api.listProcesses.mock.calls.at(-1)?.[0]).toMatchObject({ page: 1, sortOrder: 'desc' })
+    wrapper.unmount()
   })
 
   it('固定使用窗口节点且强制结束必须完成两次确认', async () => {

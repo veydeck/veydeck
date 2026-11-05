@@ -41,6 +41,112 @@ const MAX_CPU_SAMPLE_GAP_SECONDS: f64 = 6.0;
 const DEFAULT_PAGE_SIZE: usize = 100;
 const MAX_PAGE_SIZE: usize = 500;
 
+const PROCESS_SNAPSHOT_IDLE: Duration = Duration::from_secs(120);
+const PROCESS_SNAPSHOT_MAX_COUNT: usize = 32;
+const PROCESS_SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// 固定查询条件及完整排序结果，分页期间不再读取实时采样。
+struct ProcessListSnapshot {
+    query_key: String,
+    result: ProcessListPage,
+    bytes: usize,
+}
+
+/// 按空闲期限、数量与内存预算管理不可变分页快照。
+#[derive(Default)]
+struct ProcessListSnapshotCache {
+    entries: Vec<(Arc<ProcessListSnapshot>, Instant)>,
+}
+
+impl ProcessListSnapshotCache {
+    /// 清理空闲过期快照，活跃分页会延长有效期。
+    fn expire(&mut self) {
+        self.entries
+            .retain(|(_, used)| used.elapsed() < PROCESS_SNAPSHOT_IDLE);
+    }
+
+    /// 获取固定查询快照，拒绝过期标识或中途变更查询条件。
+    fn get(&mut self, id: &str, query_key: &str) -> ApiResult<Arc<ProcessListSnapshot>> {
+        self.expire();
+        let (snapshot, used) = self
+            .entries
+            .iter_mut()
+            .find(|(snapshot, _)| snapshot.result.snapshot_id == id)
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::GONE,
+                    ErrorCode::ProcessSnapshotExpired,
+                    "process list snapshot expired",
+                )
+            })?;
+        if snapshot.query_key != query_key {
+            return Err(ApiError::bad_request(
+                ErrorCode::ValidationFailed,
+                "process snapshot query does not match",
+            ));
+        }
+        *used = Instant::now();
+        Ok(Arc::clone(snapshot))
+    }
+
+    /// 在双重预算内缓存结果，淘汰最久未使用的快照。
+    fn insert(&mut self, snapshot: Arc<ProcessListSnapshot>) -> ApiResult<()> {
+        if snapshot.bytes > PROCESS_SNAPSHOT_MAX_BYTES {
+            return Err(ApiError::new(
+                StatusCode::INSUFFICIENT_STORAGE,
+                ErrorCode::ProcessSnapshotLimit,
+                "process list snapshot capacity exceeded",
+            ));
+        }
+        self.expire();
+        while self.entries.len() >= PROCESS_SNAPSHOT_MAX_COUNT
+            || self
+                .entries
+                .iter()
+                .map(|(snapshot, _)| snapshot.bytes)
+                .sum::<usize>()
+                + snapshot.bytes
+                > PROCESS_SNAPSHOT_MAX_BYTES
+        {
+            let oldest = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(index, _)| index)
+                .expect("nonempty snapshot cache exceeds budget");
+            self.entries.remove(oldest);
+        }
+        self.entries.push((snapshot, Instant::now()));
+        Ok(())
+    }
+}
+
+impl ProcessListSnapshot {
+    /// 仅复制请求页的数据，保留固定采样时间与统计信息。
+    fn page(&self, page: usize) -> ProcessListPage {
+        let result = &self.result;
+        let start = page.saturating_sub(1).saturating_mul(result.page_size);
+        ProcessListPage {
+            snapshot_id: result.snapshot_id.clone(),
+            entries: result
+                .entries
+                .iter()
+                .skip(start)
+                .take(result.page_size)
+                .cloned()
+                .collect(),
+            page,
+            page_size: result.page_size,
+            available_total: result.available_total,
+            total: result.total,
+            counts: result.counts.clone(),
+            sampled_at: result.sampled_at.clone(),
+            coverage: result.coverage.clone(),
+        }
+    }
+}
+
 /// 供信号执行阶段重新核验的稳定进程身份。
 #[derive(Debug, Clone)]
 pub struct ProcessIdentity {
@@ -95,6 +201,7 @@ struct PreviousCpuSample {
 /// Agent 进程管理共享运行时。采样成本与浏览器连接数无关。
 pub struct ProcessManagerRuntime {
     process_snapshot: RwLock<Option<ProcessSnapshot>>,
+    process_list_snapshots: Mutex<ProcessListSnapshotCache>,
     network_snapshot: RwLock<Option<NetworkSnapshot>>,
     previous_cpu: RwLock<Option<PreviousCpuSample>>,
     signal_locks: Mutex<HashSet<String>>,
@@ -111,6 +218,7 @@ impl ProcessManagerRuntime {
     pub fn new() -> Self {
         Self {
             process_snapshot: RwLock::new(None),
+            process_list_snapshots: Mutex::new(ProcessListSnapshotCache::default()),
             network_snapshot: RwLock::new(None),
             previous_cpu: RwLock::new(None),
             signal_locks: Mutex::new(HashSet::new()),
@@ -242,13 +350,29 @@ impl ProcessManagerRuntime {
 
     /// 返回经过服务端筛选、排序和分页的进程摘要。
     pub async fn list_processes(&self, query: ProcessListQuery) -> ApiResult<ProcessListPage> {
+        let (page, page_size) = validate_page(query.page, query.page_size)?;
+        let query_key = serde_json::json!([
+            query.query,
+            query.status,
+            query.sort_by.unwrap_or(ProcessSortBy::Pid),
+            query.sort_order.unwrap_or(SortOrder::Asc),
+            page_size,
+        ])
+        .to_string();
+        if let Some(id) = query.snapshot_id.as_deref() {
+            return Ok(self
+                .process_list_snapshots
+                .lock()
+                .await
+                .get(id, &query_key)?
+                .page(page));
+        }
         let snapshot = self
             .process_snapshot
             .read()
             .await
             .clone()
             .ok_or_else(process_sampler_unavailable)?;
-        let (page, page_size) = validate_page(query.page, query.page_size)?;
         let network_counts = self
             .network_snapshot
             .read()
@@ -286,24 +410,37 @@ impl ProcessManagerRuntime {
             query.sort_order.unwrap_or(SortOrder::Asc),
         );
         let total = filtered.len();
-        let start = page.saturating_sub(1).saturating_mul(page_size);
-        let entries = filtered.into_iter().skip(start).take(page_size).collect();
         let mut counts = BTreeMap::new();
         for entry in &available_entries {
             *counts
                 .entry(process_state_key(entry.state).to_string())
                 .or_insert(0) += 1;
         }
-        Ok(ProcessListPage {
-            entries,
-            page,
+        let result = ProcessListPage {
+            snapshot_id: uuid::Uuid::now_v7().to_string(),
+            entries: filtered,
+            page: 1,
             page_size,
             available_total,
             total,
             counts,
             sampled_at: snapshot.sampled_at,
             coverage: snapshot.coverage,
-        })
+        };
+        let bytes = serde_json::to_vec(&result)
+            .map_err(|error| ApiError::internal(error.to_string()))?
+            .len()
+            + result.entries.capacity() * std::mem::size_of::<ProcessSummary>();
+        let snapshot = Arc::new(ProcessListSnapshot {
+            query_key,
+            result,
+            bytes,
+        });
+        self.process_list_snapshots
+            .lock()
+            .await
+            .insert(Arc::clone(&snapshot))?;
+        Ok(snapshot.page(page))
     }
 
     /// 根据不透明 processId 返回最近采样到的稳定身份。
@@ -1555,6 +1692,161 @@ mod tests {
 
     fn proc_network_row(state: &str, inode: &str) -> String {
         format!("0: 0100007F:1F90 00000000:0000 {state} 0 0 0 0 0 {inode}\n")
+    }
+
+    /// 构造可区分排序边界的进程采样数据。
+    fn snapshot_process(pid: u32, metric: f64) -> ProcessSummary {
+        serde_json::from_value(serde_json::json!({
+            "processId": pid.to_string(), "pid": pid, "name": format!("worker-{pid}"),
+            "parentPid": 1, "threadCount": 1, "userName": "root", "state": "running",
+            "cpuPercent": metric, "memoryPercent": metric,
+            "management": { "kind": "custom" },
+            "capabilities": { "canTerminate": true, "canForceKill": true }
+        }))
+        .expect("valid process fixture")
+    }
+
+    /// 用可控指标替换实时采样，模拟采样循环导致的排序跨页变化。
+    async fn replace_test_snapshot(runtime: &ProcessManagerRuntime, first: f64, second: f64) {
+        let entries = vec![snapshot_process(1, first), snapshot_process(2, second)];
+        let coverage = SamplingCoverage {
+            status: SamplingStatus::Complete,
+            scanned_count: 2,
+            succeeded_count: 2,
+            failed_count: 0,
+            owner_coverage_percent: None,
+            warnings: Vec::new(),
+        };
+        *runtime.process_snapshot.write().await = Some(ProcessSnapshot {
+            entries,
+            identities: HashMap::new(),
+            sampled_at: format!("sample-{first}"),
+            coverage: coverage.clone(),
+        });
+        *runtime.network_snapshot.write().await = Some(NetworkSnapshot {
+            entries: Vec::new(),
+            counts_by_process: HashMap::from([
+                ("1".to_string(), first as u64),
+                ("2".to_string(), second as u64),
+            ]),
+            sampled_at: "network-sample".to_string(),
+            coverage,
+        });
+    }
+
+    #[tokio::test]
+    async fn process_pagination_pins_metrics_connections_and_order_across_samples() {
+        for sort_by in [
+            ProcessSortBy::CpuPercent,
+            ProcessSortBy::MemoryPercent,
+            ProcessSortBy::ConnectionCount,
+        ] {
+            let runtime = ProcessManagerRuntime::new();
+            replace_test_snapshot(&runtime, 9.0, 1.0).await;
+            let query = ProcessListQuery {
+                page_size: Some(1),
+                sort_by: Some(sort_by),
+                sort_order: Some(SortOrder::Desc),
+                ..Default::default()
+            };
+            let first = runtime
+                .list_processes(query.clone())
+                .await
+                .expect("first page");
+            assert_eq!(first.entries[0].pid, 1);
+            replace_test_snapshot(&runtime, 1.0, 9.0).await;
+            let second = runtime
+                .list_processes(ProcessListQuery {
+                    snapshot_id: Some(first.snapshot_id.clone()),
+                    page: Some(2),
+                    ..query.clone()
+                })
+                .await
+                .expect("same snapshot second page");
+            assert_eq!(second.entries[0].pid, 2);
+            assert_eq!(second.entries[0].cpu_percent, Some(1.0));
+            assert_eq!(second.entries[0].connection_count, Some(1));
+            assert_eq!(second.snapshot_id, first.snapshot_id);
+            assert_eq!(second.sampled_at, first.sampled_at);
+            assert_eq!(second.total, 2);
+            let fresh = runtime.list_processes(query).await.expect("fresh snapshot");
+            assert_ne!(fresh.snapshot_id, first.snapshot_id);
+            assert_eq!(fresh.entries[0].pid, 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn process_snapshot_rejects_changed_query_and_expired_ids() {
+        let runtime = ProcessManagerRuntime::new();
+        replace_test_snapshot(&runtime, 9.0, 1.0).await;
+        let first = runtime
+            .list_processes(ProcessListQuery::default())
+            .await
+            .expect("snapshot");
+        assert!(
+            runtime
+                .list_processes(ProcessListQuery {
+                    snapshot_id: Some(first.snapshot_id.clone()),
+                    sort_order: Some(SortOrder::Desc),
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            runtime
+                .list_processes(ProcessListQuery {
+                    snapshot_id: Some(first.snapshot_id.clone()),
+                    page_size: Some(1),
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+        runtime.process_list_snapshots.lock().await.entries[0].1 =
+            Instant::now() - PROCESS_SNAPSHOT_IDLE - Duration::from_secs(1);
+        let error = runtime
+            .list_processes(ProcessListQuery {
+                snapshot_id: Some(first.snapshot_id),
+                ..Default::default()
+            })
+            .await
+            .expect_err("expired snapshot must not switch to live sample");
+        assert_eq!(error.code, ErrorCode::ProcessSnapshotExpired);
+    }
+
+    #[tokio::test]
+    async fn process_snapshot_cache_enforces_count_and_memory_budgets() {
+        let runtime = ProcessManagerRuntime::new();
+        replace_test_snapshot(&runtime, 9.0, 1.0).await;
+        let first = runtime
+            .list_processes(ProcessListQuery::default())
+            .await
+            .expect("snapshot");
+        for _ in 0..PROCESS_SNAPSHOT_MAX_COUNT {
+            runtime
+                .list_processes(ProcessListQuery::default())
+                .await
+                .expect("within cache limit");
+        }
+        let mut cache = runtime.process_list_snapshots.lock().await;
+        assert_eq!(cache.entries.len(), PROCESS_SNAPSHOT_MAX_COUNT);
+        assert!(cache.get(&first.snapshot_id, "").is_err());
+        let oversized = Arc::new(ProcessListSnapshot {
+            query_key: String::new(),
+            result: first.clone(),
+            bytes: PROCESS_SNAPSHOT_MAX_BYTES + 1,
+        });
+        assert!(cache.insert(oversized).is_err());
+        let full = Arc::new(ProcessListSnapshot {
+            query_key: String::new(),
+            result: first,
+            bytes: PROCESS_SNAPSHOT_MAX_BYTES,
+        });
+        cache
+            .insert(full)
+            .expect("evict old snapshots to satisfy byte budget");
+        assert_eq!(cache.entries.len(), 1);
     }
 
     #[test]

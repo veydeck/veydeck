@@ -287,6 +287,8 @@ const en = {
       PROCESS_CONFIRMATION_INVALID: 'The force-kill confirmation expired or is invalid.',
       PROCESS_SIGNAL_UNAVAILABLE: 'Safe process signaling is unavailable on this kernel.',
       PROCESS_SAMPLER_UNAVAILABLE: 'Process sampling is temporarily unavailable.',
+      PROCESS_SNAPSHOT_EXPIRED: 'The process list snapshot expired. Reloading.',
+      PROCESS_SNAPSHOT_LIMIT: 'The process list snapshot exceeds cache capacity. Narrow the query.',
       NETWORK_SAMPLER_UNAVAILABLE: 'Network connection sampling is temporarily unavailable.',
     },
     upgrades: {

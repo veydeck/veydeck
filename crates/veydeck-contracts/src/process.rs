@@ -97,6 +97,8 @@ pub struct ProcessSummary {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessListQuery {
+    /// 后续分页沿用首次查询返回的不可变快照。
+    pub snapshot_id: Option<String>,
     pub query: Option<String>,
     pub status: Option<ProcessState>,
     pub page: Option<usize>,
@@ -125,11 +127,12 @@ pub enum SortOrder {
     Desc,
 }
 
-/// 进程分页响应。
+/// 进程分页响应；快照标识固定筛选、排序和连接数。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "process/")]
 pub struct ProcessListPage {
+    pub snapshot_id: String,
     #[ts(inline)]
     pub entries: Vec<ProcessSummary>,
     pub page: usize,
