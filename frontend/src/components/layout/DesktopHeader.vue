@@ -481,6 +481,8 @@ function isLibraryGlassActive(id: AppId) {
   border-width: 0 0 1px;
   border-color: var(--vdl-glass-border);
   border-radius: 0;
+  /* 顶栏不使用浮动面板阴影，避免阴影覆盖下方应用区域。 */
+  box-shadow: none;
   color: var(--vdl-text-primary);
   padding: 0 var(--vdl-space-3);
   display: flex;

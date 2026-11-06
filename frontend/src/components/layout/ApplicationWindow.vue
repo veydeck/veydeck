@@ -589,8 +589,6 @@ onUnmounted(() => {
 .window-content {
   position: relative;
   z-index: 1;
-  /* 建立独立背景采样边界，避免窗口内的玻璃控件采样桌面图标的悬停边框。 */
-  clip-path: inset(0);
   flex-grow: 1;
   overflow: auto; /* 允许应用内容滚动 */
   /* 确保应用组件可以撑满内容区 */
