@@ -1,4 +1,4 @@
-/* 节点管理视图：展示节点列表，支持新增/编辑节点并进行预检与部署。 */
+<!-- 节点管理视图：卡片摘要、独立详情及节点生命周期操作。 -->
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -13,7 +13,7 @@ import {
 } from '@/api/modules/nodes'
 import { useNodeStore, type NodeStatus, type NodeSummary } from '@/stores/node'
 import { useWindowManagerStore } from '@/stores/window-manager'
-import VeyTable, { type VeyTableColumn } from '@/components/ui/VeyTable.vue'
+import NodeContextMenu from './node-manager/NodeContextMenu.vue'
 import {
   VeyButton,
   VeyCard,
@@ -23,8 +23,8 @@ import {
   VeyAlert,
   VeyFormItem,
   VeyDescriptions,
-  VeyActionMenu,
   VeyCheckbox,
+  VeyLoading,
 } from '@/components/ui'
 import { useToastStore } from '@/stores/toast'
 import { formatDateTime } from '@/utils/time'
@@ -51,13 +51,6 @@ const { confirmationState, showConfirmation, handleConfirmationResponse } =
 
 const nodes = computed(() => nodeStore.nodes)
 const currentNodeId = computed(() => nodeStore.currentNodeId)
-const selectedNodeId = computed({
-  get: () => nodeStore.currentNodeId,
-  set: (value) => {
-    if (value === null) return
-    void switchCurrentNode(String(value))
-  },
-})
 const activeView = ref<'list' | NodeProvisionPhase>('list')
 const isEditActive = ref(false)
 const editTarget = ref<NodeSummary | null>(null)
@@ -161,17 +154,6 @@ const nodeDisplayName = (node: NodeSummary) => {
   return node.name
 }
 
-const nodeOptions = computed(() =>
-  nodes.value.map((node) => {
-    const isAbnormal = node.status !== 'online'
-    return {
-      value: node.id,
-      label: nodeDisplayName(node),
-      disabled: isAbnormal,
-    }
-  }),
-)
-
 const statusLabel = (status: NodeStatus) => {
   switch (status) {
     case 'draft':
@@ -205,22 +187,9 @@ const statusTagType = (status: NodeStatus): 'success' | 'danger' | 'warning' | '
   return 'info'
 }
 
-const runtimeTagType = (status?: string): 'success' | 'warning' | 'info' => {
-  const normalized = (status ?? '').toLowerCase()
-  if (normalized === 'active') return 'success'
-  if (!normalized) return 'info'
-  return 'warning'
-}
-
-const healthTagType = (status?: string): 'success' | 'danger' | 'info' => {
-  const normalized = (status ?? '').toLowerCase()
-  if (normalized === 'online') return 'success'
-  if (!normalized) return 'info'
-  return 'danger'
-}
-
 const formatBytes = (bytes?: number) => {
-  if (!bytes || bytes <= 0) return '0 B'
+  if (bytes === undefined || !Number.isFinite(bytes)) return '--'
+  if (bytes <= 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
   const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
   const value = bytes / Math.pow(1024, index)
@@ -228,11 +197,12 @@ const formatBytes = (bytes?: number) => {
 }
 
 const formatPercent = (value?: number) => {
-  if (value === undefined || Number.isNaN(value)) return '--'
+  if (value === undefined || !Number.isFinite(value)) return '--'
   return `${value.toFixed(1)}%`
 }
 
 const resourceLabel = (node: NodeSummary) => {
+  if (!['online', 'degraded'].includes(node.status)) return '--'
   const resource = node.metadata?.resource as Record<string, unknown> | undefined
   if (!resource) return 'CPU -- · MEM --'
   const cpu = resource.cpuPercent as number | undefined
@@ -275,41 +245,80 @@ const checkStatusLabel = computed(() => {
   return t('app.nodes.check.statusUnknown')
 })
 
-/** 节点基础详情定义 */
-const nodeBaseDetailItems = computed(() => [
-  { label: t('app.nodes.detail.lifecycleStatus'), slot: 'lifecycle' },
-  { label: t('app.nodes.detail.runtimeStatus'), slot: 'runtime' },
-  { label: t('app.nodes.detail.healthStatus'), slot: 'health' },
-  { label: t('app.nodes.detail.lastSeenAt'), slot: 'lastSeen' },
-  { label: t('app.nodes.detail.group'), slot: 'group' },
-])
+/** 详情概览只显示有实际意义的版本、分组与最近在线时间。 */
+const detailVersion = computed(() => {
+  const resource = detailNode.value?.metadata?.resource as Record<string, unknown> | undefined
+  const version = selectedNodeDetail.value?.node.metadata?.resource?.version ?? resource?.version
+  return typeof version === 'string' && version ? version : t('app.nodes.status.unknown')
+})
+const detailGroup = computed(() => {
+  const group = selectedNodeDetail.value?.node.groupName || detailNode.value?.groupId
+  return group && group !== 'default' ? group : ''
+})
+const detailLastSeen = computed(() => {
+  if (!detailNode.value || detailNode.value.status === 'online') return ''
+  const lastSeen = selectedNodeDetail.value?.node.lastSeenAt || detailNode.value.lastSeenAt
+  return lastSeen ? formatDateTime(lastSeen) : ''
+})
+const deploymentFailed = computed(() => Boolean(
+  selectedNodeDetail.value?.provisioning?.lastDeployResultStatus === 'failed'
+  || selectedNodeDetail.value?.provisioning?.lastDeployErrorSummary
+  || detailNode.value?.status === 'deploy_failed',
+))
 
-/** 节点部署详情定义 */
+/** 将服务端枚举映射为面向用户的文案，未知状态不着色。 */
+const detailValueLabel = (kind: 'runtime' | 'method', value?: string) => {
+  const values = kind === 'runtime'
+    ? ['active', 'expired', 'closed', 'revoked', 'superseded']
+    : ['ssh_push', 'ssh_upgrade', 'ssh_repair', 'inventory_create', 'inventory_update']
+  return value && values.includes(value)
+    ? t(`app.nodes.detail.${kind}.${value}`)
+    : t('app.nodes.status.unknown')
+}
+
+/** 部署信息使用单列键值展示，不重复输出内部部署任务状态。 */
 const nodeDeployDetailItems = computed(() => {
-  const base = [
-    { label: t('app.nodes.detail.deployMethod'), slot: 'deployMethod' },
-    { label: t('app.nodes.detail.deployStatus'), slot: 'deployStatus' },
-    { label: t('app.nodes.detail.sshTarget'), slot: 'sshTarget' },
-    { label: t('app.nodes.detail.installDir'), slot: 'installDir' },
-    { label: t('app.nodes.detail.deployAt'), slot: 'deployAt' },
+  const provisioning = selectedNodeDetail.value?.provisioning
+  if (!provisioning) return []
+  const address = provisioning.sshAddr
+  const sshTarget = address
+    ? `${address.includes(':') && !address.startsWith('[') ? `[${address}]` : address}:${provisioning.sshPort ?? 22}`
+    : t('app.nodes.status.unknown')
+  return [
+    { label: t('app.nodes.detail.deployMethod'), value: detailValueLabel('method', provisioning.deployMethod) },
+    { label: t('app.nodes.detail.sshTarget'), value: sshTarget },
+    { label: t('app.nodes.detail.installDir'), value: provisioning.installDir || t('app.nodes.status.unknown') },
+    { label: t('app.nodes.detail.deployAt'), value: formatDateTime(provisioning.lastDeployAt) },
   ]
-  if (selectedNodeDetail.value?.provisioning?.lastDeployErrorSummary) {
-    base.push({ label: t('app.nodes.detail.deployError'), slot: 'deployError' })
-  }
-  return base
 })
 
-/** 节点会话详情定义 */
-const nodeSessionDetailItems = computed(() => [
-  { label: t('app.nodes.detail.sessionId'), slot: 'sessionId' },
-  { label: t('app.nodes.detail.registeredAt'), slot: 'registeredAt' },
-  { label: t('app.nodes.detail.lastHeartbeatAt'), slot: 'lastHeartbeatAt' },
-  { label: t('app.nodes.detail.leaseExpiresAt'), slot: 'leaseExpiresAt' },
-  { label: t('app.nodes.detail.agentVersion'), slot: 'agentVersion' },
-])
+/** 内部生命周期及完整会话信息仅放在可展开的连接诊断中。 */
+const nodeDiagnosticItems = computed(() => {
+  const node = selectedNodeDetail.value?.node
+  const session = selectedNodeDetail.value?.session
+  const items = [
+    { label: t('app.nodes.detail.lifecycleStatus'), value: statusLabel((node?.lifecycleStatus || detailNode.value?.lifecycleStatus) as NodeStatus) },
+    { label: t('app.nodes.detail.runtimeStatus'), value: detailValueLabel('runtime', node?.runtimeStatus) },
+    { label: t('app.nodes.detail.healthStatus'), value: statusLabel(node?.healthStatus as NodeStatus) },
+  ]
+  if (session) items.push(
+    { label: t('app.nodes.detail.sessionId'), value: session.sessionId },
+    { label: t('app.nodes.detail.registeredAt'), value: formatDateTime(session.registeredAt) },
+    { label: t('app.nodes.detail.lastHeartbeatAt'), value: formatDateTime(session.lastHeartbeatAt) },
+    { label: t('app.nodes.detail.leaseExpiresAt'), value: formatDateTime(session.leaseExpiresAt) },
+  )
+  return items
+})
 
 /** 批量升级选中的节点 ID 列表 */
 const selectedNodeIds = ref<string[]>([])
+const selectionMode = ref(false)
+
+/** 退出批量选择时清理勾选。 */
+const exitSelection = () => {
+  selectionMode.value = false
+  selectedNodeIds.value = []
+}
 
 /** 是否展示精细化升级引导 */
 const showUpgradeGuide = ref(!!props.payload?.highlightUpgrade)
@@ -349,6 +358,7 @@ const handleSelectAll = (val: boolean) => {
 /** 单选/取消单选 */
 const handleSelectChange = (nodeId: string, val: boolean) => {
   if (val) {
+    if (!nodes.value.some((node) => node.id === nodeId && isNodeUpgradable(node))) return
     if (!selectedNodeIds.value.includes(nodeId)) {
       selectedNodeIds.value.push(nodeId)
     }
@@ -357,67 +367,91 @@ const handleSelectChange = (nodeId: string, val: boolean) => {
   }
 }
 
-/** 本地节点表格列定义 */
-const columns = computed<VeyTableColumn[]>(() => [
-  { label: '', slot: 'selection', headerSlot: 'selectionHeader', width: 50, align: 'center' },
-  { label: t('app.nodes.columns.name'), minWidth: 180, slot: 'name', align: 'center' },
-  { prop: 'address', label: t('app.nodes.columns.address'), minWidth: 180, align: 'center' },
-  { label: t('app.nodes.columns.status'), minWidth: 120, slot: 'status', align: 'center' },
-  { label: t('app.nodes.columns.resources'), minWidth: 240, slot: 'resource', align: 'center' },
-  { label: t('app.nodes.columns.tags'), minWidth: 180, slot: 'tags', align: 'center' },
-  {
-    label: t('app.nodes.columns.actions'),
-    width: 140,
-    fixed: 'right',
-    slot: 'actions',
-    align: 'center',
-  },
-])
-
 const closeCheckDrawer = () => {
   isCheckDrawerVisible.value = false
 }
 
-const selectedRemoteNodeId = computed(() => {
-  const value = selectedNodeId.value
-  if (!value || value === 'local') return null
-  return value
-})
+const detailNodeId = ref<string | null>(null)
+const detailNode = computed(() => nodes.value.find((node) => node.id === detailNodeId.value))
+const selectedNodeName = computed(() => detailNode.value ? nodeDisplayName(detailNode.value) : '')
+const detailError = ref(false)
+let detailRequest = 0
+let loadingDetailId: string | null = null
 
-const selectedNodeName = computed(() => {
-  const nodeId = selectedRemoteNodeId.value
-  if (!nodeId) return ''
-  const found = nodeStore.nodes.find((n) => n.id === nodeId)
-  return found ? nodeDisplayName(found) : nodeId
-})
+/** 关闭详情时使在途请求失效，避免旧响应覆盖后续选择。 */
+const closeNodeDetail = () => {
+  detailRequest += 1
+  loadingDetailId = null
+  detailNodeId.value = null
+  selectedNodeDetail.value = null
+  nodeDetailLoading.value = false
+  detailError.value = false
+}
 
-const loadingNodeId = ref<string | null>(null)
-
+/** 仅为当前打开的外部节点请求详情。 */
 const loadSelectedNodeDetail = async (silent = false) => {
-  const nodeId = selectedRemoteNodeId.value
-  if (!nodeId) {
-    selectedNodeDetail.value = null
-    return
-  }
-  if (loadingNodeId.value === nodeId) return
-  loadingNodeId.value = nodeId
-  if (!silent) {
-    nodeDetailLoading.value = true
-  }
+  const nodeId = detailNodeId.value
+  if (!nodeId || nodeId === 'local' || loadingDetailId === nodeId) return
+  const request = ++detailRequest
+  loadingDetailId = nodeId
+  if (!silent) nodeDetailLoading.value = true
   try {
     const res = await nodesApi.detail(nodeId)
-    if (selectedRemoteNodeId.value === nodeId) {
-      selectedNodeDetail.value = res.success && res.data ? res.data : null
-    }
+    if (request !== detailRequest || detailNodeId.value !== nodeId) return
+    selectedNodeDetail.value = res.success && res.data ? res.data : null
+    detailError.value = !selectedNodeDetail.value
   } catch {
-    if (selectedRemoteNodeId.value === nodeId) {
-      selectedNodeDetail.value = null
-    }
+    if (request === detailRequest) detailError.value = true
   } finally {
-    if (loadingNodeId.value === nodeId) {
-      loadingNodeId.value = null
+    if (request === detailRequest) {
+      loadingDetailId = null
       nodeDetailLoading.value = false
     }
+  }
+}
+
+/** 普通模式查看详情，选择模式仅切换升级勾选。 */
+const activateCard = (node: NodeSummary) => {
+  menu.value = null
+  if (selectionMode.value) {
+    if (isNodeUpgradable(node)) handleSelectChange(node.id, !selectedNodeIds.value.includes(node.id))
+    return
+  }
+  closeNodeDetail()
+  detailNodeId.value = node.id
+  void loadSelectedNodeDetail()
+}
+
+const menu = ref<{ nodeId: string; x: number; y: number } | null>(null)
+const menuNode = computed(() => nodes.value.find((node) => node.id === menu.value?.nodeId))
+const menuActions = computed(() => {
+  const node = menuNode.value
+  if (!node) return []
+  return [{
+    label: node.id === currentNodeId.value ? t('app.nodes.current') : t('app.nodes.switchToNode'),
+    disabled: node.id === currentNodeId.value || node.status !== 'online',
+    handler: () => switchCurrentNode(node.id),
+  }, ...(node.id === 'local' ? [] : getNodeActions(node))]
+})
+
+/** 右键与键盘菜单入口共享目标，不触发卡片查看或勾选。 */
+const openNodeMenu = (event: MouseEvent | KeyboardEvent, node: NodeSummary) => {
+  event.preventDefault()
+  event.stopPropagation()
+  const card = event.currentTarget as HTMLElement
+  card.focus()
+  const rect = card.getBoundingClientRect()
+  menu.value = { nodeId: node.id, x: 'clientX' in event ? event.clientX : rect.left + 16,
+    y: 'clientY' in event ? event.clientY : rect.top + 32 }
+}
+
+/** 使用键盘查看卡片或打开其上下文菜单。 */
+const handleCardKeydown = (event: KeyboardEvent, node: NodeSummary) => {
+  if (event.target !== event.currentTarget) return
+  if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) openNodeMenu(event, node)
+  else if (event.key === 'Enter' || event.key === ' ') {
+    event.preventDefault()
+    activateCard(node)
   }
 }
 
@@ -1065,20 +1099,23 @@ watch(
   { immediate: true },
 )
 
-watch(selectedRemoteNodeId, () => {
-  void loadSelectedNodeDetail()
+watch(activeView, () => {
+  menu.value = null
+  closeNodeDetail()
+  exitSelection()
 })
 
-watch(
-  () => nodeStore.nodes,
-  () => {
-    void loadSelectedNodeDetail(true)
-  },
-)
+watch(() => nodeStore.nodes, () => {
+  selectedNodeIds.value = selectedNodeIds.value.filter((id) => nodes.value.some((node) => node.id === id && isNodeUpgradable(node)))
+  if (menu.value && !menuNode.value) menu.value = null
+  if (detailNodeId.value && !detailNode.value) closeNodeDetail()
+  else void loadSelectedNodeDetail(true)
+}, { deep: true })
 
 onUnmounted(() => {
   nodeStore.startAutoRefresh(10000)
   stopPollingProgress()
+  closeNodeDetail()
 })
 
 const isUpgradeDialogOpen = ref(false)
@@ -1102,6 +1139,7 @@ const getNodeNameById = (id: string) => {
 }
 
 const openUpgradeDialog = async () => {
+  if (selectedNodeIds.value.length === 0) return
   upgradeForm.targetVersion = ''
   upgradeForm.overwriteSameVersion = false
   isUpgradeDialogOpen.value = true
@@ -1117,7 +1155,7 @@ const openUpgradeDialog = async () => {
 }
 
 const submitUpgradePlan = async () => {
-  if (!upgradeForm.targetVersion) return
+  if (!upgradeForm.targetVersion || selectedNodeIds.value.length === 0) return
   upgradeSubmitting.value = true
   try {
     const payload = {
@@ -1136,7 +1174,7 @@ const submitUpgradePlan = async () => {
       return
     }
 
-    selectedNodeIds.value = []
+    exitSelection()
     isUpgradeDialogOpen.value = false
 
     // 缓存升级状态并跳转
@@ -1219,136 +1257,85 @@ onMounted(() => {
               deployFinished ? t('app.nodes.deploy.viewResult') : t('app.nodes.deploy.viewProgress')
             }}
           </VeyButton>
-          <VeyButton
-            type="primary"
-            :class="{ 'upgrade-btn-highlight': showUpgradeGuide }"
-            :disabled="selectedNodeIds.length === 0"
-            data-ui="node-upgrade-selected"
-            @click="openUpgradeDialog"
-          >
-            {{ t('app.nodes.upgradeSelected') }}
-            {{ selectedNodeIds.length > 0 ? `(${selectedNodeIds.length})` : '' }}
+          <VeyButton v-if="!selectionMode" type="secondary" :class="{ 'upgrade-btn-highlight': showUpgradeGuide }" data-ui="node-select-mode" @click="selectionMode = true">
+            {{ t('app.nodes.batchUpgrade') }}
           </VeyButton>
+          <template v-else>
+            <VeyCheckbox :model-value="isAllSelected" :disabled="nodes.filter(isNodeUpgradable).length === 0" data-ui="node-select-all" @change="handleSelectAll">{{ t('app.nodes.selectAll') }}</VeyCheckbox>
+            <VeyButton type="primary" :disabled="selectedNodeIds.length === 0" data-ui="node-upgrade-selected" @click="openUpgradeDialog">
+              {{ t('app.nodes.upgradeSelected') }} ({{ selectedNodeIds.length }})
+            </VeyButton>
+            <VeyButton type="secondary" data-ui="node-exit-selection" @click="exitSelection">{{ t('app.nodes.exitSelection') }}</VeyButton>
+          </template>
         </div>
 
         <div class="toolbar-right">
-          <VeySelect
-            v-model="selectedNodeId"
-            class="agent-select"
-            :options="nodeOptions"
-            :placeholder="t('desktop.header.nodePlaceholder')"
-          />
-
-          <VeySelect v-model="refreshInterval" class="refresh-select" :options="refreshOptions" />
+          <VeySelect v-model="refreshInterval" class="refresh-select" style="width: 150px" :options="refreshOptions" />
 
           <VeyButton @click="fetchNodes">{{ t('app.nodes.refresh.manual') }}</VeyButton>
         </div>
       </div>
     </VeyCard>
 
-    <VeyCard
-      v-if="activeView === 'list' && selectedRemoteNodeId"
-      shadow="never"
-      class="detail-card"
-      data-slot="detail"
+    <ApplicationDialog
+      :visible="detailNodeId !== null"
+      :title="`${t('app.nodes.detail.title')} · ${selectedNodeName}`"
+      width="640px"
+      data-ui="node-detail-dialog"
+      @close="closeNodeDetail"
     >
-      <template #header>
-        <div class="drawer-list-header">
-          <span>{{ t('app.nodes.detail.title') }}</span>
-          <VeyTag :type="selectedNodeDetail?.node?.status === 'online' ? 'success' : 'warning'">
-            {{ selectedNodeName }}
-          </VeyTag>
+      <div :key="detailNodeId || 'closed'" class="detail-body node-detail" data-slot="detail">
+        <div v-if="detailNode" class="node-overview" data-ui="node-detail-overview">
+          <div class="node-overview-line">
+            <VeyTag :type="statusTagType(detailNode.status)">{{ statusLabel(detailNode.status) }}</VeyTag>
+            <span class="node-overview-address">{{ detailNode.address || '--' }}</span>
+            <span>{{ t('app.nodes.detail.agentVersion') }} {{ detailVersion }}</span>
+          </div>
+          <div v-if="detailNode.status === 'online' || detailNode.status === 'degraded'" class="node-overview-resource">
+            {{ resourceLabel(detailNode) }}
+          </div>
+          <div v-if="detailLastSeen">{{ t('app.nodes.detail.lastSeenAt') }}: {{ detailLastSeen }}</div>
+          <div v-if="detailGroup || detailNode.tags.length" class="node-overview-line">
+            <span v-if="detailGroup">{{ t('app.nodes.detail.group') }}: {{ detailGroup }}</span>
+            <VeyTag v-for="tag in detailNode.tags" :key="tag">{{ tag }}</VeyTag>
+          </div>
+          <p v-if="detailNode.description">{{ detailNode.description }}</p>
         </div>
-      </template>
-
-      <div class="detail-body">
+        <VeyAlert v-if="detailError" type="error" :title="t('app.nodes.detailLoadFailed')" />
+        <VeyButton v-if="detailError" type="secondary" @click="loadSelectedNodeDetail()">{{ t('common.retry') }}</VeyButton>
         <VeyAlert
           v-if="selectedNodeDetail?.node?.lifecycleStatus === 'conflict'"
           :title="t('app.nodes.detail.conflict')"
           type="error"
           show-icon
         />
-
-        <div class="detail-grid">
-          <VeyDescriptions
-            :items="nodeBaseDetailItems"
-            :data="selectedNodeDetail?.node as any"
-            border
-          >
-            <template #lifecycle="{ data }: { data: any }">
-              <VeyTag type="info">{{ data?.lifecycleStatus ?? '--' }}</VeyTag>
-            </template>
-            <template #runtime="{ data }: { data: any }">
-              <VeyTag :type="runtimeTagType(data?.runtimeStatus)">
-                {{ data?.runtimeStatus ?? '--' }}
-              </VeyTag>
-            </template>
-            <template #health="{ data }: { data: any }">
-              <VeyTag :type="healthTagType(data?.healthStatus)">
-                {{ data?.healthStatus ?? '--' }}
-              </VeyTag>
-            </template>
-            <template #lastSeen="{ data }: { data: any }">
-              {{ formatDateTime(data?.lastSeenAt) }}
-            </template>
-            <template #group="{ data }: { data: any }">
-              {{ data?.groupName ?? '--' }}
-            </template>
-          </VeyDescriptions>
-
-          <VeyDescriptions
-            :items="nodeDeployDetailItems"
-            :data="selectedNodeDetail?.provisioning as any"
-            border
-          >
-            <template #deployMethod="{ data }: { data: any }">
-              {{ data?.deployMethod ?? '--' }}
-            </template>
-            <template #deployStatus="{ data }: { data: any }">
-              <VeyTag :type="data?.lastDeployResultStatus === 'failed' ? 'danger' : 'success'">
-                {{ data?.lastDeployResultStatus ?? '--' }}
-              </VeyTag>
-            </template>
-            <template #sshTarget="{ data }: { data: any }">
-              {{ data?.sshAddr ? `${data.sshAddr}:${data.sshPort ?? 22}` : '--' }}
-            </template>
-            <template #installDir="{ data }: { data: any }">
-              {{ data?.installDir ?? '--' }}
-            </template>
-            <template #deployAt="{ data }: { data: any }">
-              {{ formatDateTime(data?.lastDeployAt) }}
-            </template>
-            <template #deployError="{ data }: { data: any }">
-              {{ data?.lastDeployErrorSummary }}
-            </template>
-          </VeyDescriptions>
-
-          <VeyDescriptions
-            :items="nodeSessionDetailItems"
-            :data="selectedNodeDetail?.session as any"
-            border
-          >
-            <template #sessionId="{ data }: { data: any }">
-              {{ data?.sessionId ? data.sessionId.split('-')[0] : '--' }}
-            </template>
-            <template #registeredAt="{ data }: { data: any }">
-              {{ formatDateTime(data?.registeredAt) }}
-            </template>
-            <template #lastHeartbeatAt="{ data }: { data: any }">
-              {{ formatDateTime(data?.lastHeartbeatAt) }}
-            </template>
-            <template #leaseExpiresAt="{ data }: { data: any }">
-              {{ formatDateTime(data?.leaseExpiresAt) }}
-            </template>
-            <template #agentVersion>
-              {{ selectedNodeDetail?.node?.metadata?.resource?.version || '--' }}
-            </template>
-          </VeyDescriptions>
-        </div>
+        <details
+          v-if="selectedNodeDetail?.provisioning"
+          :open="deploymentFailed"
+          class="node-detail-section"
+          data-ui="node-deployment-details"
+        >
+          <summary>{{ t('app.nodes.detail.deployment') }}</summary>
+          <div class="node-detail-section-body">
+            <VeyAlert
+              v-if="deploymentFailed"
+              type="error"
+              :title="selectedNodeDetail.provisioning.lastDeployErrorSummary || t('app.nodes.status.deployFailed')"
+              show-icon
+              data-ui="node-deployment-error"
+            />
+            <VeyDescriptions :items="nodeDeployDetailItems" :column="1" :glass="false" />
+          </div>
+        </details>
+        <details v-if="selectedNodeDetail" class="node-detail-section" data-ui="node-connection-diagnostics">
+          <summary>{{ t('app.nodes.detail.diagnostics') }}</summary>
+          <div class="node-detail-section-body">
+            <VeyDescriptions :items="nodeDiagnosticItems" :column="1" :glass="false" />
+          </div>
+        </details>
+        <VeyLoading :loading="nodeDetailLoading" cover />
       </div>
-      <!-- 节点加载遮罩：仅覆盖详情卡片，不遮挡右上角切换下拉框和窗口 Header 强关按钮 -->
-      <VeyLoading :loading="nodeDetailLoading" cover />
-    </VeyCard>
+    </ApplicationDialog>
 
     <ApplicationDialog
       :visible="isEditActive"
@@ -1491,73 +1478,33 @@ onMounted(() => {
       </template>
     </ApplicationDialog>
 
-    <VeyCard v-if="activeView === 'list'" shadow="never" class="table-card">
-      <VeyTable :data="nodes" :columns="columns" border class="nodes-table" data-ui="table">
-        <!-- 这里只需处理具有 slot 的列 -->
-        <template #selectionHeader>
-          <VeyCheckbox
-            :model-value="isAllSelected"
-            :disabled="nodes.filter(isNodeUpgradable).length === 0"
-            @change="handleSelectAll"
-          />
-        </template>
-
-        <template #selection="{ row: node }: { row: any }">
-          <VeyCheckbox
-            :model-value="selectedNodeIds.includes(node.id)"
-            :disabled="!isNodeUpgradable(node)"
-            @change="(val) => handleSelectChange(node.id, val)"
-          />
-        </template>
-
-        <template #name="{ row: node }: { row: any }">
-          <div class="name-cell">
-            <span>{{ nodeDisplayName(node) }}</span>
-            <VeyTag v-if="node.id === currentNodeId" type="primary">
-              {{ t('app.nodes.current') }}
-            </VeyTag>
+    <div v-if="activeView === 'list'" class="node-grid-scroll" data-ui="node-grid">
+      <div class="node-grid">
+        <VeyCard v-for="node in nodes" :key="node.id" shadow="never" :glass="false"
+          :content-style="{ background: 'transparent' }"
+          :style="{ backgroundColor: node.id === currentNodeId ? 'color-mix(in srgb, var(--vdl-primary) 5%, var(--vdl-bg-panel))' : 'var(--vdl-bg-panel)' }"
+          class="node-card" :class="{ 'is-current': node.id === currentNodeId, 'is-selected': selectedNodeIds.includes(node.id) }"
+          role="button" tabindex="0" :aria-label="`${nodeDisplayName(node)} · ${statusLabel(node.status)}${node.id === currentNodeId ? ` · ${t('app.nodes.current')}` : ''}`"
+          :aria-pressed="selectionMode ? selectedNodeIds.includes(node.id) : undefined"
+          :aria-disabled="selectionMode && !isNodeUpgradable(node) ? true : undefined"
+          data-ui="node-card" :data-node-id="node.id" :data-current="node.id === currentNodeId"
+          @click="activateCard(node)" @keydown="handleCardKeydown($event, node)" @contextmenu="openNodeMenu($event, node)">
+          <div class="node-card-heading">
+            <div v-if="selectionMode" @click.stop @keydown.stop>
+              <VeyCheckbox :model-value="selectedNodeIds.includes(node.id)" :disabled="!isNodeUpgradable(node)" :aria-label="nodeDisplayName(node)" @change="(value) => handleSelectChange(node.id, value)" />
+            </div>
+            <strong class="node-card-name">{{ nodeDisplayName(node) }}</strong>
+            <VeyTag v-if="node.id === currentNodeId" type="primary" data-ui="node-current">{{ t('app.nodes.current') }}</VeyTag>
           </div>
-        </template>
-
-        <template #address="{ row: node }: { row: any }">
-          {{ node.address || '-' }}
-        </template>
-
-        <template #status="{ row: node }: { row: any }">
+          <div class="node-card-address">{{ node.address || '--' }}</div>
           <VeyTag :type="statusTagType(node.status)">{{ statusLabel(node.status) }}</VeyTag>
-        </template>
-
-        <template #resource="{ row: node }: { row: any }">
-          <span class="resource-text">{{ resourceLabel(node) }}</span>
-        </template>
-
-        <template #tags="{ row: node }: { row: any }">
-          <div class="tag-list">
-            <VeyTag v-if="node.tags.length === 0" type="default">
-              {{ t('app.nodes.noTags') }}
-            </VeyTag>
-            <VeyTag v-for="tag in node.tags" :key="tag">{{ tag }}</VeyTag>
-          </div>
-        </template>
-
-        <template #actions="{ row: node }: { row: any }">
-          <VeyActionMenu
-            v-if="node.id !== 'local'"
-            :label="t('app.nodes.actions.menu')"
-            :actions="getNodeActions(node)"
-          />
-          <span v-else class="vl-text-muted">-</span>
-        </template>
-
-        <template #empty>
-          <div class="empty-state">
-            <span>{{ t('app.nodes.messages.empty') }}</span>
-          </div>
-        </template>
-      </VeyTable>
-      <!-- 节点加载遮罩：仅覆盖表格卡片，不遮挡右上角切换下拉框和窗口 Header 强关按钮 -->
-      <VeyLoading :loading="nodeDetailLoading" cover />
-    </VeyCard>
+          <div v-if="node.status === 'online' || node.status === 'degraded'" class="resource-text">{{ resourceLabel(node) }}</div>
+          <div v-else class="resource-text">{{ t('app.nodes.detail.lastSeenAt') }}: {{ formatDateTime(node.lastSeenAt) }}</div>
+        </VeyCard>
+      </div>
+      <div v-if="nodes.length === 0" class="empty-state">{{ t('app.nodes.messages.empty') }}</div>
+    </div>
+    <NodeContextMenu v-if="menu && menuNode" :key="menu.nodeId" :x="menu.x" :y="menu.y" :label="nodeDisplayName(menuNode)" :actions="menuActions" @close="menu = null" />
 
     <ApplicationDialog
       :visible="isCheckDrawerVisible"
@@ -1693,7 +1640,7 @@ onMounted(() => {
         <VeyButton
           type="primary"
           :loading="upgradeSubmitting"
-          :disabled="!upgradeForm.targetVersion"
+          :disabled="!upgradeForm.targetVersion || selectedNodeIds.length === 0"
           @click="submitUpgradePlan"
         >
           {{ t('app.nodes.upgradeDialog.submit') }}
@@ -1717,11 +1664,6 @@ onMounted(() => {
 
 <style scoped>
 /* 确保表格最后一列操作栏下拉菜单能够正常弹出越界显示 */
-:deep(.vl-table-cell:last-child),
-:deep(.vl-table-cell:last-child .vl-cell) {
-  overflow: visible !important;
-}
-
 .node-manager {
   display: flex;
   flex-direction: column;
@@ -1742,42 +1684,107 @@ onMounted(() => {
 .toolbar {
   display: flex;
   justify-content: space-between;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--vdl-space-3);
 }
 
 .toolbar-right {
+  flex: 0 0 auto;
+  max-width: 100%;
   display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  min-width: 0;
   align-items: center;
   gap: var(--vdl-space-2);
 }
 
-.agent-select {
-  width: 180px;
+.refresh-select { width: 150px; }
+.node-grid-scroll { flex: 1; min-height: 0; overflow: auto; }
+.node-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr)); gap: var(--vdl-space-3); align-items: start; }
+.node-card { min-width: 0; cursor: pointer; border: 1px solid var(--vdl-border-default); border-radius: var(--vdl-radius-md); background: var(--vdl-bg-panel); }
+.node-card.is-current { border-color: var(--vdl-border-brand); background: color-mix(in srgb, var(--vdl-primary) 5%, var(--vdl-bg-panel)); }
+.node-card.is-selected { outline: 2px dashed var(--vdl-border-brand); outline-offset: -4px; }
+.node-card:focus-visible { outline: 2px solid var(--vdl-primary); outline-offset: -2px; }
+.node-card-heading { display: flex; align-items: center; gap: var(--vdl-space-2); min-width: 0; margin-bottom: var(--vdl-space-2); }
+.node-card-name { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+.node-card-address { font-family: var(--vdl-font-mono); font-size: var(--vdl-font-body-sm); overflow-wrap: anywhere; margin-bottom: var(--vdl-space-2); }
+.node-card .resource-text { margin-top: var(--vdl-space-3); overflow-wrap: anywhere; }
+.node-detail {
+  container-type: inline-size;
 }
 
-.refresh-select {
-  width: 150px;
-}
-
-.table-card {
-  flex: 1;
-  min-height: 0;
-  position: relative;
-  z-index: 1;
-}
-
-.detail-card {
-  min-height: auto;
-  position: relative;
-  z-index: 1;
-}
-
-.name-cell {
+.node-overview {
   display: flex;
+  flex-direction: column;
+  gap: var(--vdl-space-3);
+  padding-bottom: var(--vdl-space-4);
+  overflow-wrap: anywhere;
+}
+
+.node-overview-line {
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  justify-content: center;
   gap: var(--vdl-space-2);
+}
+
+.node-overview-address {
+  font-family: var(--vdl-font-mono);
+}
+
+.node-overview-resource {
+  color: var(--vdl-text-secondary);
+  font-size: var(--vdl-font-body-sm);
+}
+
+.node-overview p {
+  margin: 0;
+}
+
+.node-detail-section {
+  border-top: 1px solid var(--vdl-border-subtle);
+}
+
+.node-detail-section summary {
+  padding: var(--vdl-space-3) 0;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.node-detail-section summary:focus-visible {
+  outline: 2px solid var(--vdl-border-brand);
+  outline-offset: -2px;
+}
+
+.node-detail-section-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--vdl-space-3);
+  padding-bottom: var(--vdl-space-3);
+}
+
+.node-detail :deep(.vl-descriptions-content) {
+  overflow-wrap: anywhere;
+  word-break: normal;
+  white-space: normal;
+}
+
+@container (max-width: 480px) {
+  .node-detail-section-body :deep(.vl-descriptions-item) {
+    flex-direction: column;
+  }
+
+  .node-detail-section-body :deep(.vl-descriptions-label) {
+    width: auto;
+    padding: var(--vdl-space-2) 0 var(--vdl-space-1);
+    background: transparent;
+  }
+
+  .node-detail-section-body :deep(.vl-descriptions-content) {
+    padding: 0 0 var(--vdl-space-2);
+  }
 }
 
 .resource-text {
@@ -1788,7 +1795,6 @@ onMounted(() => {
 .tag-list {
   display: flex;
   flex-wrap: wrap;
-  justify-content: center;
   gap: var(--vdl-space-1);
 }
 
@@ -1801,12 +1807,6 @@ onMounted(() => {
 .detail-body {
   position: relative;
   min-height: 100px;
-}
-
-.detail-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: var(--vdl-space-4);
 }
 
 .drawer-meta {
@@ -1834,12 +1834,6 @@ onMounted(() => {
   padding: var(--vdl-space-8);
   text-align: center;
   color: var(--vdl-text-muted);
-}
-
-@media (max-width: 1200px) {
-  .detail-grid {
-    grid-template-columns: 1fr;
-  }
 }
 
 .form-section {
@@ -1871,6 +1865,9 @@ onMounted(() => {
 
 .toolbar-left {
   display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  min-width: 0;
   gap: var(--vdl-space-3);
   align-items: center;
 }
