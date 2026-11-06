@@ -1,19 +1,14 @@
 <script setup lang="ts">
 /**
  * @file TerminalView.vue
- * @description 固定节点宿主机 PTY 会话界面，展示服务端确认的访问与会话状态。
+ * @description 终端会话标签工作区，汇总各标签的窗口运行状态。
  */
-
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, ref, shallowReactive, watch } from 'vue'
+import type { ComponentPublicInstance } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { Terminal } from '@xterm/xterm'
-import { FitAddon } from '@xterm/addon-fit'
-import type { TerminalServerMessage } from '@/api/generated'
-import { useTerminalSession, type TerminalSessionState } from '@/composables/useTerminalSession'
-import { useThemeStore, buildTerminalTheme } from '@/stores/theme'
 import { useWindowManagerStore } from '@/stores/window-manager'
-import { VeyAlert, VeyButton, VeyLoading, VeyTag } from '@/components/ui'
-import '@xterm/xterm/css/xterm.css'
+import { VeyButton, VeyTooltip } from '@/components/ui'
+import TerminalSessionPane from './TerminalSessionPane.vue'
 
 const props = defineProps<{
   windowId?: string
@@ -21,503 +16,174 @@ const props = defineProps<{
 }>()
 
 const { t } = useI18n()
-const themeStore = useThemeStore()
 const windowStore = useWindowManagerStore()
-const terminalHost = ref<HTMLDivElement | null>(null)
-const hasTranscript = ref(false)
+const nodeId = typeof props.payload?.nodeId === 'string' && props.payload.nodeId ? props.payload.nodeId : 'local'
+const nodeName = typeof props.payload?.nodeName === 'string' && props.payload.nodeName ? props.payload.nodeName : nodeId
+const tabs = ref([{ id: 1, number: 1, nodeId, nodeName }])
+const activeId = ref(1)
+let nextId = 2
+const panes = shallowReactive<Record<number, InstanceType<typeof TerminalSessionPane>>>({})
+const hasActiveSession = computed(() => tabs.value.some((tab) => panes[tab.id]?.hasActiveSession))
 
-const targetNodeId =
-  typeof props.payload?.nodeId === 'string' && props.payload.nodeId ? props.payload.nodeId : 'local'
-const targetNodeName =
-  typeof props.payload?.nodeName === 'string' && props.payload.nodeName
-    ? props.payload.nodeName
-    : targetNodeId
-
-let xterm: Terminal | null = null
-let fitAddon: FitAddon | null = null
-let resizeObserver: ResizeObserver | null = null
-let resizeFrame: number | null = null
-
-/** 控制事件只更新页面状态，不写入终端转录。 */
-const handleControl = (message: TerminalServerMessage) => {
-  if (message.kind === 'started') {
-    xterm?.focus()
-  }
+/** 登记标签实例，以汇总标签状态。 */
+const registerPane = (id: number, instance: Element | ComponentPublicInstance | null) => {
+  if (instance) panes[id] = instance as InstanceType<typeof TerminalSessionPane>
+  else delete panes[id]
 }
 
-const terminalSession = useTerminalSession(targetNodeId, {
-  onOutput(bytes) {
-    hasTranscript.value = true
-    xterm?.write(bytes)
-  },
-  onControl: handleControl,
-})
-
-const {
-  access,
-  accessState,
-  sessionState,
-  sessionError,
-  exitResult,
-  idleWarningSeconds,
-  canConnect,
-  checkAccess,
-  connect,
-  writeInput,
-  resize,
-  disconnect,
-  cancel,
-} = terminalSession
-
-const activeStates: TerminalSessionState[] = [
-  'connecting',
-  'starting',
-  'active',
-  'idleWarning',
-  'closing',
-]
-const hasActiveSession = computed(() => activeStates.includes(sessionState.value))
-const isConnecting = computed(() => ['connecting', 'starting'].includes(sessionState.value))
-
-const visibleStatus = computed(() => {
-  if (accessState.value === 'checking') return 'checking'
-  if (accessState.value === 'failed') return 'accessFailed'
-  if (accessState.value === 'unavailable') return 'unavailable'
-  return sessionState.value
-})
-
-const statusLabel = computed(() => t(`app.terminal.status.${visibleStatus.value}`))
-const statusType = computed<'default' | 'info' | 'success' | 'warning' | 'danger'>(() => {
-  if (['active'].includes(visibleStatus.value)) return 'success'
-  if (['connecting', 'starting', 'checking', 'closing'].includes(visibleStatus.value)) return 'info'
-  if (['idleWarning', 'unavailable'].includes(visibleStatus.value)) return 'warning'
-  if (['failed', 'accessFailed'].includes(visibleStatus.value)) return 'danger'
-  return 'default'
-})
-
-const sessionErrorText = computed(() =>
-  sessionError.value ? t(`app.terminal.errors.${sessionError.value.code}`) : '',
-)
-const sessionResultText = computed(() => {
-  if (!exitResult.value) return ''
-  return exitResult.value.exitCode === null
-    ? t('app.terminal.sessionEnded')
-    : t('app.terminal.sessionEndedWithCode', { code: exitResult.value.exitCode })
-})
-const inactiveStatusText = computed(
-  () => sessionErrorText.value || sessionResultText.value || statusLabel.value,
-)
-const terminalBackground = computed(
-  () => buildTerminalTheme(themeStore.currentTheme)?.background || 'var(--vdl-bg-canvas)',
-)
-const unavailableText = computed(() => {
-  const code = access.value?.unavailableReason
-  return code ? t(`app.terminal.errors.${code}`) : t('app.terminal.accessUnavailable')
-})
-
-/** 解析 VDL 等宽字体 Token 后交给 Canvas 渲染器。 */
-const resolveMonospaceFont = () => {
-  const token = getComputedStyle(document.documentElement)
-    .getPropertyValue('--vdl-font-mono')
-    .trim()
-  return token || 'monospace'
+/** 新建当前节点的独立会话，并复用最小可用显示序号。 */
+const addSession = () => {
+  const id = nextId++
+  let number = 1
+  while (tabs.value.some((tab) => tab.number === number)) number += 1
+  tabs.value.push({ id, number, nodeId, nodeName })
+  activeId.value = id
 }
 
-/** 合并窗口尺寸变化，并忽略隐藏或零尺寸状态。 */
-const scheduleFit = () => {
-  if (resizeFrame !== null) cancelAnimationFrame(resizeFrame)
-  resizeFrame = requestAnimationFrame(() => {
-    resizeFrame = null
-    const host = terminalHost.value
-    if (!host || host.clientWidth === 0 || host.clientHeight === 0 || !fitAddon) return
-    try {
-      fitAddon.fit()
-    } catch {
-      // 窗口布局切换期间由下一次 ResizeObserver 回调重新计算。
-    }
-  })
+/** 关闭标签并释放会话；最后一个标签关闭后等待用户新建。 */
+const closeSession = (id: number) => {
+  const index = tabs.value.findIndex((tab) => tab.id === id)
+  if (index < 0) return
+  tabs.value.splice(index, 1)
+  if (tabs.value.length > 0 && activeId.value === id) activeId.value = tabs.value[Math.min(index, tabs.value.length - 1)]!.id
 }
 
-/** 清空旧会话并以当前可见网格创建全新 PTY。 */
-const startConnection = async () => {
-  if (!canConnect.value) return
-  xterm?.reset()
-  xterm?.clear()
-  hasTranscript.value = false
+/** 提供标签栏的方向键、Home 与 End 导航。 */
+const navigateTabs = async (event: KeyboardEvent, id: number) => {
+  const index = tabs.value.findIndex((tab) => tab.id === id)
+  let nextIndex: number
+  if (event.key === 'ArrowRight') nextIndex = (index + 1) % tabs.value.length
+  else if (event.key === 'ArrowLeft') nextIndex = (index + tabs.value.length - 1) % tabs.value.length
+  else if (event.key === 'Home') nextIndex = 0
+  else if (event.key === 'End') nextIndex = tabs.value.length - 1
+  else return
+  event.preventDefault()
+  activeId.value = tabs.value[nextIndex]!.id
+  const tablist = (event.currentTarget as HTMLElement).closest('[role="tablist"]')
   await nextTick()
-  scheduleFit()
-  connect(xterm?.cols || 80, xterm?.rows || 24)
+  tablist?.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]')?.focus()
 }
 
-/** 清理当前转录，但不改变会话生命周期。 */
-const clearTranscript = () => {
-  xterm?.clear()
-  hasTranscript.value = false
-}
-
-watch(
-  () => themeStore.currentTheme,
-  (theme) => {
-    if (xterm) xterm.options.theme = buildTerminalTheme(theme)
-  },
-)
-
-watch(
-  hasActiveSession,
-  (active) => {
-    if (!props.windowId) return
-    windowStore.updateWindowRuntimeState(props.windowId, {
-      activeSession: active,
-      allowsNodeSwitch: false,
-      blockLevel: active ? 'active' : 'open',
-      blockReason: active ? t('app.terminal.guardActive') : t('app.terminal.guardOpen'),
-      blockReasonKey: active ? 'app.terminal.guardActive' : 'app.terminal.guardOpen',
-    })
-  },
-  { immediate: true },
-)
-
-onMounted(() => {
-  if (!terminalHost.value) return
-  xterm = new Terminal({
-    cursorBlink: true,
-    disableStdin: true,
-    fontFamily: resolveMonospaceFont(),
-    fontSize: 13,
-    scrollback: 5_000,
-    theme: buildTerminalTheme(themeStore.currentTheme),
+watch(hasActiveSession, (active) => {
+  if (!props.windowId) return
+  windowStore.updateWindowRuntimeState(props.windowId, {
+    activeSession: active,
+    allowsNodeSwitch: false,
+    blockLevel: active ? 'active' : 'open',
+    blockReason: active ? t('app.terminal.guardActive') : t('app.terminal.guardOpen'),
+    blockReasonKey: active ? 'app.terminal.guardActive' : 'app.terminal.guardOpen',
   })
-  fitAddon = new FitAddon()
-  xterm.loadAddon(fitAddon)
-  xterm.open(terminalHost.value)
-  xterm.textarea?.setAttribute(
-    'aria-label',
-    t('app.terminal.terminalLabel', { node: targetNodeName }),
-  )
-  xterm.onData(writeInput)
-  xterm.onResize(({ cols, rows }) => resize(cols, rows))
-  resizeObserver = new ResizeObserver(scheduleFit)
-  resizeObserver.observe(terminalHost.value)
-  scheduleFit()
-  void checkAccess()
-})
-
-watch(sessionState, (state) => {
-  if (xterm) xterm.options.disableStdin = !['active', 'idleWarning'].includes(state)
-})
-
-onBeforeUnmount(() => {
-  resizeObserver?.disconnect()
-  if (resizeFrame !== null) cancelAnimationFrame(resizeFrame)
-  xterm?.dispose()
-  xterm = null
-  fitAddon = null
-})
+}, { immediate: true })
 </script>
 
 <template>
-  <div
-    class="terminal-app"
-    data-page="terminal"
-    data-ui="terminal-workspace"
-    :style="{ '--terminal-background': terminalBackground }"
-  >
-    <div class="terminal-toolbar" data-ui="terminal-toolbar" data-slot="toolbar">
-      <div class="terminal-context" data-slot="target">
-        <span class="context-label">{{ t('app.terminal.targetNode') }}</span>
-        <strong class="context-value">{{ targetNodeName }}</strong>
-        <VeyTag :type="statusType" data-ui="terminal-status">{{ statusLabel }}</VeyTag>
-        <span
-          v-if="idleWarningSeconds !== null"
-          class="context-notice context-notice-warning"
-          data-ui="terminal-idle-warning"
-        >
-          {{ t('app.terminal.idleWarning', { seconds: idleWarningSeconds }) }}
-        </span>
-        <span
-          v-else-if="sessionError?.recoverable && sessionErrorText"
-          class="context-notice context-notice-error"
-          data-ui="terminal-session-error"
-        >
-          {{ sessionErrorText }}
-        </span>
-        <span v-if="sessionResultText" class="session-result" data-slot="session-result">
-          {{ sessionResultText }}
-        </span>
+  <div class="terminal-workspace" data-page="terminal" data-ui="terminal-workspace">
+    <div v-if="tabs.length > 0" class="terminal-tabbar" data-ui="terminal-tabbar" data-slot="tabbar">
+      <div class="terminal-tabs" role="tablist" :aria-label="t('app.terminal.sessionTabs')">
+        <div v-for="tab in tabs" :key="tab.id" class="terminal-tab" :class="{ 'is-active': tab.id === activeId }" data-ui="terminal-tab">
+          <button
+            class="terminal-tab-select"
+            role="tab"
+            :id="`terminal-tab-${windowId || 'standalone'}-${tab.id}`"
+            :aria-controls="`terminal-panel-${windowId || 'standalone'}-${tab.id}`"
+            :aria-selected="tab.id === activeId"
+            :tabindex="tab.id === activeId ? 0 : -1"
+            :title="panes[tab.id]?.statusLabel"
+            @click="activeId = tab.id"
+            @keydown="navigateTabs($event, tab.id)"
+          >
+            <span class="terminal-status-dot" :data-status="panes[tab.id]?.statusType" aria-hidden="true"></span>
+            <span class="terminal-tab-name">{{ tab.nodeName }} · {{ tab.number }}</span>
+            <span class="sr-only" data-ui="terminal-status">{{ panes[tab.id]?.statusLabel }}</span>
+          </button>
+          <button class="terminal-tab-close" :aria-label="t('app.terminal.closeSession', { name: tab.nodeName })" data-ui="terminal-close-tab" @click="closeSession(tab.id)">×</button>
+        </div>
       </div>
-      <div class="terminal-actions" data-slot="actions">
-        <VeyButton size="small" type="secondary" data-ui="terminal-clear" @click="clearTranscript">
-          {{ t('app.terminal.clear') }}
-        </VeyButton>
-        <VeyButton
-          v-if="isConnecting"
-          size="small"
-          type="secondary"
-          data-ui="terminal-cancel"
-          @click="cancel"
-        >
-          {{ t('common.cancel') }}
-        </VeyButton>
-        <VeyButton
-          v-else-if="sessionState === 'active' || sessionState === 'idleWarning'"
-          size="small"
-          type="danger"
-          data-ui="terminal-disconnect"
-          @click="disconnect"
-        >
-          {{ t('app.terminal.disconnect') }}
-        </VeyButton>
-        <VeyButton
-          v-else
-          size="small"
-          type="primary"
-          :disabled="!canConnect"
-          data-ui="terminal-connect"
-          @click="startConnection"
-        >
-          {{ hasTranscript ? t('app.terminal.reconnect') : t('app.terminal.connect') }}
-        </VeyButton>
-      </div>
+      <VeyTooltip :text="t('app.terminal.newSession')" position="bottom">
+        <button class="terminal-tab-add" :aria-label="t('app.terminal.newSession')" data-ui="terminal-add-tab" @click="addSession">+</button>
+      </VeyTooltip>
     </div>
-
-    <div class="sr-only" role="status" aria-live="polite" data-slot="announcements">
-      <span>{{ statusLabel }}</span>
-      <span v-if="idleWarningSeconds !== null">
-        {{ t('app.terminal.idleWarning', { seconds: idleWarningSeconds }) }}
-      </span>
-      <span v-if="sessionErrorText">{{ sessionErrorText }}</span>
-      <span v-if="exitResult">
-        {{
-          exitResult.exitCode === null
-            ? t('app.terminal.sessionEnded')
-            : t('app.terminal.sessionEndedWithCode', { code: exitResult.exitCode })
-        }}
-      </span>
+    <div v-if="tabs.length === 0" class="terminal-empty" data-ui="terminal-empty">
+      <VeyButton type="secondary" @click="addSession">{{ t('app.terminal.newSession') }}</VeyButton>
     </div>
-
-    <div class="terminal-stage" data-slot="canvas">
-      <div
-        ref="terminalHost"
-        class="terminal-canvas"
-        role="application"
-        :aria-label="t('app.terminal.terminalLabel', { node: targetNodeName })"
-        data-ui="terminal-canvas"
-        data-native-context-menu
-      ></div>
-
-      <div
-        v-if="accessState === 'checking'"
-        class="terminal-overlay"
-        aria-busy="true"
-        data-ui="terminal-checking"
-      >
-        <VeyLoading
-          class="terminal-checking-loading"
-          :loading="true"
-          :text="t('app.terminal.checkingAccess')"
-        />
-      </div>
-      <div
-        v-else-if="accessState === 'failed'"
-        class="terminal-overlay"
-        data-ui="terminal-access-failed"
-      >
-        <VeyAlert type="error" :title="t('app.terminal.accessFailed')" show-icon />
-        <VeyButton type="secondary" @click="checkAccess">{{ t('common.retry') }}</VeyButton>
-      </div>
-      <div
-        v-else-if="accessState === 'unavailable'"
-        class="terminal-overlay"
-        data-ui="terminal-unavailable"
-      >
-        <VeyAlert type="warning" :title="unavailableText" show-icon />
-      </div>
-      <div
-        v-else-if="sessionState === 'ended' || sessionState === 'failed'"
-        class="terminal-overlay terminal-inactive-overlay"
-        data-ui="terminal-inactive"
-      >
-        <VeyTag :type="statusType">{{ statusLabel }}</VeyTag>
-        <p>{{ inactiveStatusText }}</p>
-        <VeyButton
-          type="primary"
-          :disabled="!canConnect"
-          data-ui="terminal-reconnect"
-          @click="startConnection"
-        >
-          {{ t('app.terminal.reconnect') }}
-        </VeyButton>
-      </div>
-      <div
-        v-else-if="!hasTranscript && !hasActiveSession"
-        class="terminal-overlay"
-        data-ui="terminal-ready"
-      >
-        <p>{{ t('app.terminal.readyHint', { node: targetNodeName }) }}</p>
-        <VeyButton type="primary" :disabled="!canConnect" @click="startConnection">
-          {{ t('app.terminal.connect') }}
-        </VeyButton>
-      </div>
-    </div>
+    <TerminalSessionPane
+      v-for="tab in tabs"
+      v-show="tab.id === activeId"
+      :key="tab.id"
+      :ref="(instance) => registerPane(tab.id, instance)"
+      :id="`terminal-panel-${windowId || 'standalone'}-${tab.id}`"
+      role="tabpanel"
+      :aria-labelledby="`terminal-tab-${windowId || 'standalone'}-${tab.id}`"
+      :active="tab.id === activeId"
+      :payload="{ nodeId: tab.nodeId, nodeName: tab.nodeName }"
+    />
   </div>
 </template>
 
 <style scoped>
-.terminal-app {
+.terminal-workspace {
   height: 100%;
   min-height: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
   background: var(--vdl-bg-canvas);
-  color: var(--vdl-text-primary);
 }
-
-.terminal-toolbar {
-  min-height: 44px;
+.terminal-empty { flex: 1; display: flex; align-items: center; justify-content: center; }
+.terminal-tabbar {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--vdl-space-3);
-  padding: var(--vdl-space-2) var(--vdl-space-3);
+  align-items: stretch;
+  min-height: 36px;
+  flex-shrink: 0;
   border-bottom: 1px solid var(--vdl-border-subtle);
-  background: var(--vdl-bg-surface);
+  background: var(--vdl-bg-muted);
 }
-
-.terminal-context,
-.terminal-actions {
+.terminal-tabs {
+  display: flex;
+  min-width: 0;
+  overflow-x: auto;
+}
+.terminal-tab {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  border-right: 1px solid var(--vdl-border-subtle);
+  border-bottom: 2px solid transparent;
+}
+.terminal-tab.is-active {
+  background: var(--vdl-bg-canvas);
+  border-bottom-color: var(--vdl-border-brand);
+}
+.terminal-tab-select,
+.terminal-tab-close,
+.terminal-tab-add {
+  border: 0;
+  background: transparent;
+  color: var(--vdl-text-secondary);
+  cursor: pointer;
+}
+.terminal-tab-select {
   display: flex;
   align-items: center;
   gap: var(--vdl-space-2);
-}
-
-.terminal-context {
-  min-width: 0;
-}
-
-.context-label,
-.session-result {
-  color: var(--vdl-text-secondary);
+  padding: var(--vdl-space-2) var(--vdl-space-3);
+  font: inherit;
   font-size: var(--vdl-font-body-sm);
 }
-
-.context-value {
-  max-width: 240px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--vdl-font-mono);
-  font-size: var(--vdl-font-body-sm);
-}
-
-.context-notice {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: var(--vdl-font-body-sm);
-}
-
-.context-notice-warning {
-  color: var(--vdl-warning);
-}
-
-.context-notice-error {
-  color: var(--vdl-danger);
-}
-
-.terminal-stage {
-  position: relative;
-  flex: 1;
-  min-height: 0;
-  overflow: hidden;
-  padding: var(--vdl-space-3);
-  background: var(--terminal-background);
-}
-
-.terminal-canvas {
-  width: 100%;
-  height: 100%;
-  min-height: 0;
-  overflow: hidden;
-  background: var(--terminal-background);
-}
-
-.terminal-overlay {
-  position: absolute;
-  inset: var(--vdl-space-3);
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: var(--vdl-space-4);
-  padding: var(--vdl-space-5);
-  text-align: center;
-  background: var(--vdl-bg-canvas);
-}
-
-.terminal-overlay > :deep(*) {
-  max-width: 520px;
-}
-
-.terminal-overlay p {
-  margin: 0;
-  color: var(--vdl-text-secondary);
-  line-height: 1.6;
-}
-
-.terminal-checking-loading {
-  width: 240px;
-  max-width: 100%;
-}
-
-.terminal-checking-loading :deep(.vl-loading-text) {
-  white-space: nowrap;
-}
-
-.sr-only {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-  white-space: nowrap;
-  border: 0;
-}
-
-:deep(.xterm) {
-  height: 100%;
-  background: var(--terminal-background);
-}
-
-:deep(.xterm-viewport) {
-  overflow-y: auto;
-  background: var(--terminal-background) !important;
-}
-
-:deep(.xterm-screen) {
-  background: var(--terminal-background);
-}
-
-@media (max-width: 700px) {
-  .terminal-toolbar {
-    align-items: flex-start;
-    flex-wrap: wrap;
-  }
-
-  .terminal-context {
-    width: 100%;
-  }
-
-  .terminal-actions {
-    width: 100%;
-    justify-content: flex-end;
-  }
-
-  .context-value {
-    max-width: 160px;
-  }
-}
+.is-active .terminal-tab-select { color: var(--vdl-text-primary); }
+.terminal-tab-name { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.terminal-tab-close,
+.terminal-tab-add { padding: 0 var(--vdl-space-2); font-size: 18px; }
+.terminal-tab-add { height: 100%; min-height: 36px; flex-shrink: 0; }
+.terminal-tab-close:hover,
+.terminal-tab-add:hover { background: var(--vdl-bg-surface); color: var(--vdl-text-primary); }
+.terminal-tab-select:focus-visible,
+.terminal-tab-close:focus-visible,
+.terminal-tab-add:focus-visible { outline: 2px solid var(--vdl-border-brand); outline-offset: -2px; }
+.terminal-status-dot { width: 6px; height: 6px; flex-shrink: 0; border-radius: 50%; background: var(--vdl-text-secondary); }
+.terminal-status-dot[data-status='success'] { background: var(--vdl-success); }
+.terminal-status-dot[data-status='info'] { background: var(--vdl-info); }
+.terminal-status-dot[data-status='warning'] { background: var(--vdl-warning); }
+.terminal-status-dot[data-status='danger'] { background: var(--vdl-danger); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
 </style>
