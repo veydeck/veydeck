@@ -7,6 +7,9 @@ const assets = import.meta.glob<string>('../assets/file-icons/*.png', {
   import: 'default',
 })
 const suffixGroups: Record<string, string[]> = {
+  'file-capture-v01': ['pcap', 'pcapng', 'cap'],
+  'file-torrent-v01': ['torrent'],
+  'file-ebook-v01': ['epub', 'mobi', 'azw3'],
   'file-text-v01': ['txt', 'text', 'rst'],
   'file-markdown-v01': ['md', 'markdown', 'mdown'],
   'file-pdf-v01': ['pdf'],
@@ -92,6 +95,31 @@ const suffixes = Object.entries(suffixGroups)
   .flatMap(([icon, extensions]) => extensions.map((extension) => ({ extension, icon })))
   .sort((a, b) => b.extension.length - a.extension.length)
 
+/** 只匹配顶层绝对路径，普通同名目录不使用系统目录图标。 */
+const linuxDirectories = new Set(
+  [
+    'root',
+    'home',
+    'etc',
+    'var',
+    'usr',
+    'bin',
+    'sbin',
+    'lib',
+    'lib64',
+    'boot',
+    'dev',
+    'proc',
+    'sys',
+    'run',
+    'tmp',
+    'mnt',
+    'media',
+    'opt',
+    'srv',
+  ].map((name) => '/' + name),
+)
+
 /** 返回经构建生成内容哈希的资源地址。 */
 export function fileIconUrl(stem: string): string {
   return assets[`../assets/file-icons/${stem}.png`]!
@@ -106,6 +134,13 @@ export function resolveFileIcon(entry: FsEntryDetail): { icon: string; badge?: s
       ? 'badge-link-broken-v01'
       : 'badge-link-v01'
     : undefined
+  const directoryPath = entry.path?.replace(/\/+$/, '')
+  if (
+    directoryPath &&
+    linuxDirectories.has(directoryPath) &&
+    (kind === 'directory' || (linked && !entry.symlinkError && (!kind || kind === 'symlink')))
+  )
+    return { icon: `folder-linux-${directoryPath.slice(1)}-v01`, badge }
   if (!kind || kind === 'symlink') return { icon: 'link-generic-v01', badge }
   if (kind === 'directory') return { icon: 'folder-v01', badge }
   if (kind === 'other') return { icon: 'file-special-v01', badge }

@@ -12,7 +12,7 @@ const zh: typeof en = {
     refresh: '刷新',
     retry: '重试',
     editAddress: '编辑地址',
-    home: '主目录',
+    home: '家目录',
     root: '根目录',
     copy: '复制',
     cut: '剪切',

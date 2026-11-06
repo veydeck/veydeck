@@ -20,6 +20,7 @@ import { localizeErrorSummary } from '@/api/error'
 import type { FsEntry } from '@/api/interface/fs'
 import { fileParent, fileTarget, validateFileAction } from '@/services/file-browser'
 import { captureDroppedFiles } from '@/services/file-drop'
+import { fileIconUrl } from '@/services/file-icons'
 
 /** 文件管理窗口只持有浏览状态，后台文件任务由桌面会话统一管理。 */
 const props = defineProps<{
@@ -712,14 +713,26 @@ onUnmounted(() => {
           @dragover.prevent.stop="dragOver($event, undefined, home)"
           @drop.prevent.stop="drop($event, undefined, home)"
         >
-          <VeyIcon name="folder" :size="18" />{{ t('fileBrowser.home') }}</button
+          <img
+            :src="fileIconUrl('nav-home-v01')"
+            class="location-icon"
+            alt=""
+            draggable="false"
+            data-ui="file-location-home-icon"
+          />{{ t('fileBrowser.home') }}</button
         ><button
           :class="{ 'is-drop-target': dropPath === '/' }"
           @click="navigate('/')"
           @dragover.prevent.stop="dragOver($event, undefined, '/')"
           @drop.prevent.stop="drop($event, undefined, '/')"
         >
-          <VeyIcon name="folder" :size="18" />{{ t('fileBrowser.root') }}
+          <img
+            :src="fileIconUrl('nav-root-v01')"
+            class="location-icon"
+            alt=""
+            draggable="false"
+            data-ui="file-location-root-icon"
+          />{{ t('fileBrowser.root') }}
         </button>
       </aside>
       <div
@@ -1206,6 +1219,12 @@ onUnmounted(() => {
 }
 .locations button:hover {
   background: var(--vdl-bg-hover);
+}
+.location-icon {
+  width: 20px;
+  height: 20px;
+  object-fit: contain;
+  flex-shrink: 0;
 }
 .files-pane {
   display: flex;
