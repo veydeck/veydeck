@@ -3,7 +3,7 @@
  * @description 系统监控图表配置构建器（纯函数模块）。
  *
  * 为五类图表（负载、CPU、内存、磁盘 IO、网络吞吐）生成完整 ECharts 配置，
- * 包含仅通过底部滑块操作的 dataZoom、缺失点断线和 crosshair 联动。
+ * 包含时间轴滑块、X 轴滚轮缩放、缺失点断线和 crosshair 联动。
  */
 
 import { formatScaledThroughput } from '@/utils/units'
@@ -29,7 +29,10 @@ interface ThroughputScale {
 /** 通用 dataZoom 配置。 */
 const buildDataZoom = () => [
   {
+    id: 'history-time-zoom',
     type: 'slider',
+    xAxisIndex: 0,
+    filterMode: 'none',
     start: 0,
     end: 100,
     show: true,
@@ -39,6 +42,17 @@ const buildDataZoom = () => [
     backgroundColor: 'rgba(148, 163, 184, 0.06)',
     fillerColor: 'rgba(0, 200, 255, 0.12)',
     handleStyle: { color: 'currentColor' },
+  },
+  {
+    id: 'history-wheel-zoom',
+    type: 'inside',
+    xAxisIndex: 0,
+    filterMode: 'none',
+    start: 0,
+    end: 100,
+    zoomOnMouseWheel: true,
+    moveOnMouseWheel: false,
+    moveOnMouseMove: false,
   },
 ]
 
@@ -84,6 +98,7 @@ const buildYAxis = (theme: ChartTheme) => ({
 
 /** 将负载值限制为最多两位小数，不修改原始采样。 */
 const formatLoadValue = (value: unknown) => {
+  if (value === null || value === undefined) return '—'
   const numericValue = Number(value)
   if (!Number.isFinite(numericValue)) return ''
   return numericValue.toFixed(2).replace(/\.?0+$/, '')
@@ -160,7 +175,9 @@ export function buildCpuChartOptions(
 ): Record<string, unknown> {
   return {
     color: [theme.primary],
-    tooltip: buildTooltip(theme, (value) => `${Number(value ?? 0).toFixed(1)}%`),
+    tooltip: buildTooltip(theme, (value) =>
+      value === null || value === undefined ? '—' : `${Number(value).toFixed(1)}%`,
+    ),
     grid: { left: 44, right: 18, top: 16, bottom: 36 },
     xAxis: buildXAxis(theme, labels),
     yAxis: {
@@ -200,7 +217,9 @@ export function buildMemoryChartOptions(
 ): Record<string, unknown> {
   return {
     color: [theme.success],
-    tooltip: buildTooltip(theme, (value) => `${Number(value ?? 0).toFixed(1)}%`),
+    tooltip: buildTooltip(theme, (value) =>
+      value === null || value === undefined ? '—' : `${Number(value).toFixed(1)}%`,
+    ),
     grid: { left: 44, right: 18, top: 16, bottom: 36 },
     xAxis: buildXAxis(theme, labels),
     yAxis: {
@@ -241,7 +260,9 @@ export function buildDiskIoChartOptions(
   seriesNames: { read: string; write: string },
 ): Record<string, unknown> {
   const formatter = (value: unknown) =>
-    `${formatScaledThroughput(Number(value ?? 0), scale.base)} ${scale.unit}`
+    value === null || value === undefined
+      ? '—'
+      : `${formatScaledThroughput(Number(value), scale.base)} ${scale.unit}`
   return {
     color: [theme.primary, theme.success],
     tooltip: buildTooltip(theme, formatter),
@@ -292,7 +313,9 @@ export function buildNetworkChartOptions(
   seriesNames: { rx: string; tx: string },
 ): Record<string, unknown> {
   const formatter = (value: unknown) =>
-    `${formatScaledThroughput(Number(value ?? 0), scale.base)} ${scale.unit}`
+    value === null || value === undefined
+      ? '—'
+      : `${formatScaledThroughput(Number(value), scale.base)} ${scale.unit}`
   return {
     color: [theme.primary, theme.warning],
     tooltip: buildTooltip(theme, formatter),

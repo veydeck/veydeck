@@ -16,7 +16,7 @@ use veydeck_contracts::{
         OperationLogPage, OperationLogQuery, OperationLogSummary, OperationOutcome,
         OperationParameterValue, OperationTarget, SuiteOperationEventRequest,
     },
-    monitoring::{SystemMonitoringOverview, SystemMonitoringSeriesPage, SystemMonitoringSettings},
+    monitoring::{SystemMonitoringCurrent, SystemMonitoringSeriesPage, SystemMonitoringSettings},
     notification::{
         NotificationAction, NotificationArchiveScope, NotificationArchiveStateRequest,
         NotificationAttentionLevel, NotificationBatchArchiveStateRequest, NotificationCapabilities,
@@ -93,8 +93,8 @@ fn export_contract_bindings() {
     export_type::<OperationEventLabel>(&cfg);
     export_type::<AgentOperationEvent>(&cfg);
     export_type::<SuiteOperationEventRequest>(&cfg);
-    export_type::<SystemMonitoringOverview>(&cfg);
     export_type::<SystemMonitoringSeriesPage>(&cfg);
+    export_type::<SystemMonitoringCurrent>(&cfg);
     export_type::<SystemMonitoringSettings>(&cfg);
     export_type::<NotificationCode>(&cfg);
     export_type::<NotificationCategory>(&cfg);

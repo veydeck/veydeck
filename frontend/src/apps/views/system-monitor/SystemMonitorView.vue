@@ -26,7 +26,9 @@ import {
   buildNetworkChartOptions,
 } from './chartOptions'
 import MonitorChartPanel from './MonitorChartPanel.vue'
-import { VeyAlert, VeyButton, VeyEmpty, VeyLoading, VeySelect, VeyTag } from '@/components/ui'
+import MonitorCurrentValues from './MonitorCurrentValues.vue'
+import { useSystemMonitorCurrent } from '@/composables/useSystemMonitorCurrent'
+import { VeyAlert, VeyEmpty, VeyLoading, VeySelect, VeyTabs } from '@/components/ui'
 
 use([
   LineChart,
@@ -49,12 +51,12 @@ const { t } = useI18n()
 const themeStore = useThemeStore()
 const windowStore = useWindowManagerStore()
 const {
-  overview,
+  activeGroup,
+  memoryType,
   series,
-  overviewState,
   seriesState,
   timeRange,
-  points,
+  hasSeriesData,
   labels,
   load1,
   load5,
@@ -68,10 +70,26 @@ const {
   diskScale,
   netScale,
   busy,
-  manualRefreshing,
-  refreshAll,
 } = useSystemMonitor()
+const {
+  current,
+  loading: currentLoading,
+  error: currentError,
+  stale: currentStale,
+} = useSystemMonitorCurrent(activeGroup)
 
+/** 只有当前节点已配置 Swap 时开放切换，未知采样不当作未配置。 */
+const hasSwap = computed(
+  () => current.value?.group === 'memory' && (current.value.metrics.swapTotalBytes ?? 0) > 0,
+)
+const memoryOptions = computed(() => [
+  { value: 'physical', label: t('app.systemMonitor.memoryTypes.physical') },
+  { value: 'swap', label: t('app.systemMonitor.memoryTypes.swap') },
+])
+watch(current, (snapshot) => {
+  if (snapshot?.group === 'memory' && snapshot.metrics.swapTotalBytes === 0)
+    memoryType.value = 'physical'
+})
 const rangeOptions = computed(() => [
   { value: '1h', label: t('app.systemMonitor.ranges.1h') },
   { value: '6h', label: t('app.systemMonitor.ranges.6h') },
@@ -80,35 +98,23 @@ const rangeOptions = computed(() => [
   { value: '7d', label: t('app.systemMonitor.ranges.7d') },
 ])
 const chartTheme = computed(() => buildChartTheme(themeStore.currentTheme))
-const hasSeriesData = computed(() => points.value.some((point) => point.coveragePercent > 0))
-const seriesMatchesRange = computed(() => series.value?.range === timeRange.value)
-const awaitingSeriesWithoutChart = computed(
-  () =>
-    seriesState.value.loading ||
-    (seriesState.value.refreshing && !seriesMatchesRange.value && !hasSeriesData.value),
+const awaitingSeriesWithoutChart = computed(() => seriesState.value.loading)
+const tabs = computed(() =>
+  ['load', 'cpu', 'memory', 'diskIo', 'network'].map((name) => ({
+    name,
+    label: t(`app.systemMonitor.tabs.${name}`),
+  })),
 )
 const showSeriesLoading = ref(false)
 let seriesLoadingTimer: number | null = null
-const warnings = computed(() =>
-  [overviewState.value.warning, seriesState.value.warning].filter(Boolean),
-)
-const failures = computed(() =>
-  [overviewState.value.error, seriesState.value.error].filter(Boolean),
-)
-const qualityTag = computed(() => {
-  const status = overview.value?.snapshotStatus ?? 'unavailable'
-  return {
-    type:
-      status === 'fresh'
-        ? ('success' as const)
-        : status === 'partial' || status === 'stale'
-          ? ('warning' as const)
-          : ('danger' as const),
-    label: t(`app.systemMonitor.snapshotStatus.${status}`),
-  }
+const collectionNotice = computed(() => {
+  if (series.value?.collectionState === 'stopped')
+    return t('app.systemMonitor.collectionStoppedNotice')
+  if (series.value?.seriesStatus === 'stale') return t('app.systemMonitor.noRecentSamples')
+  return ''
 })
 const emptyDescription = computed(() =>
-  overview.value?.history.state === 'stopped'
+  series.value?.collectionState === 'stopped'
     ? t('app.systemMonitor.collectionStopped')
     : t('app.systemMonitor.noHistory'),
 )
@@ -154,7 +160,11 @@ const memoryChartOptions = computed(() =>
     labels.value,
     memory.value,
     chartTheme.value,
-    t('app.systemMonitor.charts.series.memory'),
+    t(
+      memoryType.value === 'swap'
+        ? 'app.systemMonitor.charts.series.swap'
+        : 'app.systemMonitor.charts.series.memory',
+    ),
   ),
 )
 const diskIoChartOptions = computed(() =>
@@ -184,6 +194,17 @@ const networkChartOptions = computed(() =>
   ),
 )
 
+const activeChartOptions = computed(
+  () =>
+    ({
+      load: loadChartOptions,
+      cpu: cpuChartOptions,
+      memory: memoryChartOptions,
+      diskIo: diskIoChartOptions,
+      network: networkChartOptions,
+    })[activeGroup.value].value,
+)
+
 watch(
   busy,
   (isBusy) => {
@@ -202,63 +223,61 @@ watch(
 <template>
   <div class="system-monitor" data-page="system-monitoring" data-ui="monitoring-workspace">
     <div class="toolbar" data-ui="toolbar" data-slot="toolbar">
-      <div class="status-cluster" data-slot="status">
-        <VeyTag :type="qualityTag.type" effect="light">{{ qualityTag.label }}</VeyTag>
-        <span v-if="overview?.observedAt" class="observed-at">
-          {{
-            t('app.systemMonitor.observedAt', {
-              time: new Date(overview.observedAt).toLocaleString(),
-            })
-          }}
-        </span>
-      </div>
-      <div class="actions" data-slot="actions">
-        <VeySelect
-          id="system-monitoring-range"
-          v-model="timeRange"
-          class="range-select"
-          name="systemMonitoringRange"
-          :aria-label="t('app.systemMonitor.timeRange')"
-          :options="rangeOptions"
-        />
-        <VeyButton
-          type="secondary"
-          :loading="manualRefreshing"
-          data-slot="refresh"
-          @click="refreshAll"
-        >
-          {{ t('app.systemMonitor.refresh') }}
-        </VeyButton>
-      </div>
+      <VeyTabs v-model="activeGroup" :tabs="tabs" class="monitor-tabs" data-ui="monitoring-tabs" />
+      <VeySelect
+        id="system-monitoring-range"
+        v-model="timeRange"
+        class="range-select"
+        name="systemMonitoringRange"
+        :aria-label="t('app.systemMonitor.timeRange')"
+        :options="rangeOptions"
+      />
     </div>
 
     <VeyAlert
-      v-for="warning in warnings"
-      :key="`warning-${warning}`"
+      v-if="seriesState.warning"
       type="warning"
-      :title="warning"
+      :title="seriesState.warning"
       show-icon
       data-ui="refresh-warning"
     />
     <VeyAlert
-      v-for="failure in failures"
-      :key="`failure-${failure}`"
+      v-if="seriesState.error"
       type="error"
-      :title="failure"
+      :title="seriesState.error"
       show-icon
       data-ui="load-error"
     />
     <VeyAlert
-      v-if="overview?.snapshotStatus === 'partial'"
+      v-if="collectionNotice"
       type="warning"
-      :title="
-        t('app.systemMonitor.partialCoverage', { coverage: overview.coveragePercent.toFixed(0) })
-      "
+      :title="collectionNotice"
       show-icon
-      data-ui="partial-status"
+      data-ui="collection-notice"
     />
 
-    <div class="content" data-slot="content">
+    <div
+      v-if="activeGroup === 'memory' && hasSwap"
+      class="memory-controls"
+      data-ui="memory-controls"
+    >
+      <VeySelect
+        v-model="memoryType"
+        class="memory-type-select"
+        name="systemMonitoringMemoryType"
+        :aria-label="t('app.systemMonitor.memoryType')"
+        :options="memoryOptions"
+        data-ui="memory-type-select"
+      />
+    </div>
+    <div
+      class="content"
+      data-slot="content"
+      data-ui="monitoring-panel"
+      role="tabpanel"
+      :aria-label="t(`app.systemMonitor.tabs.${activeGroup}`)"
+      :data-group="activeGroup"
+    >
       <div
         v-if="awaitingSeriesWithoutChart"
         class="series-loading-placeholder"
@@ -272,39 +291,34 @@ watch(
         />
       </div>
       <VeyEmpty
-        v-else-if="seriesMatchesRange && !hasSeriesData"
+        v-else-if="series && !hasSeriesData"
+        class="history-empty"
         :description="emptyDescription"
         data-ui="history-empty"
       />
-      <div v-else-if="hasSeriesData" class="chart-grid" data-ui="chart-grid">
-        <MonitorChartPanel
-          :title="t('app.systemMonitor.charts.load')"
-          :options="loadChartOptions"
-          full-width
-          data-slot="load-chart"
-        />
-        <MonitorChartPanel
-          :title="t('app.systemMonitor.charts.cpu')"
-          :options="cpuChartOptions"
-          data-slot="cpu-chart"
-        />
-        <MonitorChartPanel
-          :title="t('app.systemMonitor.charts.memory')"
-          :options="memoryChartOptions"
-          data-slot="memory-chart"
-        />
-        <MonitorChartPanel
-          :title="t('app.systemMonitor.charts.diskIo')"
-          :options="diskIoChartOptions"
-          data-slot="disk-chart"
-        />
-        <MonitorChartPanel
-          :title="t('app.systemMonitor.charts.network')"
-          :options="networkChartOptions"
-          data-slot="network-chart"
-        />
-      </div>
+      <MonitorChartPanel
+        v-else-if="hasSeriesData"
+        :key="`${activeGroup}-${activeGroup === 'memory' ? memoryType : ''}`"
+        :title="
+          t(
+            activeGroup === 'memory' && memoryType === 'swap'
+              ? 'app.systemMonitor.charts.swap'
+              : `app.systemMonitor.charts.${activeGroup}`,
+          )
+        "
+        :options="activeChartOptions"
+        :data-group="activeGroup"
+        data-slot="active-chart"
+      />
     </div>
+    <MonitorCurrentValues
+      :group="activeGroup"
+      :snapshot="current"
+      :memory-type="memoryType"
+      :loading="currentLoading"
+      :error="currentError"
+      :stale="currentStale"
+    />
   </div>
 </template>
 
@@ -321,23 +335,29 @@ watch(
   background: var(--vdl-bg-canvas);
 }
 
-.toolbar,
-.actions,
-.status-cluster {
+.toolbar {
   display: flex;
   align-items: center;
-}
-
-.toolbar {
   flex-shrink: 0;
-  justify-content: space-between;
   gap: var(--vdl-space-3);
-  flex-wrap: wrap;
+  min-width: 0;
 }
 
-.actions,
-.status-cluster {
+.monitor-tabs {
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.monitor-tabs :deep(.vl-tabs-nav) {
+  width: max-content;
+  min-width: 100%;
   gap: var(--vdl-space-2);
+}
+
+.monitor-tabs :deep(.vl-tabs-item) {
+  flex-shrink: 0;
 }
 
 .range-select {
@@ -345,9 +365,15 @@ watch(
   flex: 0 0 130px;
 }
 
-.observed-at {
-  color: var(--vdl-text-muted);
-  font-size: var(--vdl-font-caption);
+.memory-controls {
+  display: flex;
+  justify-content: flex-end;
+  flex-shrink: 0;
+}
+
+.memory-type-select {
+  width: 166px;
+  flex: 0 0 166px;
 }
 
 .content {
@@ -356,6 +382,11 @@ watch(
   min-height: 0;
   display: flex;
   overflow: hidden;
+}
+
+.history-empty {
+  flex: 1;
+  min-width: 0;
 }
 
 .series-loading-placeholder {
@@ -368,40 +399,14 @@ watch(
   width: 100%;
 }
 
-.chart-grid {
-  flex: 1;
-  min-height: 0;
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--vdl-space-3);
-  overflow-y: auto;
-  padding-right: var(--vdl-space-1);
-}
-
-@media (max-width: 1024px) {
-  .chart-grid {
-    grid-template-columns: 1fr;
-  }
-}
-
 @media (max-width: 640px) {
-  .toolbar,
-  .actions {
-    align-items: stretch;
-  }
-
   .toolbar {
-    flex-direction: column;
-  }
-
-  .actions {
-    width: 100%;
+    gap: var(--vdl-space-2);
   }
 
   .range-select {
-    width: auto;
-    min-width: 130px;
-    flex: 1 1 130px;
+    width: 120px;
+    flex-basis: 120px;
   }
 }
 </style>

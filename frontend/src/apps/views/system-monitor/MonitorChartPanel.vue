@@ -12,8 +12,6 @@ const props = defineProps<{
   title: string
   /** ECharts 配置对象 */
   options: Record<string, unknown>
-  /** 是否占满整行 */
-  fullWidth?: boolean
 }>()
 
 const chartRef = ref<HTMLElement | null>(null)
@@ -40,7 +38,7 @@ defineExpose({ instance })
 </script>
 
 <template>
-  <div class="monitor-chart-panel" :class="{ 'is-full-width': fullWidth }" data-ui="chart-panel">
+  <div class="monitor-chart-panel" data-ui="chart-panel">
     <h3 class="chart-title" data-slot="chart-title">{{ title }}</h3>
     <div ref="chartRef" class="chart-body" data-slot="chart-canvas"></div>
   </div>
@@ -50,15 +48,13 @@ defineExpose({ instance })
 .monitor-chart-panel {
   display: flex;
   flex-direction: column;
-  min-height: 280px;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
   padding: var(--vdl-space-3);
   border: 1px solid var(--vdl-border-default);
   border-radius: var(--vdl-radius-md);
   background: var(--vdl-bg-card);
-}
-
-.monitor-chart-panel.is-full-width {
-  grid-column: 1 / -1;
 }
 
 .chart-title {
@@ -71,12 +67,6 @@ defineExpose({ instance })
 .chart-body {
   width: 100%;
   flex: 1;
-  min-height: 220px;
-}
-
-@media (max-width: 1024px) {
-  .monitor-chart-panel.is-full-width {
-    grid-column: auto;
-  }
+  min-height: 180px;
 }
 </style>

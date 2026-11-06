@@ -1,4 +1,4 @@
-//! 系统监控 API：提供稳定的实时概览、历史趋势与采集设置。
+//! 系统监控 API：提供分组实时指标、历史趋势与采集设置。
 
 use axum::{
     Json, Router,
@@ -10,21 +10,23 @@ use axum::{
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
 use veydeck_contracts::{
     api::ErrorCode,
     monitoring::{
-        SystemMonitoringCapabilities, SystemMonitoringCollectionState,
-        SystemMonitoringHistorySummary, SystemMonitoringMetrics, SystemMonitoringOverview,
-        SystemMonitoringOwnership, SystemMonitoringPageInfo, SystemMonitoringSeriesPage,
-        SystemMonitoringSeriesPoint, SystemMonitoringSeriesStatus, SystemMonitoringSettings,
-        SystemMonitoringSnapshotStatus, SystemMonitoringSourceState, SystemMonitoringSourceStatus,
+        CpuMonitoringMetrics, DiskIoMonitoringMetrics, LoadMonitoringMetrics,
+        MemoryMonitoringMetrics, NetworkMonitoringMetrics, SystemMonitoringCapabilities,
+        SystemMonitoringCollectionState, SystemMonitoringCurrent, SystemMonitoringCurrentData,
+        SystemMonitoringCurrentQuery, SystemMonitoringCurrentStatus, SystemMonitoringGroup,
+        SystemMonitoringMetrics, SystemMonitoringOwnership, SystemMonitoringPageInfo,
+        SystemMonitoringSeriesData, SystemMonitoringSeriesPage, SystemMonitoringSeriesPoint,
+        SystemMonitoringSeriesStatus, SystemMonitoringSettings,
     },
 };
 
 use crate::{
     services::system_monitoring::{
-        HISTORY_SAMPLE_INTERVAL_SECONDS, RawHostMetricSample, STALE_AFTER_SECONDS,
+        CurrentHostSnapshot, HISTORY_SAMPLE_INTERVAL_SECONDS, RawHostMetricSample,
         SystemMonitoringStorageSettings,
     },
     state::AppState,
@@ -78,6 +80,7 @@ pub struct SystemMonitoringSettingsUpdate {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SystemMonitoringSeriesQuery {
+    pub group: SystemMonitoringGroup,
     #[serde(default = "default_range")]
     pub range: String,
     #[serde(default = "default_sort")]
@@ -100,6 +103,7 @@ struct StoredSample {
     memory_used_bytes: Option<i64>,
     memory_total_bytes: Option<i64>,
     memory_percent: Option<f64>,
+    swap_percent: Option<f64>,
     load_average_1m: Option<f64>,
     load_average_5m: Option<f64>,
     load_average_15m: Option<f64>,
@@ -107,7 +111,6 @@ struct StoredSample {
     disk_write_bytes: Option<i64>,
     network_receive_bytes: Option<i64>,
     network_transmit_bytes: Option<i64>,
-    available_source_count: i64,
 }
 
 impl StoredSample {
@@ -118,6 +121,7 @@ impl StoredSample {
             memory_used_bytes: as_u64(self.memory_used_bytes),
             memory_total_bytes: as_u64(self.memory_total_bytes),
             memory_percent: self.memory_percent,
+            swap_percent: self.swap_percent,
             load_average_1m: self.load_average_1m,
             load_average_5m: self.load_average_5m,
             load_average_15m: self.load_average_15m,
@@ -133,68 +137,101 @@ impl StoredSample {
 /// 构建 Agent 内部系统监控路由。
 pub fn system_monitoring_router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/overview", get(overview))
+        .route("/current", get(current))
         .route("/series", get(series))
         .route("/settings", get(settings).put(update_settings))
         .route("/history", delete(clear_history))
 }
 
-/// 返回缓存中的实时概览，不触发新的宿主机采样。
-async fn overview(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
-    let latest = state.system_monitoring.latest_sample.read().await.clone();
-    let previous = state.system_monitoring.previous_sample.read().await.clone();
-    let storage_settings = *state.system_monitoring.settings.read().await;
-    let collection_state = *state.system_monitoring.collection_state.read().await;
-    let last_sampled_at = load_last_history_sample(&state).await?;
-
-    let now = Utc::now().timestamp();
-    let (snapshot_status, coverage_percent, observed_at, sources, metrics) = match latest {
-        Some(sample) => {
-            let coverage = f64::from(sample.available_source_count()) / 5.0 * 100.0;
-            let status = if now - sample.sampled_at > STALE_AFTER_SECONDS {
-                SystemMonitoringSnapshotStatus::Stale
-            } else if sample.available_source_count() < 5 {
-                SystemMonitoringSnapshotStatus::Partial
-            } else {
-                SystemMonitoringSnapshotStatus::Fresh
-            };
-            let metrics = sample.metrics(previous.as_ref());
-            (
-                status,
-                coverage,
-                Some(format_epoch(sample.sampled_at)?),
-                sample.source_statuses,
-                metrics,
-            )
-        }
-        None => (
-            SystemMonitoringSnapshotStatus::Unavailable,
-            0.0,
-            None,
-            unavailable_sources(),
-            empty_metrics(),
-        ),
-    };
-
-    let response = SystemMonitoringOverview {
-        ownership: SystemMonitoringOwnership::System,
-        observed_at,
-        snapshot_status,
-        coverage_percent,
-        sources,
-        metrics,
-        history: SystemMonitoringHistorySummary {
-            state: collection_state,
-            sample_interval_seconds: HISTORY_SAMPLE_INTERVAL_SECONDS,
-            retention_days: storage_settings.retention_days,
-            last_sampled_at: last_sampled_at.map(format_epoch).transpose()?,
-        },
-        capabilities: capabilities(),
-    };
+/// 读取唯一后台采样器的缓存，不触发新采样或历史查询。
+async fn current(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SystemMonitoringCurrentQuery>,
+) -> ApiResult<Response> {
+    let cached = state.system_monitoring.current.read().await;
+    let data = build_current(cached.as_ref(), query.group, Instant::now())?;
     Ok(
-        ApiResponse::success_with_raw("System monitoring overview loaded", Some(response))
+        ApiResponse::success_with_raw("System monitoring current loaded", Some(data))
             .into_response(),
     )
+}
+
+/// 投影当前分组，并独立判断采样是否过期或尚不可用。
+fn build_current(
+    snapshot: Option<&CurrentHostSnapshot>,
+    group: SystemMonitoringGroup,
+    now: Instant,
+) -> ApiResult<SystemMonitoringCurrent> {
+    let empty = SystemMonitoringMetrics::default();
+    let metrics = snapshot.map(|snapshot| &snapshot.metrics).unwrap_or(&empty);
+    let (data, available) = match group {
+        SystemMonitoringGroup::Load => (
+            SystemMonitoringCurrentData::Load {
+                metrics: LoadMonitoringMetrics {
+                    load_average_1m: metrics.load_average_1m,
+                    load_average_5m: metrics.load_average_5m,
+                    load_average_15m: metrics.load_average_15m,
+                },
+            },
+            metrics.load_average_1m.is_some()
+                || metrics.load_average_5m.is_some()
+                || metrics.load_average_15m.is_some(),
+        ),
+        SystemMonitoringGroup::Cpu => (
+            SystemMonitoringCurrentData::Cpu {
+                metrics: snapshot.map(|s| s.cpu.clone()).unwrap_or_default(),
+            },
+            snapshot.is_some_and(|s| s.cpu.cpu_percent.is_some()),
+        ),
+        SystemMonitoringGroup::Memory => (
+            SystemMonitoringCurrentData::Memory {
+                metrics: snapshot.map(|s| s.memory.clone()).unwrap_or_default(),
+            },
+            snapshot.is_some_and(|s| s.memory.total_bytes.is_some()),
+        ),
+        SystemMonitoringGroup::DiskIo => (
+            SystemMonitoringCurrentData::DiskIo {
+                metrics: DiskIoMonitoringMetrics {
+                    disk_read_bytes_per_second: metrics.disk_read_bytes_per_second,
+                    disk_write_bytes_per_second: metrics.disk_write_bytes_per_second,
+                },
+            },
+            metrics.disk_read_bytes_per_second.is_some()
+                || metrics.disk_write_bytes_per_second.is_some(),
+        ),
+        SystemMonitoringGroup::Network => (
+            SystemMonitoringCurrentData::Network {
+                metrics: NetworkMonitoringMetrics {
+                    network_receive_bytes_per_second: metrics.network_receive_bytes_per_second,
+                    network_transmit_bytes_per_second: metrics.network_transmit_bytes_per_second,
+                },
+            },
+            metrics.network_receive_bytes_per_second.is_some()
+                || metrics.network_transmit_bytes_per_second.is_some(),
+        ),
+    };
+    let sample_age_ms = snapshot.map(|snapshot| {
+        u64::try_from(
+            now.saturating_duration_since(snapshot.sampled_since)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX)
+    });
+    let status = if sample_age_ms.is_some_and(|age| age > 10_000) {
+        SystemMonitoringCurrentStatus::Stale
+    } else if available {
+        SystemMonitoringCurrentStatus::Fresh
+    } else {
+        SystemMonitoringCurrentStatus::Unavailable
+    };
+    Ok(SystemMonitoringCurrent {
+        sample_age_ms,
+        sampled_at: snapshot
+            .map(|snapshot| format_epoch(snapshot.sampled_at))
+            .transpose()?,
+        status,
+        data,
+    })
 }
 
 /// 返回固定分辨率并显式包含缺失桶的历史趋势。
@@ -224,7 +261,7 @@ async fn series(
     let to = Utc::now().timestamp();
     let from = to - range.duration_seconds;
     let rows = load_series_rows(&state, from, to).await?;
-    let mut points = build_series_points(&rows, from, to, range.resolution_seconds)?;
+    let mut points = build_series_points(&rows, from, to, range.resolution_seconds, query.group)?;
     let expected_point_count = points.len() as u32;
     let actual_point_count = points
         .iter()
@@ -249,7 +286,12 @@ async fn series(
     let has_more = end < points.len();
     let page_points = points[offset..end].to_vec();
     let collection_state = *state.system_monitoring.collection_state.read().await;
-    let newest_sampled_at = rows.last().map(|row| row.sampled_at);
+    let newest_sampled_at = rows.iter().enumerate().rev().find_map(|(index, row)| {
+        let previous = index.checked_sub(1).map(|index| rows[index].to_raw());
+        let metrics = row.to_raw().metrics(previous.as_ref());
+        (row.sampled_at >= from && group_coverage(query.group, &metrics) > 0.0)
+            .then_some(row.sampled_at)
+    });
     let series_status = if actual_point_count == 0 {
         SystemMonitoringSeriesStatus::Empty
     } else if collection_state == SystemMonitoringCollectionState::Stopped
@@ -271,7 +313,8 @@ async fn series(
         expected_point_count,
         actual_point_count,
         coverage_percent,
-        points: page_points,
+        data: project_series(query.group, page_points),
+        collection_state,
         page_info: SystemMonitoringPageInfo {
             limit: query.limit,
             has_more,
@@ -377,10 +420,10 @@ async fn clear_history(
 async fn load_series_rows(state: &AppState, from: i64, to: i64) -> ApiResult<Vec<StoredSample>> {
     sqlx::query_as::<_, StoredSample>(
         r#"
-        SELECT sampled_at, cpu_percent, memory_used_bytes, memory_total_bytes, memory_percent,
+        SELECT sampled_at, cpu_percent, memory_used_bytes, memory_total_bytes, memory_percent, swap_percent,
                load_average_1m, load_average_5m, load_average_15m,
                disk_read_bytes, disk_write_bytes,
-               network_receive_bytes, network_transmit_bytes, available_source_count
+               network_receive_bytes, network_transmit_bytes
         FROM system_monitoring_samples
         WHERE sampled_at >= ? AND sampled_at <= ?
         ORDER BY sampled_at ASC
@@ -398,7 +441,8 @@ fn build_series_points(
     from: i64,
     to: i64,
     resolution_seconds: i64,
-) -> ApiResult<Vec<SystemMonitoringSeriesPoint>> {
+    group: SystemMonitoringGroup,
+) -> ApiResult<Vec<SystemMonitoringSeriesPoint<SystemMonitoringMetrics>>> {
     let expected = ((to - from) / resolution_seconds).max(1) as usize;
     let mut buckets: BTreeMap<usize, Vec<(SystemMonitoringMetrics, f64)>> = BTreeMap::new();
     for (index, row) in rows.iter().enumerate() {
@@ -414,10 +458,9 @@ fn build_series_points(
             .and_then(|previous_index| rows.get(previous_index))
             .map(StoredSample::to_raw);
         let raw = row.to_raw();
-        buckets.entry(bucket).or_default().push((
-            raw.metrics(previous.as_ref()),
-            row.available_source_count.clamp(0, 5) as f64 / 5.0 * 100.0,
-        ));
+        let metrics = raw.metrics(previous.as_ref());
+        let coverage = group_coverage(group, &metrics);
+        buckets.entry(bucket).or_default().push((metrics, coverage));
     }
 
     (0..expected)
@@ -432,6 +475,106 @@ fn build_series_points(
             })
         })
         .collect()
+}
+
+/// 仅以当前分组有效指标计算覆盖率。
+fn group_coverage(group: SystemMonitoringGroup, metrics: &SystemMonitoringMetrics) -> f64 {
+    let values: &[Option<f64>] = match group {
+        SystemMonitoringGroup::Load => &[
+            metrics.load_average_1m,
+            metrics.load_average_5m,
+            metrics.load_average_15m,
+        ],
+        SystemMonitoringGroup::Cpu => &[metrics.cpu_percent],
+        SystemMonitoringGroup::Memory => &[metrics.memory_percent],
+        SystemMonitoringGroup::DiskIo => &[
+            metrics.disk_read_bytes_per_second,
+            metrics.disk_write_bytes_per_second,
+        ],
+        SystemMonitoringGroup::Network => &[
+            metrics.network_receive_bytes_per_second,
+            metrics.network_transmit_bytes_per_second,
+        ],
+    };
+    values.iter().filter(|value| value.is_some()).count() as f64 / values.len() as f64 * 100.0
+}
+
+/// 在 Agent 边界投影为严格分组类型，减少两段链路传输。
+fn project_series(
+    group: SystemMonitoringGroup,
+    points: Vec<SystemMonitoringSeriesPoint<SystemMonitoringMetrics>>,
+) -> SystemMonitoringSeriesData {
+    match group {
+        SystemMonitoringGroup::Load => SystemMonitoringSeriesData::Load {
+            points: points
+                .into_iter()
+                .map(|point| SystemMonitoringSeriesPoint {
+                    sampled_at: point.sampled_at,
+                    coverage_percent: point.coverage_percent,
+                    metrics: LoadMonitoringMetrics {
+                        load_average_1m: point.metrics.load_average_1m,
+                        load_average_5m: point.metrics.load_average_5m,
+                        load_average_15m: point.metrics.load_average_15m,
+                    },
+                })
+                .collect(),
+        },
+        SystemMonitoringGroup::Cpu => SystemMonitoringSeriesData::Cpu {
+            points: points
+                .into_iter()
+                .map(|point| SystemMonitoringSeriesPoint {
+                    sampled_at: point.sampled_at,
+                    coverage_percent: point.coverage_percent,
+                    metrics: CpuMonitoringMetrics {
+                        cpu_percent: point.metrics.cpu_percent,
+                    },
+                })
+                .collect(),
+        },
+        SystemMonitoringGroup::Memory => SystemMonitoringSeriesData::Memory {
+            points: points
+                .into_iter()
+                .map(|point| SystemMonitoringSeriesPoint {
+                    sampled_at: point.sampled_at,
+                    coverage_percent: point.coverage_percent,
+                    metrics: MemoryMonitoringMetrics {
+                        memory_percent: point.metrics.memory_percent,
+                        swap_percent: point.metrics.swap_percent,
+                    },
+                })
+                .collect(),
+        },
+        SystemMonitoringGroup::DiskIo => SystemMonitoringSeriesData::DiskIo {
+            points: points
+                .into_iter()
+                .map(|point| SystemMonitoringSeriesPoint {
+                    sampled_at: point.sampled_at,
+                    coverage_percent: point.coverage_percent,
+                    metrics: DiskIoMonitoringMetrics {
+                        disk_read_bytes_per_second: point.metrics.disk_read_bytes_per_second,
+                        disk_write_bytes_per_second: point.metrics.disk_write_bytes_per_second,
+                    },
+                })
+                .collect(),
+        },
+        SystemMonitoringGroup::Network => SystemMonitoringSeriesData::Network {
+            points: points
+                .into_iter()
+                .map(|point| SystemMonitoringSeriesPoint {
+                    sampled_at: point.sampled_at,
+                    coverage_percent: point.coverage_percent,
+                    metrics: NetworkMonitoringMetrics {
+                        network_receive_bytes_per_second: point
+                            .metrics
+                            .network_receive_bytes_per_second,
+                        network_transmit_bytes_per_second: point
+                            .metrics
+                            .network_transmit_bytes_per_second,
+                    },
+                })
+                .collect(),
+        },
+    }
 }
 
 fn aggregate_metrics(values: &[(SystemMonitoringMetrics, f64)]) -> SystemMonitoringMetrics {
@@ -451,6 +594,7 @@ fn aggregate_metrics(values: &[(SystemMonitoringMetrics, f64)]) -> SystemMonitor
         memory_used_bytes: integer_metric(|value| value.memory_used_bytes),
         memory_total_bytes: integer_metric(|value| value.memory_total_bytes),
         memory_percent: metric(|value| value.memory_percent),
+        swap_percent: metric(|value| value.swap_percent),
         load_average_1m: metric(|value| value.load_average_1m),
         load_average_5m: metric(|value| value.load_average_5m),
         load_average_15m: metric(|value| value.load_average_15m),
@@ -486,13 +630,6 @@ async fn load_settings_response(state: &AppState) -> ApiResult<SystemMonitoringS
         newest_sampled_at: summary.2.map(format_epoch).transpose()?,
         capabilities: capabilities(),
     })
-}
-
-async fn load_last_history_sample(state: &AppState) -> ApiResult<Option<i64>> {
-    sqlx::query_scalar("SELECT MAX(sampled_at) FROM system_monitoring_samples")
-        .fetch_one(&state.metadata_db)
-        .await
-        .map_err(database_error)
 }
 
 #[derive(Clone, Copy)]
@@ -546,32 +683,6 @@ fn capabilities() -> SystemMonitoringCapabilities {
     }
 }
 
-fn unavailable_sources() -> Vec<SystemMonitoringSourceStatus> {
-    ["cpu", "memory", "load", "diskIo", "networkIo"]
-        .into_iter()
-        .map(|source| SystemMonitoringSourceStatus {
-            source: source.to_string(),
-            state: SystemMonitoringSourceState::Unavailable,
-        })
-        .collect()
-}
-
-fn empty_metrics() -> SystemMonitoringMetrics {
-    SystemMonitoringMetrics {
-        cpu_percent: None,
-        memory_used_bytes: None,
-        memory_total_bytes: None,
-        memory_percent: None,
-        load_average_1m: None,
-        load_average_5m: None,
-        load_average_15m: None,
-        disk_read_bytes_per_second: None,
-        disk_write_bytes_per_second: None,
-        network_receive_bytes_per_second: None,
-        network_transmit_bytes_per_second: None,
-    }
-}
-
 fn format_epoch(value: i64) -> ApiResult<String> {
     chrono::DateTime::from_timestamp(value, 0)
         .map(|value| value.to_rfc3339_opts(SecondsFormat::Secs, true))
@@ -614,6 +725,369 @@ mod tests {
     use super::*;
     use axum::extract::FromRequestParts;
     use axum::http::{HeaderValue, Request};
+
+    #[test]
+    fn current_snapshots_are_grouped_nullable_and_age_independently() {
+        use veydeck_contracts::monitoring::{CurrentCpuMetrics, CurrentMemoryMetrics};
+        let sampled_since = Instant::now();
+        let snapshot = CurrentHostSnapshot {
+            sampled_at: 1000,
+            sampled_since,
+            metrics: sample(1000).to_raw().metrics(Some(&sample(940).to_raw())),
+            cpu: CurrentCpuMetrics {
+                cpu_percent: Some(50.0),
+                user_percent: Some(30.0),
+                system_percent: Some(15.0),
+                io_wait_percent: Some(10.0),
+            },
+            memory: CurrentMemoryMetrics {
+                total_bytes: Some(100),
+                used_bytes: Some(40),
+                usage_percent: Some(40.0),
+                buffers_bytes: Some(0),
+                cached_bytes: Some(30),
+                available_bytes: Some(60),
+                free_bytes: Some(20),
+                other_used_bytes: Some(50),
+                swap_total_bytes: Some(1000),
+                swap_used_bytes: Some(250),
+                swap_free_bytes: Some(750),
+                swap_percent: Some(25.0),
+            },
+        };
+        for sampled_at in [1000, 1_793_955_468, 1_893_955_468] {
+            let shifted = CurrentHostSnapshot {
+                sampled_at,
+                ..snapshot.clone()
+            };
+            let current = build_current(
+                Some(&shifted),
+                SystemMonitoringGroup::Load,
+                sampled_since + std::time::Duration::from_millis(2500),
+            )
+            .unwrap();
+            assert_eq!(current.status, SystemMonitoringCurrentStatus::Fresh);
+            assert_eq!(current.sample_age_ms, Some(2500));
+        }
+        for (group, keys) in [
+            (
+                SystemMonitoringGroup::Load,
+                vec!["loadAverage1m", "loadAverage5m", "loadAverage15m"],
+            ),
+            (
+                SystemMonitoringGroup::Cpu,
+                vec![
+                    "cpuPercent",
+                    "userPercent",
+                    "systemPercent",
+                    "ioWaitPercent",
+                ],
+            ),
+            (
+                SystemMonitoringGroup::Memory,
+                vec![
+                    "totalBytes",
+                    "usedBytes",
+                    "usagePercent",
+                    "buffersBytes",
+                    "cachedBytes",
+                    "availableBytes",
+                    "freeBytes",
+                    "otherUsedBytes",
+                    "swapTotalBytes",
+                    "swapUsedBytes",
+                    "swapFreeBytes",
+                    "swapPercent",
+                ],
+            ),
+            (
+                SystemMonitoringGroup::DiskIo,
+                vec!["diskReadBytesPerSecond", "diskWriteBytesPerSecond"],
+            ),
+            (
+                SystemMonitoringGroup::Network,
+                vec![
+                    "networkReceiveBytesPerSecond",
+                    "networkTransmitBytesPerSecond",
+                ],
+            ),
+        ] {
+            let data = build_current(
+                Some(&snapshot),
+                group,
+                sampled_since + std::time::Duration::from_secs(10),
+            )
+            .unwrap();
+            assert_eq!(data.status, SystemMonitoringCurrentStatus::Fresh);
+            assert_eq!(data.sample_age_ms, Some(10_000));
+            let json = serde_json::to_value(&data).unwrap();
+            assert_eq!(json["group"], group.as_str());
+            let metrics = json["metrics"].as_object().unwrap();
+            assert_eq!(metrics.len(), keys.len());
+            assert!(keys.iter().all(|key| metrics.contains_key(*key)));
+            let decoded: SystemMonitoringCurrent = serde_json::from_value(json).unwrap();
+            assert_eq!(decoded, data);
+            assert_eq!(
+                build_current(
+                    Some(&snapshot),
+                    group,
+                    sampled_since + std::time::Duration::from_millis(10_001)
+                )
+                .unwrap()
+                .status,
+                SystemMonitoringCurrentStatus::Stale
+            );
+            let empty = build_current(None, group, sampled_since).unwrap();
+            assert_eq!(empty.status, SystemMonitoringCurrentStatus::Unavailable);
+            assert!(empty.sampled_at.is_none());
+            assert!(empty.sample_age_ms.is_none());
+            assert!(
+                serde_json::to_value(empty).unwrap()["metrics"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(serde_json::Value::is_null)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn current_route_requires_group_and_reads_cache_without_history() {
+        let state = Arc::new(crate::test_support::setup_test_state().await);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                system_monitoring_router().with_state(server_state),
+            )
+            .await
+            .unwrap();
+        });
+        let client = reqwest::Client::new();
+        for path in [
+            "/current",
+            "/current?group=invalid",
+            "/current?group=cpu&range=1h",
+        ] {
+            assert_eq!(
+                client
+                    .get(format!("http://{address}{path}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16(),
+                400
+            );
+        }
+        let data: serde_json::Value = client
+            .get(format!("http://{address}/current?group=cpu"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(data["data"]["group"], "cpu");
+        assert_eq!(data["data"]["status"], "unavailable");
+        assert!(state.system_monitoring.current.read().await.is_none());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM system_monitoring_samples")
+            .fetch_one(&state.metadata_db)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        server.abort();
+    }
+
+    /// 构造不依赖其他来源质量的原始历史样本。
+    fn sample(sampled_at: i64) -> StoredSample {
+        StoredSample {
+            sampled_at,
+            cpu_percent: Some(0.0),
+            memory_used_bytes: Some(50),
+            memory_total_bytes: Some(100),
+            memory_percent: Some(50.0),
+            swap_percent: Some(25.0),
+            load_average_1m: Some(1.0),
+            load_average_5m: None,
+            load_average_15m: Some(3.0),
+            disk_read_bytes: Some(100),
+            disk_write_bytes: Some(200),
+            network_receive_bytes: Some(300),
+            network_transmit_bytes: Some(400),
+        }
+    }
+
+    #[test]
+    fn grouped_history_preserves_gaps_nulls_and_zero_rates() {
+        let rows = vec![sample(940), sample(1000), sample(1060)];
+        let cpu = build_series_points(&rows, 1000, 1180, 60, SystemMonitoringGroup::Cpu).unwrap();
+        assert_eq!(cpu.len(), 3);
+        assert_eq!(cpu[0].coverage_percent, 100.0);
+        assert_eq!(cpu[0].metrics.cpu_percent, Some(0.0));
+        assert_eq!(cpu[2].coverage_percent, 0.0);
+        assert_eq!(cpu[2].metrics.cpu_percent, None);
+        let load = build_series_points(&rows, 1000, 1180, 60, SystemMonitoringGroup::Load).unwrap();
+        assert!((load[0].coverage_percent - 200.0 / 3.0).abs() < 0.001);
+        let disk =
+            build_series_points(&rows, 1000, 1180, 60, SystemMonitoringGroup::DiskIo).unwrap();
+        assert_eq!(disk[0].metrics.disk_read_bytes_per_second, Some(0.0));
+        assert_eq!(disk[0].coverage_percent, 100.0);
+        let first = build_series_points(&rows[1..], 1000, 1180, 60, SystemMonitoringGroup::Network)
+            .unwrap();
+        assert_eq!(first[0].metrics.network_receive_bytes_per_second, None);
+        assert_eq!(first[0].coverage_percent, 0.0);
+    }
+
+    #[test]
+    fn swap_history_aggregates_zero_values_and_preserves_missing_buckets() {
+        let mut first = sample(1000);
+        first.swap_percent = Some(0.0);
+        let mut second = sample(1060);
+        second.swap_percent = Some(50.0);
+        let points = build_series_points(
+            &[first, second],
+            1000,
+            1360,
+            120,
+            SystemMonitoringGroup::Memory,
+        )
+        .unwrap();
+        assert_eq!(points[0].metrics.swap_percent, Some(25.0));
+        assert_eq!(points[1].metrics.swap_percent, None);
+        let projected =
+            serde_json::to_value(project_series(SystemMonitoringGroup::Memory, points)).unwrap();
+        assert_eq!(projected["points"][0]["metrics"]["swapPercent"], 25.0);
+        assert!(projected["points"][1]["metrics"]["swapPercent"].is_null());
+    }
+
+    #[tokio::test]
+    async fn grouped_api_round_trips_only_requested_metrics_and_removes_overview() {
+        use axum::body::to_bytes;
+        let state = Arc::new(crate::test_support::setup_test_state().await);
+        let now = Utc::now().timestamp();
+        sqlx::query("INSERT INTO system_monitoring_samples (sampled_at, cpu_percent, memory_percent, load_average_1m, load_average_5m, load_average_15m, disk_read_bytes, disk_write_bytes, network_receive_bytes, network_transmit_bytes, available_source_count) VALUES (?, 0, 50, 1, NULL, 3, 100, 200, 300, 400, 1)")
+            .bind(now - 60).execute(&state.metadata_db).await.unwrap();
+        *state.system_monitoring.collection_state.write().await =
+            SystemMonitoringCollectionState::Stopped;
+        for (group, fields) in [
+            (
+                SystemMonitoringGroup::Load,
+                vec!["loadAverage1m", "loadAverage5m", "loadAverage15m"],
+            ),
+            (SystemMonitoringGroup::Cpu, vec!["cpuPercent"]),
+            (
+                SystemMonitoringGroup::Memory,
+                vec!["memoryPercent", "swapPercent"],
+            ),
+            (
+                SystemMonitoringGroup::DiskIo,
+                vec!["diskReadBytesPerSecond", "diskWriteBytesPerSecond"],
+            ),
+            (
+                SystemMonitoringGroup::Network,
+                vec![
+                    "networkReceiveBytesPerSecond",
+                    "networkTransmitBytesPerSecond",
+                ],
+            ),
+        ] {
+            let response = series(
+                State(Arc::clone(&state)),
+                Query(SystemMonitoringSeriesQuery {
+                    group,
+                    range: "1h".into(),
+                    sort: "asc".into(),
+                    limit: 500,
+                    cursor: None,
+                }),
+            )
+            .await
+            .unwrap();
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let data = &body["data"];
+            assert_eq!(data["group"], group.as_str());
+            assert_eq!(data["collectionState"], "stopped");
+            assert_eq!(data["expectedPointCount"], 60);
+            assert_eq!(data["points"].as_array().unwrap().len(), 60);
+            for point in data["points"].as_array().unwrap() {
+                let metrics = point["metrics"].as_object().unwrap();
+                assert_eq!(metrics.len(), fields.len());
+                assert!(fields.iter().all(|field| metrics.contains_key(*field)));
+            }
+            // 模拟 Master 的强类型解码和重新编码，保证字段不膨胀。
+            let decoded: SystemMonitoringSeriesPage = serde_json::from_value(data.clone()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), *data);
+        }
+        let response = series(
+            State(Arc::clone(&state)),
+            Query(SystemMonitoringSeriesQuery {
+                group: SystemMonitoringGroup::Cpu,
+                range: "1h".into(),
+                sort: "desc".into(),
+                limit: 2,
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["data"]["points"].as_array().unwrap().len(), 2);
+        assert_eq!(body["data"]["pageInfo"]["nextCursor"], "2");
+
+        // 使用真实路由验证已删除接口，以及 Query 提取器对缺失/非法分组的拒绝。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, system_monitoring_router().with_state(state))
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::new();
+        for (path, status) in [
+            ("/overview", 404),
+            ("/series?range=1h", 400),
+            ("/series?group=invalid", 400),
+        ] {
+            assert_eq!(
+                client
+                    .get(format!("http://{address}{path}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16(),
+                status
+            );
+        }
+        server.abort();
+    }
+
+    #[test]
+    fn grouped_payload_is_smaller_than_full_metrics() {
+        let metrics = sample(1000).to_raw().metrics(Some(&sample(940).to_raw()));
+        let point = SystemMonitoringSeriesPoint {
+            sampled_at: "2026-11-06T00:00:00Z".into(),
+            coverage_percent: 100.0,
+            metrics,
+        };
+        let full = serde_json::to_vec(&point).unwrap().len();
+        for group in [
+            SystemMonitoringGroup::Load,
+            SystemMonitoringGroup::Cpu,
+            SystemMonitoringGroup::Memory,
+            SystemMonitoringGroup::DiskIo,
+            SystemMonitoringGroup::Network,
+        ] {
+            let value = serde_json::to_value(project_series(group, vec![point.clone()])).unwrap();
+            assert!(serde_json::to_vec(&value["points"][0]).unwrap().len() < full);
+        }
+    }
 
     #[test]
     fn range_uses_stable_resolution() {

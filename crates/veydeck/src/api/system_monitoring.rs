@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{net::IpAddr, sync::Arc};
 use veydeck_contracts::monitoring::{
-    SystemMonitoringOverview, SystemMonitoringSeriesPage, SystemMonitoringSettings,
+    SystemMonitoringCurrent, SystemMonitoringCurrentQuery, SystemMonitoringGroup,
+    SystemMonitoringSeriesPage, SystemMonitoringSettings,
 };
 
 use crate::{
@@ -31,6 +32,7 @@ const AGENT_BASE_PATH: &str = "/api/v1/agent/system-monitoring";
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SeriesQuery {
+    group: SystemMonitoringGroup,
     #[serde(default = "default_range")]
     range: String,
     #[serde(default = "default_sort")]
@@ -56,7 +58,7 @@ struct ClearHistoryResult {
 /// 构建单节点系统监控路由。
 pub fn system_monitoring_router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/{node_id}/system-monitoring/overview", get(overview))
+        .route("/{node_id}/system-monitoring/current", get(current))
         .route("/{node_id}/system-monitoring/series", get(series))
         .route(
             "/{node_id}/system-monitoring/settings",
@@ -68,20 +70,21 @@ pub fn system_monitoring_router() -> Router<Arc<AppState>> {
         )
 }
 
-async fn overview(
+/// 通过既有节点访问边界读取当前分组缓存。
+async fn current(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
+    Query(query): Query<SystemMonitoringCurrentQuery>,
 ) -> ApiResult<Response> {
     let client = node_client(&state, &node_id).await?;
-    let mut data: SystemMonitoringOverview = client
-        .get_domain(&format!("{AGENT_BASE_PATH}/overview"))
+    let data: SystemMonitoringCurrent = client
+        .get_domain(&format!(
+            "{AGENT_BASE_PATH}/current?group={}",
+            query.group.as_str()
+        ))
         .await?;
-    apply_capabilities(
-        &mut data.capabilities.can_manage_collection,
-        &mut data.capabilities.can_clear_history,
-    );
     Ok(
-        ApiResponse::success_with_raw("System monitoring overview loaded", Some(data))
+        ApiResponse::success_with_raw("System monitoring current loaded", Some(data))
             .into_response(),
     )
 }
@@ -93,15 +96,7 @@ async fn series(
 ) -> ApiResult<Response> {
     validate_series_query(&query)?;
     let client = node_client(&state, &node_id).await?;
-    let cursor = query
-        .cursor
-        .as_ref()
-        .map(|value| format!("&cursor={value}"))
-        .unwrap_or_default();
-    let path = format!(
-        "{AGENT_BASE_PATH}/series?range={}&sort={}&limit={}{}",
-        query.range, query.sort, query.limit, cursor
-    );
+    let path = series_agent_path(&query);
     let data: SystemMonitoringSeriesPage = client.get_domain(&path).await?;
     Ok(
         ApiResponse::success_with_raw("System monitoring series loaded", Some(data))
@@ -316,6 +311,23 @@ fn apply_capabilities(can_manage: &mut bool, can_clear: &mut bool) {
     *can_clear = true;
 }
 
+/// 构造已校验的历史查询，完整传递分组与分页参数。
+fn series_agent_path(query: &SeriesQuery) -> String {
+    let cursor = query
+        .cursor
+        .as_ref()
+        .map(|value| format!("&cursor={value}"))
+        .unwrap_or_default();
+    format!(
+        "{AGENT_BASE_PATH}/series?group={}&range={}&sort={}&limit={}{}",
+        query.group.as_str(),
+        query.range,
+        query.sort,
+        query.limit,
+        cursor
+    )
+}
+
 fn validate_series_query(query: &SeriesQuery) -> ApiResult<()> {
     if !["1h", "6h", "24h", "3d", "7d"].contains(&query.range.as_str())
         || !["asc", "desc"].contains(&query.sort.as_str())
@@ -351,8 +363,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn current_query_requires_only_a_valid_group() {
+        assert!(serde_json::from_value::<SystemMonitoringCurrentQuery>(json!({})).is_err());
+        assert!(
+            serde_json::from_value::<SystemMonitoringCurrentQuery>(json!({"group": "invalid"}))
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<SystemMonitoringCurrentQuery>(
+                json!({"group": "cpu", "range": "1h"})
+            )
+            .is_err()
+        );
+        for group in ["load", "cpu", "memory", "diskIo", "network"] {
+            let query: SystemMonitoringCurrentQuery =
+                serde_json::from_value(json!({"group": group})).unwrap();
+            assert_eq!(query.group.as_str(), group);
+        }
+    }
+
+    #[test]
+    fn group_is_required_validated_and_forwarded() {
+        assert!(serde_json::from_value::<SeriesQuery>(json!({"range": "1h"})).is_err());
+        assert!(serde_json::from_value::<SeriesQuery>(json!({"group": "unknown"})).is_err());
+        for group in ["load", "cpu", "memory", "diskIo", "network"] {
+            let query: SeriesQuery = serde_json::from_value(json!({
+                "group": group, "range": "6h", "sort": "desc", "limit": 2, "cursor": "4"
+            }))
+            .unwrap();
+            validate_series_query(&query).unwrap();
+            assert_eq!(
+                series_agent_path(&query),
+                format!(
+                    "{AGENT_BASE_PATH}/series?group={group}&range=6h&sort=desc&limit=2&cursor=4"
+                )
+            );
+        }
+    }
+
+    #[test]
     fn rejects_unsafe_or_unbounded_series_query() {
         let invalid = SeriesQuery {
+            group: SystemMonitoringGroup::Load,
             range: "24h&cursor=forged".to_string(),
             sort: "asc".to_string(),
             limit: 500,

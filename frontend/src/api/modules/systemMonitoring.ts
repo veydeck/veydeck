@@ -5,7 +5,7 @@
 
 import http from '@/api'
 import type {
-  SystemMonitoringOverview,
+  SystemMonitoringCurrent,
   SystemMonitoringSeriesPage,
   SystemMonitoringSettings,
 } from '@/api/generated'
@@ -25,12 +25,18 @@ const nodePath = (nodeId: string, suffix: string) =>
   `/node/${encodeURIComponent(nodeId || 'local')}/system-monitoring${suffix}`
 
 export const systemMonitoringApi = {
-  fetchOverview(nodeId: string) {
-    return http.get<SystemMonitoringOverview>(nodePath(nodeId, '/overview'))
+  /** 读取当前指标组的实时缓存，不触发主机采样。 */
+  fetchCurrent(nodeId: string, group: SystemMonitoringCurrent['group']) {
+    return http.get<SystemMonitoringCurrent>(nodePath(nodeId, '/current'), { group })
   },
-  fetchSeries(nodeId: string, range: SystemMonitoringRange) {
+  fetchSeries(
+    nodeId: string,
+    range: SystemMonitoringRange,
+    group: SystemMonitoringSeriesPage['group'],
+  ) {
     return http.get<SystemMonitoringSeriesPage>(nodePath(nodeId, '/series'), {
       range,
+      group,
       sort: 'asc',
       limit: 500,
     })

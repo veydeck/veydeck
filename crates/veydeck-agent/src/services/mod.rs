@@ -24,6 +24,7 @@ pub mod script_terminal;
 pub mod settings;
 pub mod system_metrics;
 pub mod system_monitoring;
+mod system_monitoring_resources;
 pub mod task_scheduler;
 pub mod upgrade;
 pub mod websocket;

@@ -4,23 +4,22 @@ use chrono::Utc;
 use sqlx::FromRow;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use sysinfo::{Networks, System};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, warn};
 use veydeck_contracts::monitoring::{
-    SystemMonitoringCollectionState, SystemMonitoringMetrics, SystemMonitoringSourceState,
-    SystemMonitoringSourceStatus,
+    CurrentCpuMetrics, CurrentMemoryMetrics, SystemMonitoringCollectionState,
+    SystemMonitoringMetrics, SystemMonitoringSourceState, SystemMonitoringSourceStatus,
 };
 
+use super::system_monitoring_resources::{cpu_usage, read_cpu_times, read_memory};
 use crate::state::DbPool;
 
 /// 实时采样间隔。
 pub const LIVE_SAMPLE_INTERVAL_SECONDS: u64 = 5;
 /// 历史持久化间隔。
 pub const HISTORY_SAMPLE_INTERVAL_SECONDS: u32 = 60;
-/// 实时快照超过该时间后视为过期。
-pub const STALE_AFTER_SECONDS: i64 = 10;
 /// 两次累计计数采样间隔超过该时间时不计算速率。
 pub const MAX_RATE_INTERVAL_SECONDS: i64 = 150;
 const SOURCE_COUNT: u8 = 5;
@@ -40,6 +39,7 @@ pub struct RawHostMetricSample {
     pub memory_used_bytes: Option<u64>,
     pub memory_total_bytes: Option<u64>,
     pub memory_percent: Option<f64>,
+    pub swap_percent: Option<f64>,
     pub load_average_1m: Option<f64>,
     pub load_average_5m: Option<f64>,
     pub load_average_15m: Option<f64>,
@@ -76,6 +76,7 @@ impl RawHostMetricSample {
             memory_used_bytes: self.memory_used_bytes,
             memory_total_bytes: self.memory_total_bytes,
             memory_percent: self.memory_percent,
+            swap_percent: self.swap_percent,
             load_average_1m: self.load_average_1m,
             load_average_5m: self.load_average_5m,
             load_average_15m: self.load_average_15m,
@@ -99,10 +100,20 @@ impl RawHostMetricSample {
     }
 }
 
-/// 系统监控共享运行时，不把读取请求转换为新的主机采样。
+/// 同次实时采样的原子快照，不依赖历史存储生命周期。
+#[derive(Debug, Clone)]
+pub struct CurrentHostSnapshot {
+    pub sampled_at: i64,
+    /// 实时采样起始的单调时刻，不受系统时间校准影响。
+    pub sampled_since: Instant,
+    pub metrics: SystemMonitoringMetrics,
+    pub cpu: CurrentCpuMetrics,
+    pub memory: CurrentMemoryMetrics,
+}
+
+/// 系统监控采集设置、生命周期与维护互斥状态。
 pub struct SystemMonitoringRuntime {
-    pub latest_sample: RwLock<Option<RawHostMetricSample>>,
-    pub previous_sample: RwLock<Option<RawHostMetricSample>>,
+    pub current: RwLock<Option<CurrentHostSnapshot>>,
     pub settings: RwLock<SystemMonitoringStorageSettings>,
     pub collection_state: RwLock<SystemMonitoringCollectionState>,
     pub maintenance: Mutex<()>,
@@ -118,8 +129,7 @@ impl SystemMonitoringRuntime {
             SystemMonitoringCollectionState::Stopped
         };
         Ok(Self {
-            latest_sample: RwLock::new(None),
-            previous_sample: RwLock::new(None),
+            current: RwLock::new(None),
             settings: RwLock::new(settings),
             collection_state: RwLock::new(collection_state),
             maintenance: Mutex::new(()),
@@ -134,16 +144,20 @@ pub fn spawn_sampler(pool: DbPool, runtime: Arc<SystemMonitoringRuntime>) {
         let mut ticker = tokio::time::interval(Duration::from_secs(LIVE_SAMPLE_INTERVAL_SECONDS));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_persisted_at = 0_i64;
+        let mut previous = None;
 
         loop {
             ticker.tick().await;
-            let sample = sampler.sample();
-            {
-                let mut previous = runtime.previous_sample.write().await;
-                let mut latest = runtime.latest_sample.write().await;
-                *previous = latest.take();
-                *latest = Some(sample.clone());
-            }
+            let sampled_since = Instant::now();
+            let (sample, cpu, memory) = sampler.sample();
+            *runtime.current.write().await = Some(CurrentHostSnapshot {
+                sampled_at: sample.sampled_at,
+                sampled_since,
+                metrics: sample.metrics(previous.as_ref()),
+                cpu,
+                memory,
+            });
+            previous = Some(sample.clone());
 
             let settings = *runtime.settings.read().await;
             if !settings.history_collection_enabled {
@@ -196,12 +210,12 @@ async fn persist_sample(
     sqlx::query(
         r#"
         INSERT OR REPLACE INTO system_monitoring_samples (
-            sampled_at, cpu_percent, memory_used_bytes, memory_total_bytes, memory_percent,
+            sampled_at, cpu_percent, memory_used_bytes, memory_total_bytes, memory_percent, swap_percent,
             load_average_1m, load_average_5m, load_average_15m,
             disk_read_bytes, disk_write_bytes,
             network_receive_bytes, network_transmit_bytes,
             available_source_count, source_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(sample.sampled_at)
@@ -209,6 +223,7 @@ async fn persist_sample(
     .bind(as_i64(sample.memory_used_bytes))
     .bind(as_i64(sample.memory_total_bytes))
     .bind(sample.memory_percent)
+    .bind(sample.swap_percent)
     .bind(sample.load_average_1m)
     .bind(sample.load_average_5m)
     .bind(sample.load_average_15m)
@@ -247,37 +262,30 @@ fn as_i64(value: Option<u64>) -> Option<i64> {
 }
 
 struct HostSampler {
-    system: System,
     networks: Networks,
-    cpu_ready: bool,
+    previous_cpu: Option<[u64; 8]>,
 }
 
 impl HostSampler {
     fn new() -> Self {
         Self {
-            system: System::new_all(),
             networks: Networks::new_with_refreshed_list(),
-            cpu_ready: false,
+            previous_cpu: None,
         }
     }
 
-    fn sample(&mut self) -> RawHostMetricSample {
-        self.system.refresh_cpu_usage();
-        self.system.refresh_memory();
+    /// 同时构建历史原始样本和实时细项，保证两条展示链路口径一致。
+    fn sample(&mut self) -> (RawHostMetricSample, CurrentCpuMetrics, CurrentMemoryMetrics) {
         self.networks.refresh();
         let sampled_at = Utc::now().timestamp();
-
-        let cpu_percent = self
-            .cpu_ready
-            .then(|| f64::from(self.system.global_cpu_info().cpu_usage()));
-        self.cpu_ready = true;
-        let memory_total_bytes =
-            (self.system.total_memory() > 0).then_some(self.system.total_memory());
-        let memory_used_bytes =
-            memory_total_bytes.map(|total| total.saturating_sub(self.system.available_memory()));
-        let memory_percent = memory_used_bytes
-            .zip(memory_total_bytes)
-            .map(|(used, total)| used as f64 / total as f64 * 100.0);
+        let times = read_cpu_times();
+        let cpu = cpu_usage(times, self.previous_cpu);
+        self.previous_cpu = times;
+        let memory = read_memory();
+        let cpu_percent = cpu.cpu_percent;
+        let memory_total_bytes = memory.total_bytes;
+        let memory_used_bytes = memory.used_bytes;
+        let memory_percent = memory.usage_percent;
         let load = System::load_average();
         let disk = collect_disk_io_totals();
         let network = collect_network_io_totals(&self.networks);
@@ -297,21 +305,26 @@ impl HostSampler {
             .map(|value| (value.received_bytes, value.transmitted_bytes))
             .unzip();
 
-        RawHostMetricSample {
-            sampled_at,
-            cpu_percent,
-            memory_used_bytes,
-            memory_total_bytes,
-            memory_percent,
-            load_average_1m: Some(load.one),
-            load_average_5m: Some(load.five),
-            load_average_15m: Some(load.fifteen),
-            disk_read_bytes,
-            disk_write_bytes,
-            network_receive_bytes,
-            network_transmit_bytes,
-            source_statuses: sources,
-        }
+        (
+            RawHostMetricSample {
+                sampled_at,
+                cpu_percent,
+                memory_used_bytes,
+                memory_total_bytes,
+                memory_percent,
+                swap_percent: memory.swap_percent,
+                load_average_1m: Some(load.one),
+                load_average_5m: Some(load.five),
+                load_average_15m: Some(load.fifteen),
+                disk_read_bytes,
+                disk_write_bytes,
+                network_receive_bytes,
+                network_transmit_bytes,
+                source_statuses: sources,
+            },
+            cpu,
+            memory,
+        )
     }
 }
 
@@ -437,6 +450,7 @@ mod tests {
             memory_used_bytes: Some(0),
             memory_total_bytes: Some(1),
             memory_percent: Some(0.0),
+            swap_percent: Some(25.0),
             load_average_1m: Some(0.0),
             load_average_5m: Some(0.0),
             load_average_15m: Some(0.0),
@@ -446,6 +460,59 @@ mod tests {
             network_transmit_bytes: network,
             source_statuses: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn swap_history_is_persisted_without_filling_unknown_samples() {
+        let pool = crate::test_support::setup_test_db().await;
+        let mut current = sample(Utc::now().timestamp(), Some(100), Some(100));
+        persist_sample(&pool, &current, 7).await.unwrap();
+        let stored: Option<f64> = sqlx::query_scalar(
+            "SELECT swap_percent FROM system_monitoring_samples WHERE sampled_at = ?",
+        )
+        .bind(current.sampled_at)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, Some(25.0));
+        current.sampled_at += 60;
+        current.swap_percent = None;
+        persist_sample(&pool, &current, 7).await.unwrap();
+        let stored: Option<f64> = sqlx::query_scalar(
+            "SELECT swap_percent FROM system_monitoring_samples WHERE sampled_at = ?",
+        )
+        .bind(current.sampled_at)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, None);
+    }
+
+    #[tokio::test]
+    async fn disabled_history_still_publishes_current_samples() {
+        let pool = crate::test_support::setup_test_db().await;
+        let runtime = Arc::new(SystemMonitoringRuntime::load(&pool).await.unwrap());
+        runtime.settings.write().await.history_collection_enabled = false;
+        spawn_sampler(pool.clone(), Arc::clone(&runtime));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if runtime.current.read().await.is_some()
+                    && *runtime.collection_state.read().await
+                        == SystemMonitoringCollectionState::Stopped
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM system_monitoring_samples")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(runtime.current.read().await.as_ref().unwrap().sampled_at > 0);
     }
 
     #[test]
