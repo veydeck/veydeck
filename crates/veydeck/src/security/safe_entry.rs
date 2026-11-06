@@ -243,7 +243,7 @@ fn safe_entry_notice() -> Response {
     <p>Secure login access is enabled for this environment. Open the panel with the secure login URL provided by the host command.</p>
     <div class="command">
       <div class="label">View login URL on host</div>
-      <code>veydeckctl info</code>
+      <code>sudo veydeckctl info</code>
     </div>
   </main>
 </body>
