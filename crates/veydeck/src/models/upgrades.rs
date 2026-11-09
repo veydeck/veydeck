@@ -429,7 +429,11 @@ pub async fn list_schedulable_targets(pool: &DbPool) -> sqlx::Result<Vec<Upgrade
           ON p.plan_id = t.plan_id
         WHERE p.status = 'running'
           AND t.status IN ('pending', 'deferred', 'running')
-        ORDER BY t.created_at ASC
+        ORDER BY CASE
+            WHEN t.target_type = 'controller' THEN 0
+            WHEN t.node_id = 'local' THEN 1
+            ELSE 2
+        END, t.created_at ASC
         LIMIT 50
         "#,
     )

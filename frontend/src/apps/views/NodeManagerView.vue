@@ -260,17 +260,20 @@ const detailLastSeen = computed(() => {
   const lastSeen = selectedNodeDetail.value?.node.lastSeenAt || detailNode.value.lastSeenAt
   return lastSeen ? formatDateTime(lastSeen) : ''
 })
-const deploymentFailed = computed(() => Boolean(
-  selectedNodeDetail.value?.provisioning?.lastDeployResultStatus === 'failed'
-  || selectedNodeDetail.value?.provisioning?.lastDeployErrorSummary
-  || detailNode.value?.status === 'deploy_failed',
-))
+const deploymentFailed = computed(() =>
+  Boolean(
+    selectedNodeDetail.value?.provisioning?.lastDeployResultStatus === 'failed' ||
+    selectedNodeDetail.value?.provisioning?.lastDeployErrorSummary ||
+    detailNode.value?.status === 'deploy_failed',
+  ),
+)
 
 /** 将服务端枚举映射为面向用户的文案，未知状态不着色。 */
 const detailValueLabel = (kind: 'runtime' | 'method', value?: string) => {
-  const values = kind === 'runtime'
-    ? ['active', 'expired', 'closed', 'revoked', 'superseded']
-    : ['ssh_push', 'ssh_upgrade', 'ssh_repair', 'inventory_create', 'inventory_update']
+  const values =
+    kind === 'runtime'
+      ? ['active', 'expired', 'closed', 'revoked', 'superseded']
+      : ['ssh_push', 'ssh_upgrade', 'ssh_repair', 'inventory_create', 'inventory_update']
   return value && values.includes(value)
     ? t(`app.nodes.detail.${kind}.${value}`)
     : t('app.nodes.status.unknown')
@@ -285,9 +288,15 @@ const nodeDeployDetailItems = computed(() => {
     ? `${address.includes(':') && !address.startsWith('[') ? `[${address}]` : address}:${provisioning.sshPort ?? 22}`
     : t('app.nodes.status.unknown')
   return [
-    { label: t('app.nodes.detail.deployMethod'), value: detailValueLabel('method', provisioning.deployMethod) },
+    {
+      label: t('app.nodes.detail.deployMethod'),
+      value: detailValueLabel('method', provisioning.deployMethod),
+    },
     { label: t('app.nodes.detail.sshTarget'), value: sshTarget },
-    { label: t('app.nodes.detail.installDir'), value: provisioning.installDir || t('app.nodes.status.unknown') },
+    {
+      label: t('app.nodes.detail.installDir'),
+      value: provisioning.installDir || t('app.nodes.status.unknown'),
+    },
     { label: t('app.nodes.detail.deployAt'), value: formatDateTime(provisioning.lastDeployAt) },
   ]
 })
@@ -297,16 +306,34 @@ const nodeDiagnosticItems = computed(() => {
   const node = selectedNodeDetail.value?.node
   const session = selectedNodeDetail.value?.session
   const items = [
-    { label: t('app.nodes.detail.lifecycleStatus'), value: statusLabel((node?.lifecycleStatus || detailNode.value?.lifecycleStatus) as NodeStatus) },
-    { label: t('app.nodes.detail.runtimeStatus'), value: detailValueLabel('runtime', node?.runtimeStatus) },
-    { label: t('app.nodes.detail.healthStatus'), value: statusLabel(node?.healthStatus as NodeStatus) },
+    {
+      label: t('app.nodes.detail.lifecycleStatus'),
+      value: statusLabel(
+        (node?.lifecycleStatus || detailNode.value?.lifecycleStatus) as NodeStatus,
+      ),
+    },
+    {
+      label: t('app.nodes.detail.runtimeStatus'),
+      value: detailValueLabel('runtime', node?.runtimeStatus),
+    },
+    {
+      label: t('app.nodes.detail.healthStatus'),
+      value: statusLabel(node?.healthStatus as NodeStatus),
+    },
   ]
-  if (session) items.push(
-    { label: t('app.nodes.detail.sessionId'), value: session.sessionId },
-    { label: t('app.nodes.detail.registeredAt'), value: formatDateTime(session.registeredAt) },
-    { label: t('app.nodes.detail.lastHeartbeatAt'), value: formatDateTime(session.lastHeartbeatAt) },
-    { label: t('app.nodes.detail.leaseExpiresAt'), value: formatDateTime(session.leaseExpiresAt) },
-  )
+  if (session)
+    items.push(
+      { label: t('app.nodes.detail.sessionId'), value: session.sessionId },
+      { label: t('app.nodes.detail.registeredAt'), value: formatDateTime(session.registeredAt) },
+      {
+        label: t('app.nodes.detail.lastHeartbeatAt'),
+        value: formatDateTime(session.lastHeartbeatAt),
+      },
+      {
+        label: t('app.nodes.detail.leaseExpiresAt'),
+        value: formatDateTime(session.leaseExpiresAt),
+      },
+    )
   return items
 })
 
@@ -333,7 +360,7 @@ watch(
   { deep: true },
 )
 
-/** 判断节点是否允许独立升级（排除 local 节点，且必须在线） */
+/** 判断节点是否允许同步主控版本（排除本地节点，且必须在线） */
 const isNodeUpgradable = (node: NodeSummary) => {
   return node.id !== 'local' && node.status === 'online'
 }
@@ -373,7 +400,7 @@ const closeCheckDrawer = () => {
 
 const detailNodeId = ref<string | null>(null)
 const detailNode = computed(() => nodes.value.find((node) => node.id === detailNodeId.value))
-const selectedNodeName = computed(() => detailNode.value ? nodeDisplayName(detailNode.value) : '')
+const selectedNodeName = computed(() => (detailNode.value ? nodeDisplayName(detailNode.value) : ''))
 const detailError = ref(false)
 let detailRequest = 0
 let loadingDetailId: string | null = null
@@ -414,7 +441,8 @@ const loadSelectedNodeDetail = async (silent = false) => {
 const activateCard = (node: NodeSummary) => {
   menu.value = null
   if (selectionMode.value) {
-    if (isNodeUpgradable(node)) handleSelectChange(node.id, !selectedNodeIds.value.includes(node.id))
+    if (isNodeUpgradable(node))
+      handleSelectChange(node.id, !selectedNodeIds.value.includes(node.id))
     return
   }
   closeNodeDetail()
@@ -427,11 +455,14 @@ const menuNode = computed(() => nodes.value.find((node) => node.id === menu.valu
 const menuActions = computed(() => {
   const node = menuNode.value
   if (!node) return []
-  return [{
-    label: node.id === currentNodeId.value ? t('app.nodes.current') : t('app.nodes.switchToNode'),
-    disabled: node.id === currentNodeId.value || node.status !== 'online',
-    handler: () => switchCurrentNode(node.id),
-  }, ...(node.id === 'local' ? [] : getNodeActions(node))]
+  return [
+    {
+      label: node.id === currentNodeId.value ? t('app.nodes.current') : t('app.nodes.switchToNode'),
+      disabled: node.id === currentNodeId.value || node.status !== 'online',
+      handler: () => switchCurrentNode(node.id),
+    },
+    ...(node.id === 'local' ? [] : getNodeActions(node)),
+  ]
 })
 
 /** 右键与键盘菜单入口共享目标，不触发卡片查看或勾选。 */
@@ -441,14 +472,18 @@ const openNodeMenu = (event: MouseEvent | KeyboardEvent, node: NodeSummary) => {
   const card = event.currentTarget as HTMLElement
   card.focus()
   const rect = card.getBoundingClientRect()
-  menu.value = { nodeId: node.id, x: 'clientX' in event ? event.clientX : rect.left + 16,
-    y: 'clientY' in event ? event.clientY : rect.top + 32 }
+  menu.value = {
+    nodeId: node.id,
+    x: 'clientX' in event ? event.clientX : rect.left + 16,
+    y: 'clientY' in event ? event.clientY : rect.top + 32,
+  }
 }
 
 /** 使用键盘查看卡片或打开其上下文菜单。 */
 const handleCardKeydown = (event: KeyboardEvent, node: NodeSummary) => {
   if (event.target !== event.currentTarget) return
-  if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) openNodeMenu(event, node)
+  if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10'))
+    openNodeMenu(event, node)
   else if (event.key === 'Enter' || event.key === ' ') {
     event.preventDefault()
     activateCard(node)
@@ -1105,12 +1140,18 @@ watch(activeView, () => {
   exitSelection()
 })
 
-watch(() => nodeStore.nodes, () => {
-  selectedNodeIds.value = selectedNodeIds.value.filter((id) => nodes.value.some((node) => node.id === id && isNodeUpgradable(node)))
-  if (menu.value && !menuNode.value) menu.value = null
-  if (detailNodeId.value && !detailNode.value) closeNodeDetail()
-  else void loadSelectedNodeDetail(true)
-}, { deep: true })
+watch(
+  () => nodeStore.nodes,
+  () => {
+    selectedNodeIds.value = selectedNodeIds.value.filter((id) =>
+      nodes.value.some((node) => node.id === id && isNodeUpgradable(node)),
+    )
+    if (menu.value && !menuNode.value) menu.value = null
+    if (detailNodeId.value && !detailNode.value) closeNodeDetail()
+    else void loadSelectedNodeDetail(true)
+  },
+  { deep: true },
+)
 
 onUnmounted(() => {
   nodeStore.startAutoRefresh(10000)
@@ -1141,12 +1182,14 @@ const getNodeNameById = (id: string) => {
 const openUpgradeDialog = async () => {
   if (selectedNodeIds.value.length === 0) return
   upgradeForm.targetVersion = ''
+  releases.value = []
   upgradeForm.overwriteSameVersion = false
   isUpgradeDialogOpen.value = true
   try {
     const res = await upgradesApi.listReleases()
     if (res.success && res.data) {
-      releases.value = res.data.filter((r) => r.upgradeEligible)
+      releases.value = res.data.filter((r) => r.nodeSyncEligible)
+      upgradeForm.targetVersion = releases.value[0]?.version ?? ''
     }
   } catch (err) {
     console.error('Failed to load releases', err)
@@ -1160,6 +1203,7 @@ const submitUpgradePlan = async () => {
   try {
     const payload = {
       targetVersion: upgradeForm.targetVersion,
+      component: 'agent' as const,
       nodeIds: selectedNodeIds.value,
       overwriteSameVersion: upgradeForm.overwriteSameVersion,
     }
@@ -1257,20 +1301,44 @@ onMounted(() => {
               deployFinished ? t('app.nodes.deploy.viewResult') : t('app.nodes.deploy.viewProgress')
             }}
           </VeyButton>
-          <VeyButton v-if="!selectionMode" type="secondary" :class="{ 'upgrade-btn-highlight': showUpgradeGuide }" data-ui="node-select-mode" @click="selectionMode = true">
+          <VeyButton
+            v-if="!selectionMode"
+            type="secondary"
+            :class="{ 'upgrade-btn-highlight': showUpgradeGuide }"
+            data-ui="node-select-mode"
+            @click="selectionMode = true"
+          >
             {{ t('app.nodes.batchUpgrade') }}
           </VeyButton>
           <template v-else>
-            <VeyCheckbox :model-value="isAllSelected" :disabled="nodes.filter(isNodeUpgradable).length === 0" data-ui="node-select-all" @change="handleSelectAll">{{ t('app.nodes.selectAll') }}</VeyCheckbox>
-            <VeyButton type="primary" :disabled="selectedNodeIds.length === 0" data-ui="node-upgrade-selected" @click="openUpgradeDialog">
+            <VeyCheckbox
+              :model-value="isAllSelected"
+              :disabled="nodes.filter(isNodeUpgradable).length === 0"
+              data-ui="node-select-all"
+              @change="handleSelectAll"
+              >{{ t('app.nodes.selectAll') }}</VeyCheckbox
+            >
+            <VeyButton
+              type="primary"
+              :disabled="selectedNodeIds.length === 0"
+              data-ui="node-upgrade-selected"
+              @click="openUpgradeDialog"
+            >
               {{ t('app.nodes.upgradeSelected') }} ({{ selectedNodeIds.length }})
             </VeyButton>
-            <VeyButton type="secondary" data-ui="node-exit-selection" @click="exitSelection">{{ t('app.nodes.exitSelection') }}</VeyButton>
+            <VeyButton type="secondary" data-ui="node-exit-selection" @click="exitSelection">{{
+              t('app.nodes.exitSelection')
+            }}</VeyButton>
           </template>
         </div>
 
         <div class="toolbar-right">
-          <VeySelect v-model="refreshInterval" class="refresh-select" style="width: 150px" :options="refreshOptions" />
+          <VeySelect
+            v-model="refreshInterval"
+            class="refresh-select"
+            style="width: 150px"
+            :options="refreshOptions"
+          />
 
           <VeyButton @click="fetchNodes">{{ t('app.nodes.refresh.manual') }}</VeyButton>
         </div>
@@ -1287,14 +1355,21 @@ onMounted(() => {
       <div :key="detailNodeId || 'closed'" class="detail-body node-detail" data-slot="detail">
         <div v-if="detailNode" class="node-overview" data-ui="node-detail-overview">
           <div class="node-overview-line">
-            <VeyTag :type="statusTagType(detailNode.status)">{{ statusLabel(detailNode.status) }}</VeyTag>
+            <VeyTag :type="statusTagType(detailNode.status)">{{
+              statusLabel(detailNode.status)
+            }}</VeyTag>
             <span class="node-overview-address">{{ detailNode.address || '--' }}</span>
             <span>{{ t('app.nodes.detail.agentVersion') }} {{ detailVersion }}</span>
           </div>
-          <div v-if="detailNode.status === 'online' || detailNode.status === 'degraded'" class="node-overview-resource">
+          <div
+            v-if="detailNode.status === 'online' || detailNode.status === 'degraded'"
+            class="node-overview-resource"
+          >
             {{ resourceLabel(detailNode) }}
           </div>
-          <div v-if="detailLastSeen">{{ t('app.nodes.detail.lastSeenAt') }}: {{ detailLastSeen }}</div>
+          <div v-if="detailLastSeen">
+            {{ t('app.nodes.detail.lastSeenAt') }}: {{ detailLastSeen }}
+          </div>
           <div v-if="detailGroup || detailNode.tags.length" class="node-overview-line">
             <span v-if="detailGroup">{{ t('app.nodes.detail.group') }}: {{ detailGroup }}</span>
             <VeyTag v-for="tag in detailNode.tags" :key="tag">{{ tag }}</VeyTag>
@@ -1302,7 +1377,9 @@ onMounted(() => {
           <p v-if="detailNode.description">{{ detailNode.description }}</p>
         </div>
         <VeyAlert v-if="detailError" type="error" :title="t('app.nodes.detailLoadFailed')" />
-        <VeyButton v-if="detailError" type="secondary" @click="loadSelectedNodeDetail()">{{ t('common.retry') }}</VeyButton>
+        <VeyButton v-if="detailError" type="secondary" @click="loadSelectedNodeDetail()">{{
+          t('common.retry')
+        }}</VeyButton>
         <VeyAlert
           v-if="selectedNodeDetail?.node?.lifecycleStatus === 'conflict'"
           :title="t('app.nodes.detail.conflict')"
@@ -1320,14 +1397,21 @@ onMounted(() => {
             <VeyAlert
               v-if="deploymentFailed"
               type="error"
-              :title="selectedNodeDetail.provisioning.lastDeployErrorSummary || t('app.nodes.status.deployFailed')"
+              :title="
+                selectedNodeDetail.provisioning.lastDeployErrorSummary ||
+                t('app.nodes.status.deployFailed')
+              "
               show-icon
               data-ui="node-deployment-error"
             />
             <VeyDescriptions :items="nodeDeployDetailItems" :column="1" :glass="false" />
           </div>
         </details>
-        <details v-if="selectedNodeDetail" class="node-detail-section" data-ui="node-connection-diagnostics">
+        <details
+          v-if="selectedNodeDetail"
+          class="node-detail-section"
+          data-ui="node-connection-diagnostics"
+        >
           <summary>{{ t('app.nodes.detail.diagnostics') }}</summary>
           <div class="node-detail-section-body">
             <VeyDescriptions :items="nodeDiagnosticItems" :column="1" :glass="false" />
@@ -1480,31 +1564,70 @@ onMounted(() => {
 
     <div v-if="activeView === 'list'" class="node-grid-scroll" data-ui="node-grid">
       <div class="node-grid">
-        <VeyCard v-for="node in nodes" :key="node.id" shadow="never" :glass="false"
+        <VeyCard
+          v-for="node in nodes"
+          :key="node.id"
+          shadow="never"
+          :glass="false"
           :content-style="{ background: 'transparent' }"
-          :style="{ backgroundColor: node.id === currentNodeId ? 'color-mix(in srgb, var(--vdl-primary) 5%, var(--vdl-bg-panel))' : 'var(--vdl-bg-panel)' }"
-          class="node-card" :class="{ 'is-current': node.id === currentNodeId, 'is-selected': selectedNodeIds.includes(node.id) }"
-          role="button" tabindex="0" :aria-label="`${nodeDisplayName(node)} · ${statusLabel(node.status)}${node.id === currentNodeId ? ` · ${t('app.nodes.current')}` : ''}`"
+          :style="{
+            backgroundColor:
+              node.id === currentNodeId
+                ? 'color-mix(in srgb, var(--vdl-primary) 5%, var(--vdl-bg-panel))'
+                : 'var(--vdl-bg-panel)',
+          }"
+          class="node-card"
+          :class="{
+            'is-current': node.id === currentNodeId,
+            'is-selected': selectedNodeIds.includes(node.id),
+          }"
+          role="button"
+          tabindex="0"
+          :aria-label="`${nodeDisplayName(node)} · ${statusLabel(node.status)}${node.id === currentNodeId ? ` · ${t('app.nodes.current')}` : ''}`"
           :aria-pressed="selectionMode ? selectedNodeIds.includes(node.id) : undefined"
           :aria-disabled="selectionMode && !isNodeUpgradable(node) ? true : undefined"
-          data-ui="node-card" :data-node-id="node.id" :data-current="node.id === currentNodeId"
-          @click="activateCard(node)" @keydown="handleCardKeydown($event, node)" @contextmenu="openNodeMenu($event, node)">
+          data-ui="node-card"
+          :data-node-id="node.id"
+          :data-current="node.id === currentNodeId"
+          @click="activateCard(node)"
+          @keydown="handleCardKeydown($event, node)"
+          @contextmenu="openNodeMenu($event, node)"
+        >
           <div class="node-card-heading">
             <div v-if="selectionMode" @click.stop @keydown.stop>
-              <VeyCheckbox :model-value="selectedNodeIds.includes(node.id)" :disabled="!isNodeUpgradable(node)" :aria-label="nodeDisplayName(node)" @change="(value) => handleSelectChange(node.id, value)" />
+              <VeyCheckbox
+                :model-value="selectedNodeIds.includes(node.id)"
+                :disabled="!isNodeUpgradable(node)"
+                :aria-label="nodeDisplayName(node)"
+                @change="(value) => handleSelectChange(node.id, value)"
+              />
             </div>
             <strong class="node-card-name">{{ nodeDisplayName(node) }}</strong>
-            <VeyTag v-if="node.id === currentNodeId" type="primary" data-ui="node-current">{{ t('app.nodes.current') }}</VeyTag>
+            <VeyTag v-if="node.id === currentNodeId" type="primary" data-ui="node-current">{{
+              t('app.nodes.current')
+            }}</VeyTag>
           </div>
           <div class="node-card-address">{{ node.address || '--' }}</div>
           <VeyTag :type="statusTagType(node.status)">{{ statusLabel(node.status) }}</VeyTag>
-          <div v-if="node.status === 'online' || node.status === 'degraded'" class="resource-text">{{ resourceLabel(node) }}</div>
-          <div v-else class="resource-text">{{ t('app.nodes.detail.lastSeenAt') }}: {{ formatDateTime(node.lastSeenAt) }}</div>
+          <div v-if="node.status === 'online' || node.status === 'degraded'" class="resource-text">
+            {{ resourceLabel(node) }}
+          </div>
+          <div v-else class="resource-text">
+            {{ t('app.nodes.detail.lastSeenAt') }}: {{ formatDateTime(node.lastSeenAt) }}
+          </div>
         </VeyCard>
       </div>
       <div v-if="nodes.length === 0" class="empty-state">{{ t('app.nodes.messages.empty') }}</div>
     </div>
-    <NodeContextMenu v-if="menu && menuNode" :key="menu.nodeId" :x="menu.x" :y="menu.y" :label="nodeDisplayName(menuNode)" :actions="menuActions" @close="menu = null" />
+    <NodeContextMenu
+      v-if="menu && menuNode"
+      :key="menu.nodeId"
+      :x="menu.x"
+      :y="menu.y"
+      :label="nodeDisplayName(menuNode)"
+      :actions="menuActions"
+      @close="menu = null"
+    />
 
     <ApplicationDialog
       :visible="isCheckDrawerVisible"
@@ -1577,7 +1700,7 @@ onMounted(() => {
       @background="backgroundDeploy"
     />
 
-    <!-- 弹窗：精细化升级配置 -->
+    <!-- 弹窗：同步节点至主控版本。 -->
     <ApplicationDialog
       :visible="isUpgradeDialogOpen"
       :title="t('app.nodes.upgradeDialog.title')"
@@ -1611,6 +1734,12 @@ onMounted(() => {
           </VeyTag>
         </div>
 
+        <VeyAlert
+          v-if="releases.length === 0"
+          :title="t('app.nodes.upgradeDialog.noReleases')"
+          type="info"
+          data-ui="node-sync-package-missing"
+        />
         <div class="form-group" style="margin-top: 10px">
           <label style="display: block; margin-bottom: 6px; font-weight: 600">
             {{ t('app.nodes.upgradeDialog.targetVersion') }}
@@ -1700,17 +1829,61 @@ onMounted(() => {
   gap: var(--vdl-space-2);
 }
 
-.refresh-select { width: 150px; }
-.node-grid-scroll { flex: 1; min-height: 0; overflow: auto; }
-.node-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr)); gap: var(--vdl-space-3); align-items: start; }
-.node-card { min-width: 0; cursor: pointer; border: 1px solid var(--vdl-border-default); border-radius: var(--vdl-radius-md); background: var(--vdl-bg-panel); }
-.node-card.is-current { border-color: var(--vdl-border-brand); background: color-mix(in srgb, var(--vdl-primary) 5%, var(--vdl-bg-panel)); }
-.node-card.is-selected { outline: 2px dashed var(--vdl-border-brand); outline-offset: -4px; }
-.node-card:focus-visible { outline: 2px solid var(--vdl-primary); outline-offset: -2px; }
-.node-card-heading { display: flex; align-items: center; gap: var(--vdl-space-2); min-width: 0; margin-bottom: var(--vdl-space-2); }
-.node-card-name { min-width: 0; flex: 1; overflow-wrap: anywhere; }
-.node-card-address { font-family: var(--vdl-font-mono); font-size: var(--vdl-font-body-sm); overflow-wrap: anywhere; margin-bottom: var(--vdl-space-2); }
-.node-card .resource-text { margin-top: var(--vdl-space-3); overflow-wrap: anywhere; }
+.refresh-select {
+  width: 150px;
+}
+.node-grid-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.node-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr));
+  gap: var(--vdl-space-3);
+  align-items: start;
+}
+.node-card {
+  min-width: 0;
+  cursor: pointer;
+  border: 1px solid var(--vdl-border-default);
+  border-radius: var(--vdl-radius-md);
+  background: var(--vdl-bg-panel);
+}
+.node-card.is-current {
+  border-color: var(--vdl-border-brand);
+  background: color-mix(in srgb, var(--vdl-primary) 5%, var(--vdl-bg-panel));
+}
+.node-card.is-selected {
+  outline: 2px dashed var(--vdl-border-brand);
+  outline-offset: -4px;
+}
+.node-card:focus-visible {
+  outline: 2px solid var(--vdl-primary);
+  outline-offset: -2px;
+}
+.node-card-heading {
+  display: flex;
+  align-items: center;
+  gap: var(--vdl-space-2);
+  min-width: 0;
+  margin-bottom: var(--vdl-space-2);
+}
+.node-card-name {
+  min-width: 0;
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+.node-card-address {
+  font-family: var(--vdl-font-mono);
+  font-size: var(--vdl-font-body-sm);
+  overflow-wrap: anywhere;
+  margin-bottom: var(--vdl-space-2);
+}
+.node-card .resource-text {
+  margin-top: var(--vdl-space-3);
+  overflow-wrap: anywhere;
+}
 .node-detail {
   container-type: inline-size;
 }

@@ -22,7 +22,7 @@ const nodeStore = vi.hoisted(() => ({
   currentNodeId: 'local',
   refreshNodes: vi.fn().mockResolvedValue(undefined),
   startAutoRefresh: vi.fn(),
-  requestSwitchCurrentNode: vi.fn((_id: string) => ({ switched: true, reason: '' })),
+  requestSwitchCurrentNode: vi.fn(() => ({ switched: true, reason: '' })),
 }))
 const windowManager = vi.hoisted(() => ({
   checkBeforeNodeSwitch: vi.fn(() => ({ allowed: true, blockers: [] })),
@@ -155,6 +155,78 @@ describe('NodeManagerView', () => {
     vi.mocked(upgradesApi.listReleases).mockResolvedValue(response([]) as never)
   })
 
+  it('节点同步只使用后端允许的主控版本，并明确提交节点范围', async () => {
+    nodeStore.nodes.push({
+      id: 'node-1',
+      name: '测试节点',
+      address: '192.0.2.10',
+      status: 'online',
+      tags: [],
+    })
+    vi.mocked(upgradesApi.listReleases).mockResolvedValue(
+      response([
+        { version: '9.0.0', channel: 'stable', upgradeEligible: true, nodeSyncEligible: false },
+        {
+          version: '0.1.0-alpha.3',
+          channel: 'prerelease',
+          upgradeEligible: true,
+          nodeSyncEligible: true,
+        },
+      ]) as never,
+    )
+    const plan = { plan: { planId: 'sync-plan' }, targets: [], events: [] }
+    vi.mocked(upgradesApi.createPlan).mockResolvedValue(response(plan) as never)
+    vi.mocked(upgradesApi.startPlan).mockResolvedValue(response(plan) as never)
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.get('[data-ui="node-select-mode"]').trigger('click')
+    await wrapper.get('[data-ui="node-select-all"] input').setValue(true)
+    await wrapper.get('[data-ui="node-upgrade-selected"]').trigger('click')
+    await flushPromises()
+    const submit = Array.from(document.body.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === '开始同步',
+    )!
+    expect(submit).toBeDefined()
+    expect(submit.disabled).toBe(false)
+    submit.click()
+    await flushPromises()
+    expect(upgradesApi.createPlan).toHaveBeenCalledWith({
+      component: 'agent',
+      targetVersion: '0.1.0-alpha.3',
+      nodeIds: ['node-1'],
+      overwriteSameVersion: false,
+    })
+    expect(upgradesApi.startPlan).toHaveBeenCalledWith('sync-plan')
+    wrapper.unmount()
+  })
+
+  it('没有主控版本包时禁止发起节点同步', async () => {
+    nodeStore.nodes.push({
+      id: 'node-1',
+      name: '测试节点',
+      address: '192.0.2.10',
+      status: 'online',
+      tags: [],
+    })
+    vi.mocked(upgradesApi.listReleases).mockResolvedValue(
+      response([
+        { version: '9.0.0', channel: 'stable', upgradeEligible: true, nodeSyncEligible: false },
+      ]) as never,
+    )
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.get('[data-ui="node-select-mode"]').trigger('click')
+    await wrapper.get('[data-ui="node-select-all"] input').setValue(true)
+    await wrapper.get('[data-ui="node-upgrade-selected"]').trigger('click')
+    await flushPromises()
+    const submit = Array.from(document.body.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === '开始同步',
+    )!
+    expect(submit.disabled).toBe(true)
+    expect(upgradesApi.createPlan).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
   afterEach(() => {
     document.body.innerHTML = ''
     vi.useRealTimers()
@@ -250,10 +322,13 @@ describe('NodeManagerView', () => {
     const windowContent = document.querySelector('.window-content')!
     const windowHeader = document.querySelector('.window-header')!
     const invokeAction = async (label: string) => {
-      await wrapper.get('[data-node-id="node-2"]').trigger('contextmenu', { clientX: 100, clientY: 100 })
+      await wrapper
+        .get('[data-node-id="node-2"]')
+        .trigger('contextmenu', { clientX: 100, clientY: 100 })
       await flushPromises()
-      const button = Array.from(document.querySelectorAll<HTMLButtonElement>('[data-ui="node-context-menu"] button'))
-        .find((item) => item.textContent === label)!
+      const button = Array.from(
+        document.querySelectorAll<HTMLButtonElement>('[data-ui="node-context-menu"] button'),
+      ).find((item) => item.textContent === label)!
       button.click()
       await flushPromises()
     }
@@ -300,7 +375,13 @@ describe('NodeManagerView', () => {
   /** 建立多个不同状态的节点用于卡片交互测试。 */
   const addNodes = () => {
     nodeStore.nodes.push(
-      { id: 'node-a', name: '节点 A', address: '192.0.2.1', status: 'online', tags: ['production'] },
+      {
+        id: 'node-a',
+        name: '节点 A',
+        address: '192.0.2.1',
+        status: 'online',
+        tags: ['production'],
+      },
       { id: 'node-b', name: '节点 B', address: '192.0.2.2', status: 'offline', tags: [] },
     )
   }
@@ -309,8 +390,9 @@ describe('NodeManagerView', () => {
   const menuAction = async (wrapper: ReturnType<typeof mountView>, id: string, label: string) => {
     await wrapper.get(`[data-node-id="${id}"]`).trigger('contextmenu', { clientX: 50, clientY: 50 })
     await flushPromises()
-    return Array.from(document.querySelectorAll<HTMLButtonElement>('[data-ui="node-context-menu"] button'))
-      .find((button) => button.textContent === label)!
+    return Array.from(
+      document.querySelectorAll<HTMLButtonElement>('[data-ui="node-context-menu"] button'),
+    ).find((button) => button.textContent === label)!
   }
 
   it('点击查看独立详情，本地节点不请求远端信息且当前标记保持不变', async () => {
@@ -323,12 +405,18 @@ describe('NodeManagerView', () => {
     expect(nodesApi.detail).toHaveBeenCalledWith('node-a')
     expect(nodeStore.requestSwitchCurrentNode).not.toHaveBeenCalled()
     expect(wrapper.get('[data-node-id="local"]').attributes('data-current')).toBe('true')
-    expect(document.querySelector('[data-ui="node-detail-dialog"]')?.textContent).toContain('节点 A')
+    expect(document.querySelector('[data-ui="node-detail-dialog"]')?.textContent).toContain(
+      '节点 A',
+    )
     await wrapper.get('[data-node-id="local"]').trigger('click')
     await flushPromises()
     expect(nodesApi.detail).toHaveBeenCalledTimes(1)
-    expect(document.querySelector('[data-ui="node-detail-dialog"]')?.textContent).toContain('127.0.0.1')
-    expect(document.querySelector('[data-ui="node-detail-dialog"]')?.textContent).not.toContain('SSH 目标')
+    expect(document.querySelector('[data-ui="node-detail-dialog"]')?.textContent).toContain(
+      '127.0.0.1',
+    )
+    expect(document.querySelector('[data-ui="node-detail-dialog"]')?.textContent).not.toContain(
+      'SSH 目标',
+    )
     wrapper.unmount()
   })
 
@@ -353,7 +441,10 @@ describe('NodeManagerView', () => {
     addNodes()
     const wrapper = mountView()
     await flushPromises()
-    windowManager.checkBeforeNodeSwitch.mockReturnValue({ allowed: false, blockers: [{ title: '终端', reason: '会话活动中' }] } as never)
+    windowManager.checkBeforeNodeSwitch.mockReturnValue({
+      allowed: false,
+      blockers: [{ title: '终端', reason: '会话活动中' }],
+    } as never)
     ;(await menuAction(wrapper, 'node-a', '切换到此节点')).click()
     await flushPromises()
     expect(nodeStore.requestSwitchCurrentNode).not.toHaveBeenCalled()
@@ -383,7 +474,9 @@ describe('NodeManagerView', () => {
     await wrapper.get('[data-node-id="node-a"]').trigger('click')
     expect(wrapper.get('[data-ui="node-upgrade-selected"]').text()).toContain('(1)')
     expect(nodesApi.detail).not.toHaveBeenCalled()
-    useNodeStore().nodes = useNodeStore().nodes.map((node) => node.id === 'node-a' ? { ...node, status: 'offline' } : node)
+    useNodeStore().nodes = useNodeStore().nodes.map((node) =>
+      node.id === 'node-a' ? { ...node, status: 'offline' } : node,
+    )
     await flushPromises()
     expect(wrapper.get('[data-ui="node-upgrade-selected"]').text()).toContain('(0)')
     await wrapper.get('[data-ui="node-exit-selection"]').trigger('click')
@@ -394,8 +487,19 @@ describe('NodeManagerView', () => {
   it('旧详情响应不会覆盖新选择，关闭期间返回的请求也不会重新显示', async () => {
     addNodes()
     let resolveFirst!: (value: never) => void
-    vi.mocked(nodesApi.detail).mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve }))
-    vi.mocked(nodesApi.detail).mockResolvedValueOnce(response({ node: { metadata: { resource: { version: 'B-current' } } }, provisioning: null, session: null }) as never)
+    vi.mocked(nodesApi.detail).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveFirst = resolve
+        }),
+    )
+    vi.mocked(nodesApi.detail).mockResolvedValueOnce(
+      response({
+        node: { metadata: { resource: { version: 'B-current' } } },
+        provisioning: null,
+        session: null,
+      }) as never,
+    )
     const wrapper = mountView()
     await flushPromises()
     await wrapper.get('[data-node-id="node-a"]').trigger('click')
@@ -403,9 +507,15 @@ describe('NodeManagerView', () => {
     await flushPromises()
     resolveFirst(response({ node: { metadata: { resource: { version: 'A-stale' } } } }) as never)
     await flushPromises()
-    expect(document.querySelector('[data-ui="node-detail-dialog"]')?.textContent).toContain('B-current')
-    expect(document.querySelector('[data-ui="node-detail-dialog"]')?.textContent).not.toContain('A-stale')
-    document.querySelector<HTMLButtonElement>('[data-ui="node-detail-dialog"] [aria-label]')?.click()
+    expect(document.querySelector('[data-ui="node-detail-dialog"]')?.textContent).toContain(
+      'B-current',
+    )
+    expect(document.querySelector('[data-ui="node-detail-dialog"]')?.textContent).not.toContain(
+      'A-stale',
+    )
+    document
+      .querySelector<HTMLButtonElement>('[data-ui="node-detail-dialog"] [aria-label]')
+      ?.click()
     await flushPromises()
     const calls = vi.mocked(nodesApi.detail).mock.calls.length
     useNodeStore().nodes = [...useNodeStore().nodes]
@@ -424,7 +534,9 @@ describe('NodeManagerView', () => {
     await flushPromises()
     const menu = document.querySelector<HTMLElement>('[data-ui="node-context-menu"]')!
     expect(menu.contains(document.activeElement)).toBe(true)
-    document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    document.activeElement?.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }),
+    )
     await flushPromises()
     expect(document.querySelector('[data-ui="node-context-menu"]')).toBeNull()
     expect(document.activeElement).toBe(card.element)
@@ -443,31 +555,55 @@ describe('NodeManagerView', () => {
   it('详情关闭后使在途响应失效，同一节点重开不会显示上次请求内容', async () => {
     addNodes()
     let resolveOld!: (value: never) => void
-    vi.mocked(nodesApi.detail).mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve }))
-    vi.mocked(nodesApi.detail).mockResolvedValueOnce(response({ node: { metadata: { resource: { version: 'fresh' } } } }) as never)
+    vi.mocked(nodesApi.detail).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveOld = resolve
+        }),
+    )
+    vi.mocked(nodesApi.detail).mockResolvedValueOnce(
+      response({ node: { metadata: { resource: { version: 'fresh' } } } }) as never,
+    )
     const wrapper = mountView()
     await flushPromises()
     await wrapper.get('[data-node-id="node-a"]').trigger('keydown', { key: 'Enter' })
     await flushPromises()
-    document.querySelector<HTMLButtonElement>('[data-ui="node-detail-dialog"] [aria-label]')?.click()
+    document
+      .querySelector<HTMLButtonElement>('[data-ui="node-detail-dialog"] [aria-label]')
+      ?.click()
     await flushPromises()
     await wrapper.get('[data-node-id="node-a"]').trigger('keydown', { key: 'Enter' })
     await flushPromises()
     resolveOld(response({ node: { metadata: { resource: { version: 'stale' } } } }) as never)
     await flushPromises()
     expect(document.querySelector('[data-ui="node-detail-dialog"]')?.textContent).toContain('fresh')
-    expect(document.querySelector('[data-ui="node-detail-dialog"]')?.textContent).not.toContain('stale')
+    expect(document.querySelector('[data-ui="node-detail-dialog"]')?.textContent).not.toContain(
+      'stale',
+    )
     expect(nodeStore.requestSwitchCurrentNode).not.toHaveBeenCalled()
     wrapper.unmount()
   })
 
   it('详情默认展示概览，部署及连接诊断收起，默认分组不占位置', async () => {
     addNodes()
-    vi.mocked(nodesApi.detail).mockResolvedValue(response({
-      node: { groupName: 'default', lifecycleStatus: 'online', runtimeStatus: 'active', metadata: { resource: { version: '0.1.2' } } },
-      provisioning: { deployMethod: 'ssh_push', sshAddr: '2001:db8::1', sshPort: 22, installDir: '/opt/veydeck', lastDeployResultStatus: 'prepared' },
-      session: { sessionId: 'full-session-identifier', registeredAt: '2026-11-06T00:00:00Z' },
-    }) as never)
+    vi.mocked(nodesApi.detail).mockResolvedValue(
+      response({
+        node: {
+          groupName: 'default',
+          lifecycleStatus: 'online',
+          runtimeStatus: 'active',
+          metadata: { resource: { version: '0.1.2' } },
+        },
+        provisioning: {
+          deployMethod: 'ssh_push',
+          sshAddr: '2001:db8::1',
+          sshPort: 22,
+          installDir: '/opt/veydeck',
+          lastDeployResultStatus: 'prepared',
+        },
+        session: { sessionId: 'full-session-identifier', registeredAt: '2026-11-06T00:00:00Z' },
+      }) as never,
+    )
     const wrapper = mountView()
     await flushPromises()
     await wrapper.get('[data-node-id="node-a"]').trigger('click')
@@ -477,8 +613,12 @@ describe('NodeManagerView', () => {
     expect(overview.textContent).toContain('0.1.2')
     expect(overview.textContent).not.toContain('default')
     expect(overview.textContent).not.toContain('最近可见')
-    const deployment = document.querySelector<HTMLDetailsElement>('[data-ui="node-deployment-details"]')!
-    const diagnostics = document.querySelector<HTMLDetailsElement>('[data-ui="node-connection-diagnostics"]')!
+    const deployment = document.querySelector<HTMLDetailsElement>(
+      '[data-ui="node-deployment-details"]',
+    )!
+    const diagnostics = document.querySelector<HTMLDetailsElement>(
+      '[data-ui="node-connection-diagnostics"]',
+    )!
     expect(deployment.open).toBe(false)
     expect(diagnostics.open).toBe(false)
     expect(deployment.textContent).toContain('SSH 部署')
@@ -492,26 +632,42 @@ describe('NodeManagerView', () => {
     diagnostics.open = true
     await wrapper.get('[data-node-id="node-b"]').trigger('click')
     await flushPromises()
-    expect(document.querySelector<HTMLDetailsElement>('[data-ui="node-connection-diagnostics"]')?.open).toBe(false)
+    expect(
+      document.querySelector<HTMLDetailsElement>('[data-ui="node-connection-diagnostics"]')?.open,
+    ).toBe(false)
     wrapper.unmount()
   })
 
   it('部署失败自动展开错误，离线节点只展示最近在线时间而不显示旧指标', async () => {
     addNodes()
-    vi.mocked(nodesApi.detail).mockResolvedValue(response({
-      node: { lifecycleStatus: 'offline', lastSeenAt: '2026-11-06T00:00:00Z', groupName: 'default' },
-      provisioning: { deployMethod: 'ssh_push', lastDeployResultStatus: 'failed', lastDeployErrorSummary: 'SSH 认证失败', installDir: '/opt/veydeck' },
-    }) as never)
+    vi.mocked(nodesApi.detail).mockResolvedValue(
+      response({
+        node: {
+          lifecycleStatus: 'offline',
+          lastSeenAt: '2026-11-06T00:00:00Z',
+          groupName: 'default',
+        },
+        provisioning: {
+          deployMethod: 'ssh_push',
+          lastDeployResultStatus: 'failed',
+          lastDeployErrorSummary: 'SSH 认证失败',
+          installDir: '/opt/veydeck',
+        },
+      }) as never,
+    )
     const wrapper = mountView()
     await flushPromises()
     await wrapper.get('[data-node-id="node-b"]').trigger('click')
     await flushPromises()
-    expect(document.querySelector<HTMLDetailsElement>('[data-ui="node-deployment-details"]')?.open).toBe(true)
-    expect(document.querySelector('[data-ui="node-deployment-error"]')?.textContent).toContain('SSH 认证失败')
+    expect(
+      document.querySelector<HTMLDetailsElement>('[data-ui="node-deployment-details"]')?.open,
+    ).toBe(true)
+    expect(document.querySelector('[data-ui="node-deployment-error"]')?.textContent).toContain(
+      'SSH 认证失败',
+    )
     const overview = document.querySelector('[data-ui="node-detail-overview"]')!
     expect(overview.textContent).toContain('最近可见')
     expect(overview.textContent).not.toContain('CPU')
     wrapper.unmount()
   })
-
 })

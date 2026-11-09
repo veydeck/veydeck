@@ -1979,7 +1979,7 @@ const en = {
         compatibilityWarning:
           'Version {version} supports suite contracts {contracts}. {incompatible} of {total} installed instances are incompatible. This result is informational only.',
         contractVersion: 'Contract version {version}',
-        fineGrainedLink: 'Upgrade precisely by nodes >',
+        fineGrainedLink: 'Sync nodes to controller version >',
         back: 'Back to List',
       },
       about: {
@@ -2765,7 +2765,7 @@ const en = {
     nodes: {
       messages: { empty: 'No nodes available' },
       switchToNode: 'Switch to this node',
-      batchUpgrade: 'Batch upgrade',
+      batchUpgrade: 'Sync node versions',
       selectAll: 'Select all eligible nodes',
       exitSelection: 'Exit selection',
       detailLoadFailed: 'Unable to load node details. Try again.',
@@ -2810,8 +2810,20 @@ const en = {
       detail: {
         deployment: 'Deployment',
         diagnostics: 'Connection diagnostics',
-        runtime: { active: 'Connected', expired: 'Expired', closed: 'Closed', revoked: 'Revoked', superseded: 'Replaced by a newer session' },
-        method: { ssh_push: 'SSH deployment', ssh_upgrade: 'SSH upgrade', ssh_repair: 'SSH repair', inventory_create: 'Manually added', inventory_update: 'Configuration update' },
+        runtime: {
+          active: 'Connected',
+          expired: 'Expired',
+          closed: 'Closed',
+          revoked: 'Revoked',
+          superseded: 'Replaced by a newer session',
+        },
+        method: {
+          ssh_push: 'SSH deployment',
+          ssh_upgrade: 'SSH upgrade',
+          ssh_repair: 'SSH repair',
+          inventory_create: 'Manually added',
+          inventory_update: 'Configuration update',
+        },
         title: 'Node details',
         conflict: 'Node is in conflict. Please resolve session conflict first.',
         lifecycleStatus: 'Lifecycle Status',
@@ -2960,22 +2972,22 @@ const en = {
       form: {
         editNode: 'Edit Node',
       },
-      upgradeSelected: 'Upgrade Nodes',
-      upgradeGuideTitle: 'Fine-grained Upgrade Guide',
+      upgradeSelected: 'Sync to Controller Version',
+      upgradeGuideTitle: 'Sync Node Versions',
       upgradeGuideDesc:
-        'Please check the nodes you want to upgrade in the list below, then click the "Upgrade Nodes" button at the top to configure.',
+        'Select nodes and click "Sync to Controller Version". Use system settings to upgrade the system.',
       upgradeDialog: {
-        startPlanSuccess: 'Upgrade started successfully',
-        title: 'Upgrade Nodes',
+        startPlanSuccess: 'Node version sync started',
+        title: 'Sync to Controller Version',
         selectedCount: 'Selected {count} online node(s)',
-        targetVersion: 'Target Version',
-        versionPlaceholder: 'Please select target version',
+        targetVersion: 'Running Controller Version',
+        versionPlaceholder: 'No package for the running controller version',
         overwriteSameVersion: 'Overwrite same-version nodes',
         overwriteSameVersionTip:
           'When enabled, nodes already running the target version will download and reinstall it.',
-        submit: 'Start Upgrade',
+        submit: 'Start Sync',
         cancel: 'Cancel',
-        noReleases: 'No eligible upgrade releases detected',
+        noReleases: 'Import the running controller version package in system settings first',
         createPlanFailed: 'Failed to create upgrade plan',
         startPlanFailed: 'Failed to start upgrade activity',
       },

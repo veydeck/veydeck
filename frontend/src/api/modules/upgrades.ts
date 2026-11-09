@@ -24,6 +24,7 @@ export interface UpgradeReleaseRecord {
   signatureStatus: string
   supportedSuiteContractVersions: string
   upgradeEligible: boolean
+  nodeSyncEligible: boolean
   upgradeBlockReason?: string
   syncedAt: string
   publishedAt?: string
@@ -104,7 +105,7 @@ export interface UpgradePlanDetail {
 
 export interface UpgradePlanCreatePayload {
   targetVersion: string
-  component?: 'cluster'
+  component: 'cluster' | 'agent'
   nodeIds?: string[]
   includeOffline?: boolean
   overwriteSameVersion?: boolean
