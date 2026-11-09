@@ -244,7 +244,8 @@ pub async fn list(pool: &DbPool, options: FileListOptions) -> Result<FileListPag
         let metadata = tokio::fs::symlink_metadata(&path)
             .await
             .map_err(|error| map_io_error(error, "read file metadata"))?;
-        let summary = summary_from_metadata(&path, name, &metadata, &roots);
+        let mut summary = summary_from_metadata(&path, name, &metadata, &roots);
+        resolve_summary_symlink(&mut summary, &path).await;
         match summary.kind {
             FileEntryKind::File => counts.file_count += 1,
             FileEntryKind::Directory => counts.directory_count += 1,
@@ -255,6 +256,7 @@ pub async fn list(pool: &DbPool, options: FileListOptions) -> Result<FileListPag
             + summary.path.len()
             + summary.name.len()
             + summary.revision.len()
+            + summary.symlink_target.as_ref().map_or(0, String::len)
             + summary
                 .management
                 .owner_name
@@ -299,48 +301,15 @@ pub async fn detail(pool: &DbPool, path: &Path) -> Result<FileEntryDetail, ApiEr
         .file_name()
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_else(|| "/".to_string());
-    let symlink_target = if metadata.file_type().is_symlink() {
-        Some(
-            tokio::fs::read_link(path)
-                .await
-                .map_err(|error| map_io_error(error, "read symbolic link"))?
-                .to_string_lossy()
-                .into_owned(),
-        )
-    } else {
-        None
-    };
-    let (symlink_target_kind, symlink_target_capabilities, symlink_error) =
-        if symlink_target.is_some() {
-            match tokio::fs::metadata(path).await {
-                Ok(target) => {
-                    let target_kind = kind(&target);
-                    (
-                        Some(target_kind),
-                        Some(capabilities_from_metadata(target_kind, &target)),
-                        None,
-                    )
-                }
-                Err(error) => (
-                    None,
-                    None,
-                    Some(map_io_error(error, "resolve symbolic link").code),
-                ),
-            }
-        } else {
-            (None, None, None)
-        };
+    let mut summary = summary_from_metadata(path, name, &metadata, &roots);
+    resolve_summary_symlink(&mut summary, path).await;
     Ok(FileEntryDetail {
-        summary: summary_from_metadata(path, name, &metadata, &roots),
+        summary,
         mode: metadata.mode(),
         uid: metadata.uid(),
         gid: metadata.gid(),
         user_name: None,
         group_name: None,
-        symlink_target,
-        symlink_target_kind,
-        symlink_target_capabilities,
-        symlink_error,
     })
 }
 
@@ -697,6 +666,35 @@ fn summary_from_metadata(
         revision: revision(metadata),
         management: management_for(path, roots),
         capabilities: capabilities_from_metadata(kind, metadata),
+        symlink_target: None,
+        symlink_target_kind: None,
+        symlink_target_capabilities: None,
+        symlink_error: None,
+    }
+}
+
+/// 为列表与详情补充一致的链接目标信息；解析失败不丢弃链接自身。
+async fn resolve_summary_symlink(summary: &mut FileEntrySummary, path: &Path) {
+    if summary.kind != FileEntryKind::Symlink {
+        return;
+    }
+    match tokio::fs::read_link(path).await {
+        Ok(target) => summary.symlink_target = Some(target.to_string_lossy().into_owned()),
+        Err(error) => {
+            summary.symlink_error = Some(map_io_error(error, "read symbolic link").code);
+            return;
+        }
+    }
+    match tokio::fs::metadata(path).await {
+        Ok(target) => {
+            let target_kind = kind(&target);
+            summary.symlink_target_kind = Some(target_kind);
+            summary.symlink_target_capabilities =
+                Some(capabilities_from_metadata(target_kind, &target));
+        }
+        Err(error) => {
+            summary.symlink_error = Some(map_io_error(error, "resolve symbolic link").code);
+        }
     }
 }
 
@@ -1096,6 +1094,120 @@ mod tests {
         assert_eq!(second.entries[0].name, "b.txt");
     }
 
+    /// 列表直接区分目录、文件、多层及失效链接，翻页继续复用首次解析结果。
+    #[tokio::test]
+    async fn list_snapshots_include_symlink_targets_and_keep_link_semantics() {
+        let pool = crate::test_support::setup_test_db().await;
+        let root = TestDirectory::new("list-links").await;
+        tokio::fs::create_dir(root.0.join("actual"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.0.join("start.sh"), b"echo test")
+            .await
+            .unwrap();
+        for (name, target) in [
+            ("pages", "actual"),
+            ("link-test", "start.sh"),
+            ("chain", "pages"),
+            ("broken", "missing"),
+            ("loop", "loop"),
+        ] {
+            std::os::unix::fs::symlink(target, root.0.join(name)).unwrap();
+        }
+        let page = list(
+            &pool,
+            FileListOptions {
+                path: root.0.clone(),
+                page: 1,
+                page_size: 50,
+                sort_by: FileSortBy::Name,
+                sort_order: FileSortOrder::Asc,
+                show_hidden: false,
+                snapshot_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.counts.symlink_count, 5);
+        assert_eq!(page.counts.directory_count, 1);
+        assert_eq!(page.counts.file_count, 1);
+        for (name, target_kind) in [
+            ("pages", FileEntryKind::Directory),
+            ("chain", FileEntryKind::Directory),
+            ("link-test", FileEntryKind::File),
+        ] {
+            let entry = page
+                .entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap();
+            assert_eq!(entry.kind, FileEntryKind::Symlink);
+            assert_eq!(entry.symlink_target_kind, Some(target_kind));
+            assert_eq!(entry.path, root.0.join(name).to_string_lossy());
+            assert!(entry.symlink_error.is_none());
+            assert!(entry.capabilities.can_remove);
+            assert!(!entry.capabilities.can_download);
+            let detail = detail(&pool, &root.0.join(name)).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(entry).unwrap(),
+                serde_json::to_value(detail.summary).unwrap()
+            );
+        }
+        let directory = page
+            .entries
+            .iter()
+            .find(|entry| entry.name == "pages")
+            .unwrap();
+        assert_eq!(directory.symlink_target.as_deref(), Some("actual"));
+        assert!(!directory.capabilities.can_create_child);
+        assert!(
+            directory
+                .symlink_target_capabilities
+                .as_ref()
+                .unwrap()
+                .can_create_child
+        );
+        let json = serde_json::to_value(&page).unwrap();
+        let file = json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "link-test")
+            .unwrap();
+        assert_eq!(file["kind"], "symlink");
+        assert_eq!(file["symlinkTargetKind"], "file");
+        for (name, error) in [
+            ("broken", ErrorCode::FileNotFound),
+            ("loop", ErrorCode::FileSymlinkLoop),
+        ] {
+            let entry = page
+                .entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap();
+            assert_eq!(entry.symlink_error, Some(error));
+            assert!(entry.symlink_target_kind.is_none());
+            assert!(entry.capabilities.can_remove);
+        }
+        tokio::fs::remove_file(root.0.join("pages")).await.unwrap();
+        std::os::unix::fs::symlink("start.sh", root.0.join("pages")).unwrap();
+        let cached = list(
+            &pool,
+            FileListOptions {
+                path: root.0.clone(),
+                page: 1,
+                page_size: 50,
+                sort_by: FileSortBy::Name,
+                sort_order: FileSortOrder::Asc,
+                show_hidden: false,
+                snapshot_id: Some(page.snapshot_id.clone()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(serde_json::to_value(cached.entries).unwrap(), json["entries"]);
+    }
+
     #[tokio::test]
     async fn atomic_update_rejects_stale_revision_without_overwriting() {
         let pool = crate::test_support::setup_test_db().await;
@@ -1188,9 +1300,17 @@ mod tests {
         let logical = root.0.join("chain");
         let info = detail(&pool, &logical).await.unwrap();
         assert_eq!(info.summary.kind, FileEntryKind::Symlink);
-        assert_eq!(info.symlink_target_kind, Some(FileEntryKind::Directory));
-        assert!(info.symlink_target_capabilities.unwrap().can_create_child);
-        assert_eq!(info.symlink_target.as_deref(), Some("alias"));
+        assert_eq!(
+            info.summary.symlink_target_kind,
+            Some(FileEntryKind::Directory)
+        );
+        assert!(
+            info.summary
+                .symlink_target_capabilities
+                .unwrap()
+                .can_create_child
+        );
+        assert_eq!(info.summary.symlink_target.as_deref(), Some("alias"));
         let page = list(
             &pool,
             FileListOptions {
@@ -1213,7 +1333,11 @@ mod tests {
         std::os::unix::fs::symlink("chain/note.txt", root.0.join("file-link")).unwrap();
         let file_link = root.0.join("file-link");
         assert_eq!(
-            detail(&pool, &file_link).await.unwrap().symlink_target_kind,
+            detail(&pool, &file_link)
+                .await
+                .unwrap()
+                .summary
+                .symlink_target_kind,
             Some(FileEntryKind::File)
         );
         let document = read_content(&file_link).await.unwrap();
@@ -1230,10 +1354,13 @@ mod tests {
         std::os::unix::fs::symlink("first", root.0.join("second")).unwrap();
         let broken = detail(&pool, &root.0.join("broken")).await.unwrap();
         assert_eq!(broken.summary.kind, FileEntryKind::Symlink);
-        assert_eq!(broken.symlink_error, Some(ErrorCode::FileNotFound));
+        assert_eq!(broken.summary.symlink_error, Some(ErrorCode::FileNotFound));
         assert!(broken.summary.capabilities.can_remove);
         let looping = detail(&pool, &root.0.join("first")).await.unwrap();
-        assert_eq!(looping.symlink_error, Some(ErrorCode::FileSymlinkLoop));
+        assert_eq!(
+            looping.summary.symlink_error,
+            Some(ErrorCode::FileSymlinkLoop)
+        );
         assert_eq!(
             map_io_error(
                 io::Error::from_raw_os_error(libc::EACCES),

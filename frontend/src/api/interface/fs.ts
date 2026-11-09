@@ -34,15 +34,15 @@ export interface FsEntry {
   revision: string
   management: FileManagement
   capabilities: FileCapabilities
-}
-
-/** 文件详情保留链接本身的摘要，目标类型与能力仅按需解析。 */
-export interface FsEntryDetail extends FsEntry {
+  /** 链接目标信息由列表快照提供，操作能力仍以链接自身为准。 */
   symlinkTarget?: string | null
   symlinkTargetKind?: FileEntryKind | null
   symlinkTargetCapabilities?: FileCapabilities | null
   symlinkError?: import('@/api/generated').ErrorCode | null
 }
+
+/** 文件详情与列表共享链接目标信息。 */
+export type FsEntryDetail = FsEntry
 
 export interface FileEntryCounts {
   fileCount: number

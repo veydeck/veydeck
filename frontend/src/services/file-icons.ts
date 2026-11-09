@@ -125,7 +125,7 @@ export function fileIconUrl(stem: string): string {
   return assets[`../assets/file-icons/${stem}.png`]!
 }
 
-/** 区分普通类型、未知链接和已解析链接；不为绘制图标发起请求。 */
+/** 按列表提供的目标类型区分目录链接与文件链接，不为绘制图标发起请求。 */
 export function resolveFileIcon(entry: FsEntryDetail): { icon: string; badge?: string } {
   const linked = entry.kind === 'symlink'
   const kind = linked ? entry.symlinkTargetKind : entry.kind
@@ -134,12 +134,11 @@ export function resolveFileIcon(entry: FsEntryDetail): { icon: string; badge?: s
       ? 'badge-link-broken-v01'
       : 'badge-link-v01'
     : undefined
+  if (linked && entry.symlinkError) return { icon: 'link-generic-v01', badge }
+  if (linked && kind === 'directory') return { icon: 'folder-link-v01', badge }
+  if (linked && kind !== 'file') return { icon: 'link-generic-v01', badge }
   const directoryPath = entry.path?.replace(/\/+$/, '')
-  if (
-    directoryPath &&
-    linuxDirectories.has(directoryPath) &&
-    (kind === 'directory' || (linked && !entry.symlinkError && (!kind || kind === 'symlink')))
-  )
+  if (directoryPath && linuxDirectories.has(directoryPath) && kind === 'directory')
     return { icon: `folder-linux-${directoryPath.slice(1)}-v01`, badge }
   if (!kind || kind === 'symlink') return { icon: 'link-generic-v01', badge }
   if (kind === 'directory') return { icon: 'folder-v01', badge }
@@ -153,5 +152,6 @@ export function resolveFileIcon(entry: FsEntryDetail): { icon: string; badge?: s
     ? 'file-code-v01'
     : suffixes.find(({ extension }) => name.endsWith('.' + extension) || name === '.' + extension)
         ?.icon
+  if (linked) return { icon: match || 'link-generic-v01', badge }
   return { icon: match || 'file-generic-v01', badge }
 }

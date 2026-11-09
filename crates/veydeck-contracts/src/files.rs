@@ -65,6 +65,18 @@ pub struct FileEntrySummary {
     pub revision: String,
     pub management: FileManagement,
     pub capabilities: FileCapabilities,
+    /// 链接声明的目标路径；相对路径不转换为真实路径。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symlink_target: Option<String>,
+    /// 跟随链接解析后的最终目标类型，不改变条目自身类型。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symlink_target_kind: Option<FileEntryKind>,
+    /// 目标能力仅用于打开和目录内操作，不替代链接自身的操作能力。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symlink_target_capabilities: Option<FileCapabilities>,
+    /// 失效、循环或不可访问时保留链接条目，并返回解析错误。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symlink_error: Option<crate::api::ErrorCode>,
 }
 
 /// 文件详情，补充 POSIX 所有者和符号链接信息。
@@ -80,13 +92,6 @@ pub struct FileEntryDetail {
     pub gid: u32,
     pub user_name: Option<String>,
     pub group_name: Option<String>,
-    pub symlink_target: Option<String>,
-    /// 按需解析后的最终目标类型；逻辑路径保持不变。
-    pub symlink_target_kind: Option<FileEntryKind>,
-    /// 目标能力仅用于打开和目录内操作，不替代链接本身的复制、移动能力。
-    pub symlink_target_capabilities: Option<FileCapabilities>,
-    /// 失效、循环或不可访问的链接仍返回其自身详情。
-    pub symlink_error: Option<crate::api::ErrorCode>,
 }
 
 /// 当前目录的真实条目统计。
