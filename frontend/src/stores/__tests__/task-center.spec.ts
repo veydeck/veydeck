@@ -12,13 +12,17 @@ const mocks = vi.hoisted(() => ({
     { id: 'b', name: 'B', status: 'online' },
   ],
   info: vi.fn(),
+  error: vi.fn(),
+  openSuite: vi.fn(),
 }))
 vi.mock('@/stores/window-manager', () => ({
-  useWindowManagerStore: () => ({ openWindow: vi.fn() }),
+  useWindowManagerStore: () => ({ openWindow: vi.fn(), openWindowWithPayload: mocks.openSuite }),
 }))
 vi.mock('@/api/modules/fs', () => ({ fsApi: { forNode: mocks.forNode } }))
 vi.mock('@/stores/node', () => ({ useNodeStore: () => ({ nodes: mocks.nodes }) }))
-vi.mock('@/stores/toast', () => ({ useToastStore: () => ({ info: mocks.info, error: vi.fn() }) }))
+vi.mock('@/stores/toast', () => ({
+  useToastStore: () => ({ info: mocks.info, error: mocks.error }),
+}))
 
 const ok = <T>(data: T) => ({ success: true, data, message: '' })
 /** 创建可被测试控制的异步请求。 */
@@ -59,6 +63,7 @@ describe('task center', () => {
   let client: ReturnType<typeof createClient>
   function createClient() {
     return {
+      sendToTrafficAnalysis: vi.fn(),
       activeTasks: vi.fn().mockResolvedValue(ok([])),
       activeTransfers: vi.fn().mockResolvedValue(ok([])),
       taskDetail: vi.fn(),
@@ -90,6 +95,76 @@ describe('task center', () => {
     vi.useRealTimers()
   })
 
+  it('发送抓包归入其他任务，导入成功后携带记录 ID 打开同节点套件', async () => {
+    const pending =
+      deferred<ReturnType<typeof ok<{ app: Record<string, unknown>; importId: string }>>>()
+    client.sendToTrafficAnalysis.mockReturnValue(pending.promise)
+    const entry = { name: 'capture.PCAPNG', path: '/capture.PCAPNG', sizeBytes: 100 }
+    center.sendToTrafficAnalysis('a', entry)
+    center.sendToTrafficAnalysis('a', entry)
+    expect(client.sendToTrafficAnalysis).toHaveBeenCalledTimes(1)
+    expect(mocks.forNode).toHaveBeenLastCalledWith('a')
+    expect(center.tasks).toHaveLength(1)
+    expect(center.tasks[0]).toMatchObject({
+      category: 'other',
+      kind: 'trafficAnalysis',
+      status: 'running',
+      stage: 'sendingToTrafficAnalysis',
+    })
+    await center.cancel(center.tasks[0]!.id)
+    expect(client.cancelTask).not.toHaveBeenCalled()
+    pending.resolve(
+      ok({
+        importId: 'new-capture',
+        app: {
+          appId: 'packet-app',
+          nodeId: 'a',
+          suiteInstanceId: 'packet-instance',
+          appEntryId: 'main',
+          entryTarget: '/suite/',
+          title: '流量解析',
+          icon: '/icon.png',
+        },
+      }),
+    )
+    await flushPromises()
+    expect(center.tasks[0]).toMatchObject({
+      status: 'completed',
+      progress: 100,
+      transferredBytes: 100,
+      completedFiles: 1,
+    })
+    expect(mocks.openSuite).toHaveBeenCalledWith(
+      'suite-web-app',
+      expect.objectContaining({
+        url: expect.stringContaining('/suite/?pcapId=new-capture'),
+        nodeId: 'a',
+      }),
+      expect.objectContaining({ instanceId: 'packet-app', nodeId: 'a' }),
+    )
+    expect(mocks.info).not.toHaveBeenCalled()
+  })
+  it('导入失败保留其他任务错误，清空会话后旧请求不能打开套件', async () => {
+    client.sendToTrafficAnalysis.mockResolvedValue({ success: false, message: '套件已停用' })
+    center.sendToTrafficAnalysis('a', { name: 'a.pcap', path: '/a.pcap' })
+    await flushPromises()
+    expect(center.tasks[0]).toMatchObject({
+      category: 'other',
+      status: 'failed',
+      error: '套件已停用',
+      failedFiles: 1,
+    })
+    expect(mocks.error).toHaveBeenCalledWith('套件已停用')
+    expect(mocks.openSuite).not.toHaveBeenCalled()
+    const pending = deferred<ReturnType<typeof ok<unknown>>>()
+    client.sendToTrafficAnalysis.mockReturnValue(pending.promise)
+    center.sendToTrafficAnalysis('a', { name: 'b.pcap', path: '/b.pcap' })
+    center.reset()
+    pending.resolve(ok({ importId: 'old', app: { nodeId: 'a', entryTarget: '/suite/' } }))
+    await flushPromises()
+    expect(center.tasks).toHaveLength(0)
+    expect(mocks.openSuite).not.toHaveBeenCalled()
+  })
   it('同节点 FIFO、跨节点并行，窗口展示不影响上传', async () => {
     const blocked = deferred<ReturnType<typeof ok<{ transferredBytes: number }>>>()
     client.uploadChunk.mockReturnValue(blocked.promise)

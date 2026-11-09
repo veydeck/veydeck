@@ -539,6 +539,9 @@ fn is_file_content_stream(path: &str) -> bool {
         (value.contains("/agent/files/transfer/")
             && (value.ends_with("/content") || value.ends_with("/chunk")))
             || value.ends_with("/agent/docker/images/load")
+            || (value.contains("/agent/docker/suite/")
+                && value.contains("/proxy/")
+                && value.ends_with("/api/pcaps"))
     })
 }
 
@@ -903,6 +906,17 @@ mod tests {
             "/api/v1/node/node-1/agent/docker/images/load"
         ));
         assert!(!is_file_content_stream("/api/v1/agent/docker/images"));
+    }
+
+    /// 套件抓包导入也包含文件传输时间，不能沿用普通请求的短超时。
+    #[test]
+    fn capture_import_uses_streaming_timeout() {
+        assert!(is_file_content_stream(
+            "/api/v1/agent/docker/suite/veydeck-packet/proxy/main/api/pcaps"
+        ));
+        assert!(!is_file_content_stream(
+            "/api/v1/agent/docker/suite/veydeck-packet/proxy/main/api/pcaps/capture-1"
+        ));
     }
 
     /// 上传分块沿用文件流策略，详情、完成与取消仍使用普通请求策略。

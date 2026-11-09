@@ -11,6 +11,11 @@ import { useToastStore } from '@/stores/toast'
 import type { FsEntry } from '@/api/interface/fs'
 const api = vi.hoisted(() => ({
   list: vi.fn(),
+  suites: vi.fn(),
+  sendCapture: vi.fn(),
+  submitCapture: vi.fn(),
+  centerTasks: [] as Array<{ kind: string; nodeId: string; finishedAt?: string }>,
+  scope: vi.fn(),
   home: vi.fn(),
   detail: vi.fn(),
   readFile: vi.fn(),
@@ -25,17 +30,26 @@ const api = vi.hoisted(() => ({
 }))
 vi.mock('@/api/modules/fs', () => ({
   fsApi: {
-    forNode: () => ({
-      listEntries: api.list,
-      home: api.home,
-      detail: api.detail,
-      readFile: api.readFile,
-    }),
+    forNode: (nodeId: string) => {
+      api.scope(nodeId)
+      return {
+        sendToTrafficAnalysis: api.sendCapture,
+        listEntries: api.list,
+        home: api.home,
+        detail: api.detail,
+        readFile: api.readFile,
+      }
+    },
   },
 }))
+vi.mock('@/api/modules/suites', () => ({ suitesApi: { fetchSuites: api.suites } }))
 vi.mock('@/stores/task-center', () => ({
   useTaskCenterStore: () => ({
     open: vi.fn(),
+    sendToTrafficAnalysis: api.submitCapture,
+    get tasks() {
+      return api.centerTasks
+    },
     subscribe: api.subscribe,
     subscribeOperation: api.subscribe,
     registerOperation: vi.fn(),
@@ -80,9 +94,9 @@ const page = (entries: FsEntry[], total = entries.length) => ({
 })
 const mounted: Array<ReturnType<typeof mount>> = []
 /** 安装真实偏好与剪贴板 Store，使用当前应用的组件和国际化。 */
-function render() {
+function render(payload?: Record<string, unknown>) {
   const wrapper = mount(FileManagerView, {
-    props: { windowId: 'file-window' },
+    props: { windowId: 'file-window', payload },
     attachTo: document.body,
     global: { plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })] },
   })
@@ -94,10 +108,12 @@ describe('desktop file manager', () => {
     localStorage.clear()
     setActivePinia(createPinia())
     vi.clearAllMocks()
+    api.centerTasks = reactive([])
     api.windows = reactive({
       openWindows: [{ id: 'file-window', zIndex: 2, isMinimized: false }],
       maxZIndex: 2,
     })
+    api.suites.mockResolvedValue({ success: true, data: { catalog: [], instances: [] } })
     api.home.mockResolvedValue({ success: true, data: { path: '/home' } })
     api.detail.mockResolvedValue({
       success: true,
@@ -117,15 +133,144 @@ describe('desktop file manager', () => {
     document.body.innerHTML = ''
     vi.unstubAllGlobals()
   })
+  /** 提供同节点安装状态与实际套件图标。 */
+  function installedCapture(status = 'enabled', nodeId = 'file-node') {
+    api.suites.mockResolvedValue({
+      success: true,
+      data: {
+        instances: [
+          {
+            suiteId: 'veydeck.packet',
+            nodeId,
+            instanceId: 'packet-instance',
+            packageId: 'package',
+            status,
+          },
+        ],
+        catalog: [
+          {
+            suiteId: 'veydeck.packet',
+            icon: '/suite-icon.png',
+            versions: [{ packageId: 'package', icon: '/installed-icon.png' }],
+          },
+        ],
+      },
+    })
+  }
+  /** 打开抓包文件菜单，读取传送到桌面的真实菜单元素。 */
+  async function captureMenu(name = 'capture.PCAPNG', kind = 'file', canRead = true) {
+    api.list.mockResolvedValue(
+      page([
+        {
+          ...entry(0),
+          name,
+          path: `/home/${name}`,
+          kind,
+          capabilities: { ...entry(0).capabilities, canRead },
+        } as FsEntry,
+      ]),
+    )
+    const wrapper = render({ nodeId: 'file-node' })
+    await flushPromises()
+    await wrapper
+      .get('[data-ui="file-entry"]')
+      .trigger('contextmenu', { clientX: 100, clientY: 100 })
+    await flushPromises()
+    return {
+      wrapper,
+      action: document.querySelector<HTMLButtonElement>(
+        '[data-ui="file-send-to-traffic-analysis"]',
+      ),
+    }
+  }
+  it('菜单使用实际套件图标，发送交给任务中心且文件窗口不显示进度', async () => {
+    installedCapture()
+    const { wrapper, action } = await captureMenu()
+    expect(api.suites).toHaveBeenCalledWith('file-node')
+    expect(action?.disabled).toBe(false)
+    expect(action?.querySelector('img')?.getAttribute('src')).toBe('/installed-icon.png')
+    action!.click()
+    await flushPromises()
+    expect(api.submitCapture).toHaveBeenCalledWith(
+      'file-node',
+      expect.objectContaining({ path: '/home/capture.PCAPNG' }),
+    )
+    expect(wrapper.find('[data-ui="file-traffic-sending"]').exists()).toBe(false)
+    api.centerTasks.push({ kind: 'trafficAnalysis', nodeId: 'file-node' })
+    await wrapper
+      .get('[data-ui="file-entry"]')
+      .trigger('contextmenu', { clientX: 100, clientY: 100 })
+    await flushPromises()
+    expect(
+      document.querySelector<HTMLButtonElement>('[data-ui="file-send-to-traffic-analysis"]')
+        ?.disabled,
+    ).toBe(true)
+    expect(api.open).not.toHaveBeenCalled()
+  })
+  it('已安装但未启用时菜单禁用并提示先启用，不可读文件也禁用', async () => {
+    installedCapture('disabled')
+    const first = await captureMenu('capture.pcap')
+    expect(first.action?.disabled).toBe(true)
+    expect(first.action?.title).toBe('请先启用流量解析')
+    first.wrapper.unmount()
+    document.body.innerHTML = ''
+    installedCapture()
+    const second = await captureMenu('capture.pcap', 'file', false)
+    expect(second.action?.disabled).toBe(true)
+  })
+  it.each([
+    ['capture.txt', 'file'],
+    ['capture.pcap', 'symlink'],
+    ['capture.pcapng', 'directory'],
+  ])('不为 %s 类型 %s 提供发送入口', async (name, kind) => {
+    installedCapture()
+    expect((await captureMenu(name, kind)).action).toBeNull()
+  })
+  it('多选时不提供批量发送入口', async () => {
+    installedCapture()
+    api.list.mockResolvedValue(
+      page(
+        [0, 1].map((index) => ({
+          ...entry(index),
+          name: `capture-${index}.pcap`,
+          capabilities: { ...entry(index).capabilities, canRead: true },
+        })),
+      ),
+    )
+    const wrapper = render({ nodeId: 'file-node' })
+    await flushPromises()
+    const entries = wrapper.findAll('[data-ui="file-entry"]')
+    await entries[0]!.trigger('click')
+    await entries[1]!.trigger('click', { ctrlKey: true })
+    await entries[0]!.trigger('contextmenu', { clientX: 100, clientY: 100 })
+    await flushPromises()
+    expect(document.querySelector('[data-ui="file-send-to-traffic-analysis"]')).toBeNull()
+  })
+  it('未安装或只有其他节点安装时隐藏入口', async () => {
+    expect((await captureMenu()).action).toBeNull()
+    for (const wrapper of mounted.splice(0)) wrapper.unmount()
+    document.body.innerHTML = ''
+    installedCapture('enabled', 'other-node')
+    expect((await captureMenu()).action).toBeNull()
+  })
   it('右键与 Alt+Enter 查看单项属性，多选禁用，空白菜单查看当前目录', async () => {
     const wrapper = render()
     await flushPromises()
-    api.detail.mockResolvedValue({ success: true, data: {
-      ...entry(0), mode: 0o100644, uid: 0, gid: 0, allocatedBytes: 0,
-    } })
+    api.detail.mockResolvedValue({
+      success: true,
+      data: {
+        ...entry(0),
+        mode: 0o100644,
+        uid: 0,
+        gid: 0,
+        allocatedBytes: 0,
+      },
+    })
     const items = wrapper.findAll('[data-ui="file-entry"]')
     await items[0]!.trigger('click')
-    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', altKey: true, bubbles: true, cancelable: true }))
+    document.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Enter', altKey: true, bubbles: true, cancelable: true }),
+    )
     await flushPromises()
     expect(wrapper.getComponent(FilePropertiesDialog).props('path')).toBe('/home/file-0.txt')
     wrapper.getComponent(FilePropertiesDialog).vm.$emit('close')
@@ -133,11 +278,15 @@ describe('desktop file manager', () => {
     await items[1]!.trigger('click', { ctrlKey: true })
     await items[0]!.trigger('contextmenu', { clientX: 100, clientY: 100 })
     await flushPromises()
-    const disabled = document.querySelector<HTMLButtonElement>('[data-ui="file-properties-action"]')!
+    const disabled = document.querySelector<HTMLButtonElement>(
+      '[data-ui="file-properties-action"]',
+    )!
     expect(disabled.disabled).toBe(true)
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     await flushPromises()
-    await wrapper.get('[data-ui="file-grid"]').trigger('contextmenu', { clientX: 100, clientY: 100 })
+    await wrapper
+      .get('[data-ui="file-grid"]')
+      .trigger('contextmenu', { clientX: 100, clientY: 100 })
     await flushPromises()
     const current = document.querySelector<HTMLButtonElement>('[data-ui="file-properties-action"]')!
     expect(current.disabled).toBe(false)

@@ -1,7 +1,7 @@
 /** 桌面会话级任务中心；运行控制与文件引用只保存在内存中。 */
 import { computed, effectScope, ref, watch } from 'vue'
 import { defineStore } from 'pinia'
-import type { FileOperationTask, FileTransfer } from '@/api/interface/fs'
+import type { FileOperationTask, FileTransfer, FsEntry } from '@/api/interface/fs'
 import { fsApi } from '@/api/modules/fs'
 import {
   createFileUploadRunner,
@@ -19,7 +19,7 @@ export type TaskCategory = 'files' | 'other'
 export interface CenterTask {
   id: string
   category: TaskCategory
-  kind: 'upload' | 'download' | 'copy' | 'move' | 'remove'
+  kind: 'upload' | 'download' | 'copy' | 'move' | 'remove' | 'trafficAnalysis'
   nodeId: string
   name: string
   path: string
@@ -274,6 +274,85 @@ export const useTaskCenterStore = defineStore('task-center', () => {
     return true
   }
 
+  /** 发送任务由桌面会话持有，窗口关闭后仍完成导入与套件导航。 */
+  function sendToTrafficAnalysis(
+    nodeId: string,
+    entry: Pick<FsEntry, 'name' | 'path' | 'sizeBytes'>,
+  ) {
+    if (
+      tasks.value.some(
+        (task) =>
+          task.kind === 'trafficAnalysis' &&
+          task.nodeId === nodeId &&
+          task.path === entry.path &&
+          isTaskActive(task),
+      )
+    )
+      return
+    const task = baseTask(nodeId, 'trafficAnalysis', crypto.randomUUID())
+    Object.assign(task, {
+      category: 'other',
+      status: 'running',
+      stage: 'sendingToTrafficAnalysis',
+      name: entry.name,
+      path: entry.path,
+      totalFiles: 1,
+      totalBytes: entry.sizeBytes || 0,
+    })
+    tasks.value.push(task)
+    const record = tasks.value.find((item) => item.id === task.id)!
+    const generation = session
+    void (async () => {
+      try {
+        const result = await fsApi.forNode(nodeId).sendToTrafficAnalysis(entry.path)
+        if (generation !== session) return
+        if (!result.success || !result.data)
+          throw new Error(result.message || i18n.global.t('fileBrowser.operationFailed'))
+        const { app, importId } = result.data
+        if (app.nodeId !== nodeId || !app.entryTarget)
+          throw new Error(i18n.global.t('fileBrowser.operationFailed'))
+        const url = new URL(app.entryTarget, window.location.origin)
+        url.searchParams.set('pcapId', importId)
+        useWindowManagerStore().openWindowWithPayload(
+          'suite-web-app',
+          {
+            url: url.href,
+            title: app.title,
+            suiteInstanceId: app.suiteInstanceId,
+            nodeId,
+            appEntryId: app.appEntryId,
+          },
+          {
+            instanceId: app.appId,
+            title: app.title,
+            icon: app.icon,
+            width: app.defaultWidth,
+            height: app.defaultHeight,
+            minWidth: app.minWidth,
+            minHeight: app.minHeight,
+            nodeId,
+            nodeScope: 'explicit-node',
+            nodeSwitchPolicy: 'allow',
+          },
+        )
+        record.status = 'completed'
+        record.stage = undefined
+        record.progress = 100
+        record.completedFiles = 1
+        record.transferredBytes = record.totalBytes
+      } catch (error) {
+        if (generation !== session) return
+        record.status = 'failed'
+        record.stage = undefined
+        record.failedFiles = 1
+        record.error = error instanceof Error ? error.message : String(error)
+        useToastStore().error(record.error)
+      } finally {
+        if (generation === session) finish(record)
+      }
+    })()
+  }
+
   /** 将服务端任务事实映射为展示摘要。 */
   function applyOperation(task: CenterTask, source: FileOperationTask) {
     Object.assign(task, {
@@ -410,7 +489,7 @@ export const useTaskCenterStore = defineStore('task-center', () => {
       !task ||
       !isTaskActive(task) ||
       task.status === 'cancelling' ||
-      task.kind === 'download' ||
+      ['download', 'trafficAnalysis'].includes(task.kind) ||
       ['cleaningUp', 'completed'].includes(task.stage || '')
     )
       return
@@ -533,6 +612,7 @@ export const useTaskCenterStore = defineStore('task-center', () => {
     subscribe,
     subscribeOperation,
     submitUpload,
+    sendToTrafficAnalysis,
     registerOperation,
     captureSession,
     isCurrentSession,

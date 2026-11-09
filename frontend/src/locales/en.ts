@@ -28,7 +28,8 @@ const en = {
     contents: 'Contents',
     counts: '{files} files · {directories} subdirectories · {links} links',
     partial: 'Partial statistics:',
-    skipped: 'Skipped {mounts} directories on other file systems, {unreadable} unreadable entries, {vanished} vanished entries and {special} special files.',
+    skipped:
+      'Skipped {mounts} directories on other file systems, {unreadable} unreadable entries, {vanished} vanished entries and {special} special files.',
     errorDetails: 'Error details (up to 10)',
     connectionError: 'Connection interrupted; showing last result',
     expired: 'The statistics session expired. Recalculate to try again.',
@@ -40,6 +41,11 @@ const en = {
     scanFailed: 'The scan failed. Recalculate to try again.',
   },
   fileBrowser: {
+    trafficNotInstalled: 'Traffic Analyzer is not installed on this node',
+    trafficEntryUnavailable: 'Traffic Analyzer entry is unavailable; check the suite status',
+    trafficCaptureTooLarge: 'Traffic Analyzer accepts files up to 100 MiB',
+    sendToTrafficAnalysis: 'Send to Traffic Analyzer',
+    enableTrafficAnalysisFirst: 'Enable Traffic Analyzer first',
     view: 'View',
     ascending: 'Ascending',
     descending: 'Descending',
@@ -113,7 +119,14 @@ const en = {
     fileCounts: 'Succeeded {completed} · Failed {failed} · Total {total}',
     leaveUpload:
       'Uploads are running or queued. Reloading or closing this page interrupts uploads. Cancel uploads in the task center before signing out.',
-    kind: { upload: 'Upload', download: 'Download', copy: 'Copy', move: 'Move', remove: 'Delete' },
+    kind: {
+      trafficAnalysis: 'Send to Traffic Analyzer',
+      upload: 'Upload',
+      download: 'Download',
+      copy: 'Copy',
+      move: 'Move',
+      remove: 'Delete',
+    },
     status: {
       queued: 'Queued',
       preparing: 'Preparing',
@@ -132,6 +145,7 @@ const en = {
       streaming: 'Transferring',
     },
     stage: {
+      sendingToTrafficAnalysis: 'Sending to Traffic Analyzer…',
       queued: 'Queued',
       validating: 'Validating',
       preparing: 'Preparing',
@@ -305,7 +319,8 @@ const en = {
       FILE_LIST_SNAPSHOT_EXPIRED: 'Directory snapshot expired. Refresh the folder.',
       FILE_LIST_SNAPSHOT_LIMIT: 'Directory snapshot capacity exceeded. Try again later.',
       FILE_OPERATION_CONFLICT: 'Another file operation conflicts with this path.',
-      FILE_STATISTICS_EXPIRED: 'The directory statistics session expired. Recalculate to try again.',
+      FILE_STATISTICS_EXPIRED:
+        'The directory statistics session expired. Recalculate to try again.',
       FILE_STATISTICS_BUSY: 'This node is busy scanning other directories. Please try again later.',
       FILE_TASK_NOT_FOUND: 'The file operation task or transfer no longer exists.',
       FILE_TASK_NOT_CANCELLABLE: 'This file operation has passed the cancellable stage.',

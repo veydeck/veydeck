@@ -42,6 +42,29 @@ describe('task center view', () => {
     document.body.innerHTML = ''
   })
 
+  it('流量解析发送在其他任务展示，不提供无效取消入口', async () => {
+    const center = useTaskCenterStore()
+    const sending = task('capture-send', 'trafficAnalysis', 'running')
+    Object.assign(sending, {
+      category: 'other',
+      stage: 'sendingToTrafficAnalysis',
+      progress: undefined,
+    })
+    center.tasks.push(sending)
+    center.selectedTab = 'other'
+    const wrapper = mount(TaskCenterView, {
+      attachTo: document.body,
+      global: { plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })] },
+    })
+    await flushPromises()
+    expect(document.body.textContent).toContain('正在发送到流量解析…')
+    expect(document.querySelector('[data-ui="task-center-row"]')).not.toBeNull()
+    expect(document.querySelector('[data-ui="task-center-cancel"]')).toBeNull()
+    center.selectedTab = 'files'
+    await nextTick()
+    expect(document.querySelector('[data-ui="task-center-row"]')).toBeNull()
+    wrapper.unmount()
+  })
   it('用表格统一展示文件任务，切换标签和卸载视图不影响任务', async () => {
     const center = useTaskCenterStore()
     center.tasks.push(

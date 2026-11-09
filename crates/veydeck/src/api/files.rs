@@ -1,5 +1,7 @@
 //! 文件管理语义网关：绑定节点、认证身份、稳定契约与最终操作日志。
 
+mod traffic_analysis;
+
 use crate::{
     api::auth::AuthenticatedAdmin,
     models::{
@@ -30,9 +32,9 @@ use veydeck_contracts::{
     api::ErrorCode,
     files::{
         CreateDirectoryRequest, CreateFileOperationTaskRequest, CreateFileRequest,
-        CreateFileTransferRequest, CreateFileStatisticsRequest, FileStatistics, FileDocument, FileEntryDetail, FileHome, FileListPage,
-        FileOperationTask, FileSaveDurability, FileSaveResult, FileTransfer,
-        UpdateFileContentRequest,
+        CreateFileStatisticsRequest, CreateFileTransferRequest, FileDocument, FileEntryDetail,
+        FileHome, FileListPage, FileOperationTask, FileSaveDurability, FileSaveResult,
+        FileStatistics, FileTransfer, UpdateFileContentRequest,
     },
 };
 
@@ -69,9 +71,19 @@ pub fn file_router() -> Router<Arc<AppState>> {
         .route("/{node_id}/files/home", get(home))
         .route("/{node_id}/files/list", get(list))
         .route("/{node_id}/file/detail", get(detail))
+        .route(
+            "/{node_id}/file/send-to-traffic-analysis",
+            post(traffic_analysis::send),
+        )
         .route("/{node_id}/file/statistics/create", post(create_statistics))
-        .route("/{node_id}/file/statistics/{id}/detail", get(statistics_detail))
-        .route("/{node_id}/file/statistics/{id}/cancel", axum::routing::delete(cancel_statistics))
+        .route(
+            "/{node_id}/file/statistics/{id}/detail",
+            get(statistics_detail),
+        )
+        .route(
+            "/{node_id}/file/statistics/{id}/cancel",
+            axum::routing::delete(cancel_statistics),
+        )
         .route(
             "/{node_id}/file/content",
             get(read_content)
@@ -171,14 +183,24 @@ async fn create_statistics(
     Json(request): Json<CreateFileStatisticsRequest>,
 ) -> ApiResult<Response> {
     let statistics: FileStatistics = mutate_post(
-        &state, &node_id, &admin, &headers, "/statistics/create", &request,
-    ).await?;
-    Ok(ApiResponse::success_with_raw("Directory statistics started", Some(statistics)).into_response())
+        &state,
+        &node_id,
+        &admin,
+        &headers,
+        "/statistics/create",
+        &request,
+    )
+    .await?;
+    Ok(
+        ApiResponse::success_with_raw("Directory statistics started", Some(statistics))
+            .into_response(),
+    )
 }
 
 /// 统计标识须为 UUID，禁止将外部标识作为任意 Agent 路径转发。
 fn statistics_path(id: &str, action: &str) -> ApiResult<String> {
-    let id = uuid::Uuid::parse_str(id).map_err(|_| ApiError::validation("invalid statistics id"))?;
+    let id =
+        uuid::Uuid::parse_str(id).map_err(|_| ApiError::validation("invalid statistics id"))?;
     Ok(format!("{AGENT_BASE_PATH}/statistics/{id}/{action}"))
 }
 
@@ -190,7 +212,10 @@ async fn statistics_detail(
     let path = statistics_path(&id, "detail")?;
     let (client, _) = node_client(&state, &node_id).await?;
     let statistics: FileStatistics = client.get_domain(&path).await?;
-    Ok(ApiResponse::success_with_raw("Directory statistics loaded", Some(statistics)).into_response())
+    Ok(
+        ApiResponse::success_with_raw("Directory statistics loaded", Some(statistics))
+            .into_response(),
+    )
 }
 
 /// 属性关闭只停止查询扫描，不修改文件系统内容。
@@ -203,8 +228,14 @@ async fn cancel_statistics(
     let path = statistics_path(&id, "cancel")?;
     let (client, _) = node_client(&state, &node_id).await?;
     let context = operation_context(&admin, &headers)?;
-    let statistics: FileStatistics = client.delete_domain_with_operation_context(&path, &context).await?;
-    Ok(ApiResponse::success_with_raw("Directory statistics cancellation requested", Some(statistics)).into_response())
+    let statistics: FileStatistics = client
+        .delete_domain_with_operation_context(&path, &context)
+        .await?;
+    Ok(ApiResponse::success_with_raw(
+        "Directory statistics cancellation requested",
+        Some(statistics),
+    )
+    .into_response())
 }
 
 async fn read_content(

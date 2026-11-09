@@ -56,7 +56,7 @@ function statusText(task: CenterTask) {
 function canCancel(task: CenterTask) {
   return (
     isTaskActive(task) &&
-    task.kind !== 'download' &&
+    !['download', 'trafficAnalysis'].includes(task.kind) &&
     !['cleaningUp', 'completed'].includes(task.stage || '')
   )
 }
@@ -171,7 +171,7 @@ function speedText(task: CenterTask) {
           >
             <VeyIcon
               :name="
-                row.kind === 'upload'
+                ['upload', 'trafficAnalysis'].includes(row.kind)
                   ? 'upload'
                   : row.kind === 'download'
                     ? 'download'

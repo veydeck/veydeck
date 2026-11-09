@@ -3,6 +3,8 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { VeyButton, VeyInput, VeyEmpty } from '@/components/ui'
 import VeyIcon from '@/components/icons/VeyIcon.vue'
+import AppIcon from '@/components/icons/AppIcon.vue'
+import { suitesApi } from '@/api/modules/suites'
 import AppContextMenu from '@/components/AppContextMenu.vue'
 import ApplicationDialog from '@/components/layout/ApplicationDialog.vue'
 import ApplicationConfirmationDialog from '@/components/layout/ApplicationConfirmationDialog.vue'
@@ -37,6 +39,20 @@ const { t } = useI18n(),
   toast = useToastStore()
 const nodeId = ref(
   typeof props.payload?.nodeId === 'string' ? props.payload.nodeId : nodes.currentNodeId || 'local',
+)
+const trafficSuite = ref<{ enabled: boolean; icon: string }>()
+const trafficSending = computed(() =>
+  center.tasks.some(
+    (task) => task.kind === 'trafficAnalysis' && task.nodeId === nodeId.value && !task.finishedAt,
+  ),
+)
+const showTrafficAction = computed(
+  () =>
+    !!trafficSuite.value &&
+    !!menu.value?.entry &&
+    menu.value.entry.kind === 'file' &&
+    /\.(pcap|pcapng)$/i.test(menu.value.entry.name) &&
+    chosen.value.length <= 1,
 )
 const selected = ref(new Set<string>()),
   interacting = ref(false),
@@ -396,6 +412,44 @@ async function context(entry: FsEntry | undefined, event: MouseEvent) {
   }
   await nextTick()
   menuElement.value?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus()
+  if (entry?.kind === 'file' && /\.(pcap|pcapng)$/i.test(entry.name)) {
+    trafficSuite.value = undefined
+    const currentMenu = menu.value
+    try {
+      const result = await suitesApi.fetchSuites(nodeId.value)
+      if (disposed || menu.value !== currentMenu || !result.success || !result.data) return
+      const instance = result.data.instances.find(
+        (item) => item.suiteId === 'veydeck.packet' && item.nodeId === nodeId.value,
+      )
+      const suite = result.data.catalog.find((item) => item.suiteId === 'veydeck.packet')
+      if (instance && suite) {
+        const installedPackage = suite.versions.find(
+          (item) => item.packageId === instance.packageId,
+        )
+        trafficSuite.value = {
+          enabled: instance.status === 'enabled',
+          icon: installedPackage?.icon || suite.icon,
+        }
+      }
+    } catch {
+      // 查询失败时不提供未经确认的套件入口，普通文件菜单仍可使用。
+    }
+  }
+}
+/** 发送任务交给桌面会话持有，文件窗口只负责固定源节点和条目。 */
+function sendToTrafficAnalysis() {
+  const entry = menu.value?.entry
+  if (
+    !entry ||
+    !showTrafficAction.value ||
+    trafficSending.value ||
+    submitting.value ||
+    !trafficSuite.value?.enabled ||
+    !entry.capabilities.canRead
+  )
+    return
+  closeMenu()
+  center.sendToTrafficAnalysis(nodeId.value, entry)
 }
 /** 工具栏菜单使用明确的业务图标，并复用文件菜单的键盘与焦点处理。 */
 async function toolbarMenu(kind: 'create' | 'upload' | 'view', event: MouseEvent) {
@@ -929,6 +983,24 @@ onUnmounted(() => {
           >
             {{ t('app.fileManager.open') }}</button
           ><button
+            v-if="showTrafficAction"
+            class="context-menu-btn traffic-analysis-action"
+            role="menuitem"
+            data-ui="file-send-to-traffic-analysis"
+            :disabled="
+              !trafficSuite?.enabled ||
+              !menu.entry.capabilities.canRead ||
+              trafficSending ||
+              submitting
+            "
+            :title="
+              !trafficSuite?.enabled ? t('fileBrowser.enableTrafficAnalysisFirst') : undefined
+            "
+            @click="sendToTrafficAnalysis"
+          >
+            <AppIcon :name="trafficSuite!.icon" :size="18" data-slot="suite-icon" />
+            {{ t('fileBrowser.sendToTrafficAnalysis') }}</button
+          ><button
             v-if="menu.entry.kind === 'directory'"
             class="context-menu-btn"
             role="menuitem"
@@ -1045,15 +1117,24 @@ onUnmounted(() => {
           {{ t('app.fileManager.copyPath') }}
         </button>
         <div v-if="!menu?.kind" class="properties-menu-divider" role="separator"></div>
-        <button v-if="!menu?.kind" class="context-menu-btn" role="menuitem"
-          data-ui="file-properties-action" :disabled="!!menu?.entry && chosen.length !== 1"
-          @click="openProperties(menu?.entry)">
+        <button
+          v-if="!menu?.kind"
+          class="context-menu-btn"
+          role="menuitem"
+          data-ui="file-properties-action"
+          :disabled="!!menu?.entry && chosen.length !== 1"
+          @click="openProperties(menu?.entry)"
+        >
           {{ t('fileProperties.title') }}
         </button>
       </div></AppContextMenu
     >
-    <FilePropertiesDialog v-if="properties" :key="properties.nodeId + ':' + properties.path"
-      v-bind="properties" @close="properties = undefined" />
+    <FilePropertiesDialog
+      v-if="properties"
+      :key="properties.nodeId + ':' + properties.path"
+      v-bind="properties"
+      @close="properties = undefined"
+    />
     <ApplicationDialog
       :visible="!!dialog"
       :title="
@@ -1092,7 +1173,15 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.properties-menu-divider { margin: var(--vdl-space-1) 0; border-top: 1px solid var(--vdl-border-subtle); }
+.traffic-analysis-action {
+  display: flex;
+  align-items: center;
+  gap: var(--vdl-space-2);
+}
+.properties-menu-divider {
+  margin: var(--vdl-space-1) 0;
+  border-top: 1px solid var(--vdl-border-subtle);
+}
 .file-manager {
   height: 100%;
   min-height: 0;

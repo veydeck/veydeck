@@ -30,7 +30,8 @@ const zh: typeof en = {
     contents: '内容',
     counts: '{files} 个文件 · {directories} 个子目录 · {links} 个链接',
     partial: '部分统计：',
-    skipped: '跳过 {mounts} 个跨文件系统目录、{unreadable} 个无法读取条目、{vanished} 个已消失条目、{special} 个特殊文件。',
+    skipped:
+      '跳过 {mounts} 个跨文件系统目录、{unreadable} 个无法读取条目、{vanished} 个已消失条目、{special} 个特殊文件。',
     errorDetails: '查看错误详情（最多 10 条）',
     connectionError: '连接异常，保留上次结果',
     expired: '统计会话已过期，请重新计算。',
@@ -42,6 +43,11 @@ const zh: typeof en = {
     scanFailed: '统计失败，请重新计算。',
   },
   fileBrowser: {
+    trafficNotInstalled: '当前节点未安装流量解析',
+    trafficEntryUnavailable: '流量解析入口不可用，请检查套件状态',
+    trafficCaptureTooLarge: '流量解析仅支持不超过 100 MiB 的文件',
+    sendToTrafficAnalysis: '发送到流量解析',
+    enableTrafficAnalysisFirst: '请先启用流量解析',
     view: '视图',
     ascending: '升序',
     descending: '降序',
@@ -114,7 +120,14 @@ const zh: typeof en = {
     fileCounts: '成功 {completed} · 失败 {failed} · 共 {total} 项',
     leaveUpload:
       '仍有上传正在执行或排队。刷新或关闭页面会中断上传，退出登录前请在任务中心取消上传。',
-    kind: { upload: '上传', download: '下载', copy: '复制', move: '移动', remove: '删除' },
+    kind: {
+      trafficAnalysis: '发送到流量解析',
+      upload: '上传',
+      download: '下载',
+      copy: '复制',
+      move: '移动',
+      remove: '删除',
+    },
     status: {
       queued: '等待中',
       preparing: '准备中',
@@ -133,6 +146,7 @@ const zh: typeof en = {
       streaming: '传输中',
     },
     stage: {
+      sendingToTrafficAnalysis: '正在发送到流量解析…',
       queued: '等待中',
       validating: '校验中',
       preparing: '准备中',

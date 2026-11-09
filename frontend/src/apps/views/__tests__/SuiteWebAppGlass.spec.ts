@@ -50,6 +50,28 @@ describe('SuiteWebAppView material sync', () => {
     sdk.createSuiteHostBridge.mockClear()
   })
 
+  it('新的文件导入刷新已有 iframe，相同导入标识不重复刷新', async () => {
+    const wrapper = shallowMount(SuiteWebAppView, {
+      props: { payload: { url: '/suite/', nodeId: 'suite-node' } },
+      global: {
+        plugins: [createPinia(), createI18n({ legacy: false, locale: 'zh', messages: { zh: {} } })],
+      },
+    })
+    await flushPromises()
+    const first = wrapper.find('iframe').element
+    await wrapper.setProps({
+      payload: { url: '/suite/?pcapId=capture-1', nodeId: 'suite-node' },
+    })
+    await flushPromises()
+    const refreshed = wrapper.find('iframe').element
+    expect(refreshed).not.toBe(first)
+    await wrapper.setProps({
+      payload: { url: '/suite/?pcapId=capture-1', nodeId: 'suite-node' },
+    })
+    await flushPromises()
+    expect(wrapper.find('iframe').element).toBe(refreshed)
+    wrapper.unmount()
+  })
   it('文件导航固定使用套件所在节点', async () => {
     shallowMount(SuiteWebAppView, {
       props: { payload: { url: 'https://suite.example.test/', nodeId: 'suite-node' } },
