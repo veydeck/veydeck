@@ -1,5 +1,5 @@
 /** 文件浏览器共享的路径、选择与操作规则。 */
-import type { FsEntry, FsEntryDetail } from '@/api/interface/fs'
+import type { FsEntry } from '@/api/interface/fs'
 
 /** 校验绝对路径并消除重复分隔符，不接受父目录跳转片段。 */
 export function normalizeFilePath(value: string): string {
@@ -73,6 +73,6 @@ export function selectFileRange(
 }
 
 /** 目录路径可通过链接进入，创建子项时使用最终目录的能力。 */
-export function fileDirectoryCapabilities(entry: FsEntryDetail) {
+export function fileDirectoryCapabilities(entry: FsEntry) {
   return entry.symlinkTargetCapabilities || entry.capabilities
 }

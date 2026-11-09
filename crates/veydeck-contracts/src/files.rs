@@ -92,6 +92,63 @@ pub struct FileEntryDetail {
     pub gid: u32,
     pub user_name: Option<String>,
     pub group_name: Option<String>,
+    /// 最近访问时间；不等同于创建时间。
+    pub accessed_at: Option<String>,
+    /// 文件系统分配的磁盘空间，按 POSIX 512 字节块计量。
+    pub allocated_bytes: u64,
+}
+
+/// 为单次属性查看启动目录统计，不持久化为文件操作任务。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "files/")]
+pub struct CreateFileStatisticsRequest {
+    pub path: String,
+    pub expected_revision: String,
+}
+
+/// 目录统计生命周期；取消必须由扫描器确认后进入终态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "files/")]
+pub enum FileStatisticsStatus {
+    Running,
+    Cancelling,
+    Succeeded,
+    Cancelled,
+    Failed,
+}
+
+/// 最多保留十条的目录统计错误摘要。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "files/")]
+pub struct FileStatisticsError {
+    pub path: String,
+    pub code: crate::api::ErrorCode,
+}
+
+/// 属性查询的累计统计；目录变化或跳过条目时不能视作一致性快照。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "files/", optional_fields)]
+pub struct FileStatistics {
+    pub id: String,
+    pub path: String,
+    pub status: FileStatisticsStatus,
+    pub file_count: u64,
+    pub directory_count: u64,
+    pub symlink_count: u64,
+    pub logical_bytes: u64,
+    pub allocated_bytes: u64,
+    pub skipped_mount_count: u64,
+    pub unreadable_count: u64,
+    pub vanished_count: u64,
+    pub special_count: u64,
+    pub partial: bool,
+    pub errors: Vec<FileStatisticsError>,
+    pub created_at: String,
+    pub finished_at: Option<String>,
 }
 
 /// 当前目录的真实条目统计。

@@ -5,6 +5,7 @@ import { createI18n } from 'vue-i18n'
 import { reactive } from 'vue'
 import FileManagerView from '../FileManagerView.vue'
 import FileBrowserContent from '@/components/files/FileBrowserContent.vue'
+import FilePropertiesDialog from '@/components/files/FilePropertiesDialog.vue'
 import zh from '@/locales/zh'
 import { useToastStore } from '@/stores/toast'
 import type { FsEntry } from '@/api/interface/fs'
@@ -115,6 +116,34 @@ describe('desktop file manager', () => {
     for (const wrapper of mounted.splice(0)) wrapper.unmount()
     document.body.innerHTML = ''
     vi.unstubAllGlobals()
+  })
+  it('右键与 Alt+Enter 查看单项属性，多选禁用，空白菜单查看当前目录', async () => {
+    const wrapper = render()
+    await flushPromises()
+    api.detail.mockResolvedValue({ success: true, data: {
+      ...entry(0), mode: 0o100644, uid: 0, gid: 0, allocatedBytes: 0,
+    } })
+    const items = wrapper.findAll('[data-ui="file-entry"]')
+    await items[0]!.trigger('click')
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', altKey: true, bubbles: true, cancelable: true }))
+    await flushPromises()
+    expect(wrapper.getComponent(FilePropertiesDialog).props('path')).toBe('/home/file-0.txt')
+    wrapper.getComponent(FilePropertiesDialog).vm.$emit('close')
+    await flushPromises()
+    await items[1]!.trigger('click', { ctrlKey: true })
+    await items[0]!.trigger('contextmenu', { clientX: 100, clientY: 100 })
+    await flushPromises()
+    const disabled = document.querySelector<HTMLButtonElement>('[data-ui="file-properties-action"]')!
+    expect(disabled.disabled).toBe(true)
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await flushPromises()
+    await wrapper.get('[data-ui="file-grid"]').trigger('contextmenu', { clientX: 100, clientY: 100 })
+    await flushPromises()
+    const current = document.querySelector<HTMLButtonElement>('[data-ui="file-properties-action"]')!
+    expect(current.disabled).toBe(false)
+    current.click()
+    await flushPromises()
+    expect(wrapper.getComponent(FilePropertiesDialog).props('path')).toBe('/home')
   })
   it('统一单选、Ctrl 切换和 Shift 区间选择，切换视图保留选择', async () => {
     const wrapper = render()

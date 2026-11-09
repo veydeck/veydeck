@@ -9,7 +9,7 @@ use veydeck_contracts::{
     disks::{
         CreateDiskOperationRequest, DiskDetail, DiskInventory, DiskOperation, ManagedDiskVolume,
     },
-    files::{FileDocument, FileSaveResult, UpdateFileContentRequest},
+    files::{CreateFileStatisticsRequest, FileEntryDetail, FileStatistics, FileDocument, FileSaveResult, UpdateFileContentRequest},
     firewall::{FirewallRuleDetail, FirewallRuleListPage},
     logging::{
         AgentOperationEvent, OperationEventLabel, OperationImpact, OperationLogDetail,
@@ -80,6 +80,9 @@ fn export_contract_bindings() {
     export_type::<CreateDiskOperationRequest>(&cfg);
     export_type::<DiskOperation>(&cfg);
     export_type::<FileDocument>(&cfg);
+    export_type::<FileEntryDetail>(&cfg);
+    export_type::<FileStatistics>(&cfg);
+    export_type::<CreateFileStatisticsRequest>(&cfg);
     export_type::<FileSaveResult>(&cfg);
     export_type::<UpdateFileContentRequest>(&cfg);
     export_type::<FirewallRuleListPage>(&cfg);

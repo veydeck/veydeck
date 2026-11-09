@@ -109,6 +109,10 @@ pub enum ErrorCode {
     FileOperationConflict,
     FileListSnapshotExpired,
     FileListSnapshotLimit,
+    /// 属性统计会话已经释放，需由用户重新计算。
+    FileStatisticsExpired,
+    /// 当前节点的属性统计并发已满。
+    FileStatisticsBusy,
     FileTaskNotFound,
     FileTaskNotCancellable,
     FileTransferInvalidRange,
@@ -272,6 +276,8 @@ impl ErrorCode {
             ErrorCode::FileOperationConflict => "FILE_OPERATION_CONFLICT",
             ErrorCode::FileListSnapshotExpired => "FILE_LIST_SNAPSHOT_EXPIRED",
             ErrorCode::FileListSnapshotLimit => "FILE_LIST_SNAPSHOT_LIMIT",
+            ErrorCode::FileStatisticsExpired => "FILE_STATISTICS_EXPIRED",
+            ErrorCode::FileStatisticsBusy => "FILE_STATISTICS_BUSY",
             ErrorCode::FileTaskNotFound => "FILE_TASK_NOT_FOUND",
             ErrorCode::FileTaskNotCancellable => "FILE_TASK_NOT_CANCELLABLE",
             ErrorCode::FileTransferInvalidRange => "FILE_TRANSFER_INVALID_RANGE",

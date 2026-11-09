@@ -10,6 +10,7 @@ pub mod docker_project_tasks;
 pub mod docker_projects;
 pub mod docker_stats;
 pub mod file_path_coordinator;
+pub mod file_statistics;
 pub mod file_tasks;
 pub mod file_transfers;
 pub mod files;

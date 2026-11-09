@@ -3,6 +3,7 @@
 use crate::{
     config,
     services::{
+        file_statistics,
         file_tasks::{self, FileTaskActor},
         file_transfers::{self, FileTransferActor},
         files::{self, FileListOptions, FileSortBy, FileSortOrder},
@@ -24,7 +25,7 @@ use std::{io, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use veydeck_contracts::files::{
     CreateDirectoryRequest, CreateFileOperationTaskRequest, CreateFileRequest,
-    CreateFileTransferRequest, UpdateFileContentRequest,
+    CreateFileTransferRequest, CreateFileStatisticsRequest, UpdateFileContentRequest,
 };
 
 const ACTOR_KIND_HEADER: HeaderName = HeaderName::from_static("x-veydeck-actor-kind");
@@ -125,6 +126,30 @@ async fn detail(
     let path = files::normalize_absolute_path(&query.path)?;
     let detail = files::detail(&state.metadata_db, &path).await?;
     Ok(ApiResponse::success_with_raw("File detail loaded", Some(detail)).into_response())
+}
+
+/// 属性查看的临时统计只接收可信调用，不触发文件变更审计。
+async fn create_statistics(
+    _context: FileOperationContext,
+    Json(request): Json<CreateFileStatisticsRequest>,
+) -> ApiResult<Response> {
+    let statistics = file_statistics::create(request).await?;
+    Ok(ApiResponse::success_with_raw("Directory statistics started", Some(statistics)).into_response())
+}
+
+/// 查询并续租当前属性统计。
+async fn statistics_detail(Path(id): Path<String>) -> ApiResult<Response> {
+    let statistics = file_statistics::get(&id)?;
+    Ok(ApiResponse::success_with_raw("Directory statistics loaded", Some(statistics)).into_response())
+}
+
+/// 关闭属性窗口时请求停止扫描。
+async fn cancel_statistics(
+    _context: FileOperationContext,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    let statistics = file_statistics::cancel(&id)?;
+    Ok(ApiResponse::success_with_raw("Directory statistics cancellation requested", Some(statistics)).into_response())
 }
 
 async fn read_content(Query(query): Query<PathQuery>) -> ApiResult<Response> {
@@ -559,6 +584,9 @@ pub fn fs_router() -> Router<Arc<AppState>> {
         .route("/home", get(home))
         .route("/list", get(list))
         .route("/entry/detail", get(detail))
+        .route("/statistics/create", post(create_statistics))
+        .route("/statistics/{id}/detail", get(statistics_detail))
+        .route("/statistics/{id}/cancel", axum::routing::delete(cancel_statistics))
         .route(
             "/content",
             get(read_content)

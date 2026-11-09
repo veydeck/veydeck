@@ -2,6 +2,8 @@ import http from '@/api'
 import type { AxiosProgressEvent } from 'axios'
 import type {
   CreateFileOperationTaskRequest,
+  CreateFileStatisticsRequest,
+  FileStatistics,
   CreateFileTransferRequest,
   FileDocument,
   FileListPage,
@@ -46,7 +48,14 @@ const createScopedFsApi = (nodeId: string) => ({
       options,
     ),
   home: () => http.get<HomeResponse>(nodePath(nodeId, 'files/home')),
-  detail: (path: string) => http.get<FsEntryDetail>(nodePath(nodeId, 'file/detail'), { path }),
+  detail: (path: string, options: { signal?: AbortSignal } = {}) =>
+    http.get<FsEntryDetail>(nodePath(nodeId, 'file/detail'), { path }, options),
+  createStatistics: (payload: CreateFileStatisticsRequest) =>
+    http.post<FileStatistics>(nodePath(nodeId, 'file/statistics/create'), payload),
+  statisticsDetail: (id: string, options: { signal?: AbortSignal } = {}) =>
+    http.get<FileStatistics>(nodePath(nodeId, `file/statistics/${encodeURIComponent(id)}/detail`), undefined, options),
+  cancelStatistics: (id: string) =>
+    http.delete<FileStatistics>(nodePath(nodeId, `file/statistics/${encodeURIComponent(id)}/cancel`)),
   readFile: (path: string) => http.get<FileDocument>(nodePath(nodeId, 'file/content'), { path }),
   createFile: (payload: { path: string; content?: string }) =>
     http.post<FsEntry>(nodePath(nodeId, 'files'), payload),

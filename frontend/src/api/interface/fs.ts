@@ -1,4 +1,7 @@
-export type { FileDocument, FileSaveResult, UpdateFileContentRequest } from '@/api/generated'
+export type {
+  FileDocument, FileSaveResult, UpdateFileContentRequest,
+  FileStatistics, FileStatisticsStatus, CreateFileStatisticsRequest,
+} from '@/api/generated'
 
 /** 文件条目类型。 */
 export type FileEntryKind = 'file' | 'directory' | 'symlink' | 'other'
@@ -42,7 +45,7 @@ export interface FsEntry {
 }
 
 /** 文件详情与列表共享链接目标信息。 */
-export type FsEntryDetail = FsEntry
+export type FsEntryDetail = import('@/api/generated').FileEntryDetail
 
 export interface FileEntryCounts {
   fileCount: number

@@ -1,5 +1,5 @@
 /** 文件图标家族：按条目类型和最长后缀选择已确认的 v01 PNG。 */
-import type { FsEntryDetail } from '@/api/interface/fs'
+import type { FsEntry } from '@/api/interface/fs'
 
 const assets = import.meta.glob<string>('../assets/file-icons/*.png', {
   eager: true,
@@ -126,7 +126,7 @@ export function fileIconUrl(stem: string): string {
 }
 
 /** 按列表提供的目标类型区分目录链接与文件链接，不为绘制图标发起请求。 */
-export function resolveFileIcon(entry: FsEntryDetail): { icon: string; badge?: string } {
+export function resolveFileIcon(entry: FsEntry): { icon: string; badge?: string } {
   const linked = entry.kind === 'symlink'
   const kind = linked ? entry.symlinkTargetKind : entry.kind
   const badge = linked

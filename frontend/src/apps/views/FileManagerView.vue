@@ -7,6 +7,7 @@ import AppContextMenu from '@/components/AppContextMenu.vue'
 import ApplicationDialog from '@/components/layout/ApplicationDialog.vue'
 import ApplicationConfirmationDialog from '@/components/layout/ApplicationConfirmationDialog.vue'
 import FileBrowserContent from '@/components/files/FileBrowserContent.vue'
+import FilePropertiesDialog from '@/components/files/FilePropertiesDialog.vue'
 import { useFileDirectory } from '@/composables/useFileDirectory'
 import { useFileOperations } from '@/composables/useFileOperations'
 import { useApplicationConfirmation } from '@/composables/useApplicationConfirmation'
@@ -84,6 +85,7 @@ const active = computed(() => {
   const window = windows.openWindows?.find((w) => w.id === props.windowId)
   return !!window && !window.isMinimized && window.zIndex === windows.maxZIndex
 })
+const properties = ref<{ nodeId: string; nodeName: string; path: string }>()
 const dialog = ref<{ type: 'file' | 'dir' | 'rename'; entry?: FsEntry }>(),
   inputName = ref('')
 const menu = ref<{
@@ -279,6 +281,7 @@ function keydown(event: KeyboardEvent) {
     !active.value ||
     event.defaultPrevented ||
     dialog.value ||
+    properties.value ||
     confirmationState.value.visible ||
     menu.value
   )
@@ -295,7 +298,10 @@ function keydown(event: KeyboardEvent) {
   const modifier = event.ctrlKey || event.metaKey,
     key = event.key.toLowerCase()
   if (event.altKey) {
-    if (event.key === 'ArrowLeft') {
+    if (event.key === 'Enter' && chosen.value.length === 1) {
+      event.preventDefault()
+      openProperties(chosen.value[0])
+    } else if (event.key === 'ArrowLeft') {
       event.preventDefault()
       void directory.travel(-1)
     } else if (event.key === 'ArrowRight') {
@@ -368,6 +374,16 @@ function setPreference<K extends keyof FileBrowserPreferences>(
 ) {
   browser.preferences[key] = value
   closeMenu()
+}
+/** 固定本次查看的节点与路径，多选不隐式汇总；空白菜单查看当前目录。 */
+function openProperties(entry?: FsEntry) {
+  const target = entry?.path || path.value
+  closeMenu(false)
+  properties.value = {
+    nodeId: nodeId.value,
+    nodeName: nodes.nodes?.find((node) => node.id === nodeId.value)?.name || nodeId.value,
+    path: target,
+  }
 }
 /** 打开菜单后将焦点移入，菜单操作使用当前选择。 */
 async function context(entry: FsEntry | undefined, event: MouseEvent) {
@@ -542,6 +558,7 @@ watch(
     const nextNode = typeof payload?.nodeId === 'string' ? payload.nodeId : nodeId.value
     const target = typeof payload?.path === 'string' ? payload.path : undefined
     if (nextNode !== nodeId.value) {
+      properties.value = undefined
       nodeId.value = nextNode
       void directory.initialize(target)
     } else if (target && target !== path.value) navigate(target)
@@ -1027,8 +1044,16 @@ onUnmounted(() => {
         ><button v-if="!menu?.kind" class="context-menu-btn" role="menuitem" @click="copyPath">
           {{ t('app.fileManager.copyPath') }}
         </button>
+        <div v-if="!menu?.kind" class="properties-menu-divider" role="separator"></div>
+        <button v-if="!menu?.kind" class="context-menu-btn" role="menuitem"
+          data-ui="file-properties-action" :disabled="!!menu?.entry && chosen.length !== 1"
+          @click="openProperties(menu?.entry)">
+          {{ t('fileProperties.title') }}
+        </button>
       </div></AppContextMenu
     >
+    <FilePropertiesDialog v-if="properties" :key="properties.nodeId + ':' + properties.path"
+      v-bind="properties" @close="properties = undefined" />
     <ApplicationDialog
       :visible="!!dialog"
       :title="
@@ -1067,6 +1092,7 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.properties-menu-divider { margin: var(--vdl-space-1) 0; border-top: 1px solid var(--vdl-border-subtle); }
 .file-manager {
   height: 100%;
   min-height: 0;

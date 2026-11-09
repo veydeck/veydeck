@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import type { FsEntryDetail } from '@/api/interface/fs'
+import type { FsEntry } from '@/api/interface/fs'
 import { fileIconUrl, resolveFileIcon } from '@/services/file-icons'
 
 /** 两种文件视图共享的装饰图标，链接角标不替代文件类型。 */
-const props = defineProps<{ entry: FsEntryDetail; size: number }>()
+const props = defineProps<{ entry: FsEntry; size: number }>()
 const appearance = computed(() => resolveFileIcon(props.entry))
 </script>
 

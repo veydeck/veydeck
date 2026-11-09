@@ -30,7 +30,7 @@ use veydeck_contracts::{
     api::ErrorCode,
     files::{
         CreateDirectoryRequest, CreateFileOperationTaskRequest, CreateFileRequest,
-        CreateFileTransferRequest, FileDocument, FileEntryDetail, FileHome, FileListPage,
+        CreateFileTransferRequest, CreateFileStatisticsRequest, FileStatistics, FileDocument, FileEntryDetail, FileHome, FileListPage,
         FileOperationTask, FileSaveDurability, FileSaveResult, FileTransfer,
         UpdateFileContentRequest,
     },
@@ -69,6 +69,9 @@ pub fn file_router() -> Router<Arc<AppState>> {
         .route("/{node_id}/files/home", get(home))
         .route("/{node_id}/files/list", get(list))
         .route("/{node_id}/file/detail", get(detail))
+        .route("/{node_id}/file/statistics/create", post(create_statistics))
+        .route("/{node_id}/file/statistics/{id}/detail", get(statistics_detail))
+        .route("/{node_id}/file/statistics/{id}/cancel", axum::routing::delete(cancel_statistics))
         .route(
             "/{node_id}/file/content",
             get(read_content)
@@ -157,6 +160,51 @@ async fn detail(
     let path = agent_query_path("/entry/detail", &[("path", query.path)])?;
     let data: FileEntryDetail = client.get_domain(&path).await?;
     Ok(ApiResponse::success_with_raw("File detail loaded", Some(data)).into_response())
+}
+
+/// 启动只读目录统计，沿用可信身份边界，不记录为文件变更任务。
+async fn create_statistics(
+    State(state): State<Arc<AppState>>,
+    Path(node_id): Path<String>,
+    admin: AuthenticatedAdmin,
+    headers: HeaderMap,
+    Json(request): Json<CreateFileStatisticsRequest>,
+) -> ApiResult<Response> {
+    let statistics: FileStatistics = mutate_post(
+        &state, &node_id, &admin, &headers, "/statistics/create", &request,
+    ).await?;
+    Ok(ApiResponse::success_with_raw("Directory statistics started", Some(statistics)).into_response())
+}
+
+/// 统计标识须为 UUID，禁止将外部标识作为任意 Agent 路径转发。
+fn statistics_path(id: &str, action: &str) -> ApiResult<String> {
+    let id = uuid::Uuid::parse_str(id).map_err(|_| ApiError::validation("invalid statistics id"))?;
+    Ok(format!("{AGENT_BASE_PATH}/statistics/{id}/{action}"))
+}
+
+/// 获取固定节点上的累计统计并延长查询租约。
+async fn statistics_detail(
+    State(state): State<Arc<AppState>>,
+    Path((node_id, id)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let path = statistics_path(&id, "detail")?;
+    let (client, _) = node_client(&state, &node_id).await?;
+    let statistics: FileStatistics = client.get_domain(&path).await?;
+    Ok(ApiResponse::success_with_raw("Directory statistics loaded", Some(statistics)).into_response())
+}
+
+/// 属性关闭只停止查询扫描，不修改文件系统内容。
+async fn cancel_statistics(
+    State(state): State<Arc<AppState>>,
+    Path((node_id, id)): Path<(String, String)>,
+    admin: AuthenticatedAdmin,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let path = statistics_path(&id, "cancel")?;
+    let (client, _) = node_client(&state, &node_id).await?;
+    let context = operation_context(&admin, &headers)?;
+    let statistics: FileStatistics = client.delete_domain_with_operation_context(&path, &context).await?;
+    Ok(ApiResponse::success_with_raw("Directory statistics cancellation requested", Some(statistics)).into_response())
 }
 
 async fn read_content(
@@ -706,6 +754,19 @@ fn default_sort_order() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 临时统计标识不能逃逸到其他 Agent 路径，合法 UUID 保持固定语义路由。
+    #[test]
+    fn statistics_identifiers_cannot_escape_agent_routes() {
+        for id in ["../entry", "x/detail?path=/etc", "invalid", ""] {
+            assert!(statistics_path(id, "detail").is_err());
+        }
+        let id = uuid::Uuid::now_v7();
+        assert_eq!(
+            statistics_path(&id.to_string(), "cancel").unwrap(),
+            format!("{AGENT_BASE_PATH}/statistics/{id}/cancel")
+        );
+    }
+
     #[test]
     fn list_query_rejects_unbounded_pages() {
         let query = FileListQuery {

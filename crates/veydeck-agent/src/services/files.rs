@@ -303,14 +303,62 @@ pub async fn detail(pool: &DbPool, path: &Path) -> Result<FileEntryDetail, ApiEr
         .unwrap_or_else(|| "/".to_string());
     let mut summary = summary_from_metadata(path, name, &metadata, &roots);
     resolve_summary_symlink(&mut summary, path).await;
+    let uid = metadata.uid();
+    let gid = metadata.gid();
+    let (user_name, group_name) = tokio::task::spawn_blocking(move || owner_names(uid, gid))
+        .await
+        .unwrap_or_default();
     Ok(FileEntryDetail {
         summary,
         mode: metadata.mode(),
         uid: metadata.uid(),
         gid: metadata.gid(),
-        user_name: None,
-        group_name: None,
+        user_name,
+        group_name,
+        accessed_at: metadata.accessed().ok().and_then(timestamp),
+        allocated_bytes: metadata.blocks().saturating_mul(512),
     })
+}
+
+/// 通过可重入 NSS 接口解析所有者；缓冲区不足或身份不存在时降级为数字 ID。
+fn owner_names(uid: u32, gid: u32) -> (Option<String>, Option<String>) {
+    let mut buffer = vec![0_u8; 64 * 1024];
+    // SAFETY: 输出结构与缓冲区在调用及复制名称期间有效；仅在返回非空结果时解引用。
+    unsafe {
+        let mut user: libc::passwd = std::mem::zeroed();
+        let mut user_result = std::ptr::null_mut();
+        let user_name = if libc::getpwuid_r(
+            uid,
+            &mut user,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut user_result,
+        ) == 0
+            && !user_result.is_null()
+            && !user.pw_name.is_null()
+        {
+            Some(std::ffi::CStr::from_ptr(user.pw_name).to_string_lossy().into_owned())
+        } else {
+            None
+        };
+        let mut group: libc::group = std::mem::zeroed();
+        let mut group_result = std::ptr::null_mut();
+        let group_name = if libc::getgrgid_r(
+            gid,
+            &mut group,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut group_result,
+        ) == 0
+            && !group_result.is_null()
+            && !group.gr_name.is_null()
+        {
+            Some(std::ffi::CStr::from_ptr(group.gr_name).to_string_lossy().into_owned())
+        } else {
+            None
+        };
+        (user_name, group_name)
+    }
 }
 
 /// 读取有限大小的 UTF-8 普通文件，符号链接会解析到最终目标。
@@ -921,6 +969,33 @@ pub fn map_io_error(error: io::Error, operation: &'static str) -> ApiError {
 mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    /// 详情的所有者、访问时间与磁盘占用均来自链接自身的 POSIX 元数据。
+    #[tokio::test]
+    async fn properties_include_owner_access_time_and_allocated_space() {
+        let pool = crate::test_support::setup_test_db().await;
+        let root = TestDirectory::new("properties").await;
+        let path = root.0.join("sparse");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(16 * 1024 * 1024).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let value = detail(&pool, &path).await.unwrap();
+        assert_eq!(value.uid, metadata.uid());
+        assert_eq!(value.gid, metadata.gid());
+        assert_eq!(value.mode & 0o7777, 0o640);
+        assert_eq!(value.allocated_bytes, metadata.blocks() * 512);
+        assert_eq!(value.summary.size_bytes, Some(16 * 1024 * 1024));
+        assert_eq!(value.accessed_at, metadata.accessed().ok().and_then(timestamp));
+        let expected = owner_names(metadata.uid(), metadata.gid());
+        assert_eq!((value.user_name, value.group_name), expected);
+        std::os::unix::fs::symlink("sparse", root.0.join("alias")).unwrap();
+        let link_metadata = std::fs::symlink_metadata(root.0.join("alias")).unwrap();
+        let linked = detail(&pool, &root.0.join("alias")).await.unwrap();
+        assert_eq!(linked.mode, link_metadata.mode());
+        assert_eq!(linked.allocated_bytes, link_metadata.blocks() * 512);
+        assert_eq!(linked.summary.symlink_target_kind, Some(FileEntryKind::File));
+    }
 
     struct TestDirectory(PathBuf);
 
