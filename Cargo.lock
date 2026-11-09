@@ -4835,7 +4835,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "veydeck"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -4889,7 +4889,7 @@ dependencies = [
 
 [[package]]
 name = "veydeck-agent"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -4936,7 +4936,7 @@ dependencies = [
 
 [[package]]
 name = "veydeck-api"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "axum",
  "bcrypt",
@@ -4956,7 +4956,7 @@ dependencies = [
 
 [[package]]
 name = "veydeck-contracts"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "axum",
  "chrono",
@@ -4968,7 +4968,7 @@ dependencies = [
 
 [[package]]
 name = "veydeck-ctl"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "anyhow",
  "bcrypt",
@@ -4981,7 +4981,7 @@ dependencies = [
 
 [[package]]
 name = "veydeck-security"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "anyhow",
  "rcgen",
@@ -4990,7 +4990,7 @@ dependencies = [
 
 [[package]]
 name = "veydeck-upgrade"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "base64",
  "blake2b_simd",
