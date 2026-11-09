@@ -46,13 +46,19 @@ export function useFileProperties(nodeId: string, path: string) {
   /** 退出后尽力取消，网络不可用时由 Agent 的查询租约回收兜底。 */
   async function release(id?: string) {
     if (!id) return
-    try { await client.cancelStatistics(id) } catch { /* Agent 空闲回收兜底。 */ }
+    try {
+      await client.cancelStatistics(id)
+    } catch {
+      /* Agent 空闲回收兜底。 */
+    }
   }
 
   /** 每次仅安排一个下一轮查询，避免慢请求与轮询间隔造成并发。 */
   function schedule(token: number) {
     if (disposed || token !== generation || !running(statistics.value)) return
-    timer = setTimeout(() => { void poll(token) }, delay)
+    timer = setTimeout(() => {
+      void poll(token)
+    }, delay)
   }
 
   /** 网络失败保留累计数据，退避到最多十五秒，不误报终态。 */
@@ -117,11 +123,13 @@ export function useFileProperties(nodeId: string, path: string) {
 
   /** 创建请求不被直接中断，关闭期间收到标识后立即取消，避免遗留无主扫描。 */
   async function calculate() {
-    if (!detail.value || starting.value || (running(statistics.value) && !trackingStopped.value)) return
+    if (!detail.value || starting.value || (running(statistics.value) && !trackingStopped.value))
+      return
     const token = generation
     const revision = detail.value.revision
     if (!revision) return
-    const previous = trackingStopped.value && running(statistics.value) ? statistics.value?.id : undefined
+    const previous =
+      trackingStopped.value && running(statistics.value) ? statistics.value?.id : undefined
     starting.value = true
     statisticsError.value = ''
     connectionError.value = false
@@ -140,7 +148,8 @@ export function useFileProperties(nodeId: string, path: string) {
       schedule(token)
     } catch (failure) {
       if (!disposed && token === generation)
-        statisticsError.value = failure instanceof Error ? failure.message : t('fileProperties.loadFailed')
+        statisticsError.value =
+          failure instanceof Error ? failure.message : t('fileProperties.loadFailed')
     } finally {
       if (!disposed && token === generation) starting.value = false
     }
@@ -154,24 +163,43 @@ export function useFileProperties(nodeId: string, path: string) {
     current.status = 'cancelling'
     try {
       const result = await client.cancelStatistics(current.id)
-      if (disposed || token !== generation) return
+      if (disposed || token !== generation || statistics.value?.id !== current.id) return
       if (!result.success || !result.data) throw new Error(message(result))
-      // 取消响应可能晚于终态轮询返回，不能将已结束状态倒退为取消中。
+      // 取消响应只属于当前会话，且不能将已结束状态倒退为取消中。
       if (running(statistics.value)) statistics.value = result.data
     } catch {
-      if (!disposed && token === generation && running(statistics.value)) {
+      if (
+        !disposed &&
+        token === generation &&
+        statistics.value?.id === current.id &&
+        running(statistics.value)
+      ) {
         if (statistics.value?.status === 'cancelling') statistics.value.status = 'running'
         statisticsError.value = t('fileProperties.cancelFailed')
       }
     }
   }
 
-  onMounted(() => { void load() })
+  onMounted(() => {
+    void load()
+  })
   onBeforeUnmount(() => {
     disposed = true
     generation++
     clearRequests()
     if (running(statistics.value)) void release(statistics.value?.id)
   })
-  return { detail, statistics, loading, starting, error, statisticsError, connectionError, trackingStopped, load, calculate, cancel }
+  return {
+    detail,
+    statistics,
+    loading,
+    starting,
+    error,
+    statisticsError,
+    connectionError,
+    trackingStopped,
+    load,
+    calculate,
+    cancel,
+  }
 }
