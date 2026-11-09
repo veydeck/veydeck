@@ -32,12 +32,13 @@ const VERSION_INFO: &str = formatcp!(
     r#"{}
 commit_hash: {}
 build_time: {}
-build_env: {},{}"#,
+rustc: {}
+target: {}"#,
     build::PKG_VERSION,
     build::SHORT_COMMIT,
     build::BUILD_TIME,
     build::RUST_VERSION,
-    build::RUST_CHANNEL
+    build::BUILD_TARGET
 );
 const DEFAULT_PRODUCTION_HOME: &str = "/opt/veydeck";
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
