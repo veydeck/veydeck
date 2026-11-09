@@ -3025,13 +3025,17 @@ const en = {
     targetType: {
       controller: 'Controller',
       agent: 'Agent',
-      controllerNode: 'Controller Node',
+      controllerService: 'Controller Service',
+      localAgent: 'Local Node Agent',
       unknownNode: 'Unknown Node',
     },
     labels: {
       totalProgress: 'Upgrade Total Progress',
-      targetCount: '{count} target(s) total',
-      targetDetail: 'Upgrade Object Details',
+      hostComponentCount: '{hosts} host(s) · {components} component(s)',
+      componentCount: '{count} components',
+      controllerUnitHint:
+        'The controller service and local node agent form one upgrade unit and upgrade in sequence.',
+      targetDetail: 'Upgrade Units',
       currentVersion: 'Current Version',
       targetVersion: 'Target Version',
       currentStatus: 'Current Status',

@@ -3,7 +3,7 @@ import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { upgradesApi } from '@/api/modules/upgrades'
-import type { UpgradePlanDetail } from '@/api/modules/upgrades'
+import type { UpgradePlanDetail, UpgradeTargetRecord } from '@/api/modules/upgrades'
 import { useToastStore } from '@/stores/toast'
 import http from '@/api'
 import { resetAuthState } from '@/router'
@@ -223,15 +223,54 @@ const progressPercent = computed(() => {
   return Math.round(total / upgradePlan.value.targets.length)
 })
 
-// 升级对象排序：如果有主控（controller），其卡片始终置顶于第一位呈现
-const sortedTargets = computed(() => {
-  if (!upgradePlan.value || !upgradePlan.value.targets) return []
-  return [...upgradePlan.value.targets].sort((a, b) => {
-    if (a.targetType === 'controller' && b.targetType !== 'controller') return -1
-    if (a.targetType !== 'controller' && b.targetType === 'controller') return 1
-    return 0
-  })
+/** 同一主机上的升级组件，主控服务与本地节点 Agent 属于同一单元。 */
+interface UpgradeHost {
+  id: string
+  isController: boolean
+  targets: UpgradeTargetRecord[]
+}
+
+/** 主控固定置顶，本地节点 Agent 与主控服务合并展示。 */
+const upgradeHosts = computed<UpgradeHost[]>(() => {
+  const targets = upgradePlan.value?.targets ?? []
+  const controller = targets.find((target) => target.targetType === 'controller')
+  const localAgent = targets.find((target) => target.nodeId === 'local')
+  const controllerTargets = [controller, localAgent].filter(
+    (target): target is UpgradeTargetRecord => Boolean(target),
+  )
+  const hosts: UpgradeHost[] = controllerTargets.length
+    ? [{ id: 'controller', isController: true, targets: controllerTargets }]
+    : []
+  return hosts.concat(
+    targets
+      .filter((target) => target.targetType !== 'controller' && target.nodeId !== 'local')
+      .map((target) => ({
+        id: target.nodeId ?? target.targetId,
+        isController: false,
+        targets: [target],
+      })),
+  )
 })
+
+/** 主机内全部组件成功才显示成功，任何组件失败均保留失败状态。 */
+const getHostStatus = (host: UpgradeHost) => {
+  const statuses = host.targets.map((target) => target.status)
+  if (statuses.includes('failed')) return 'failed'
+  if (statuses.every((status) => status === 'succeeded')) return 'succeeded'
+  if (statuses.includes('running')) return 'running'
+  if (statuses.includes('canceled')) return 'canceled'
+  if (statuses.includes('succeeded')) return 'running'
+  if (statuses.includes('deferred')) return 'deferred'
+  return 'pending'
+}
+
+/** 在组件明细与事件日志中区分主控服务和本地节点 Agent。 */
+const getComponentName = (target: UpgradeTargetRecord) => {
+  if (target.targetType === 'controller') return t('upgradeProgress.targetType.controllerService')
+  return target.nodeId === 'local'
+    ? t('upgradeProgress.targetType.localAgent')
+    : t('upgradeProgress.targetType.agent')
+}
 
 const pageTitle = computed(() => {
   switch (upgradePlan.value?.plan.status) {
@@ -331,7 +370,8 @@ const shortNodeId = (nodeId?: string | null) => {
 }
 
 const getTargetName = (target: { targetType: string; nodeId?: string | null }) => {
-  if (target.targetType === 'controller') return t('upgradeProgress.targetType.controllerNode')
+  if (target.targetType === 'controller') return t('upgradeProgress.targetType.controllerService')
+  if (target.nodeId === 'local') return t('upgradeProgress.targetType.localAgent')
   if (!target.nodeId) return t('upgradeProgress.targetType.unknownNode')
   return upgradePlan.value?.nodeNames?.[target.nodeId] || shortNodeId(target.nodeId)
 }
@@ -394,7 +434,12 @@ onUnmounted(() => {
           <div class="progress-meta">
             <span>
               {{ t('upgradeProgress.labels.totalProgress') }}
-              ({{ t('upgradeProgress.labels.targetCount', { count: upgradePlan.targets.length }) }})
+              ({{
+                t('upgradeProgress.labels.hostComponentCount', {
+                  hosts: upgradeHosts.length,
+                  components: upgradePlan.targets.length,
+                })
+              }})
             </span>
             <span class="percent-text">{{ progressPercent }}%</span>
           </div>
@@ -403,54 +448,82 @@ onUnmounted(() => {
           </div>
         </section>
 
-        <!-- 节点列表 -->
-        <section class="targets-section">
+        <!-- 按主机展示升级单元，组件状态保留在所属主机内部。 -->
+        <section class="targets-section" data-ui="upgrade-hosts">
           <h3>{{ t('upgradeProgress.labels.targetDetail') }}</h3>
           <div class="targets-grid">
             <div
-              v-for="target in sortedTargets"
-              :key="target.targetId"
+              v-for="host in upgradeHosts"
+              :key="host.id"
               class="target-item-card"
+              :class="{ 'controller-host': host.isController }"
               data-ui="upgrade-target-card"
+              :data-host-id="host.id"
             >
               <div class="target-meta">
-                <span class="target-type-badge" :class="target.targetType">
-                  {{
-                    target.targetType === 'controller'
-                      ? t('upgradeProgress.targetType.controller')
-                      : t('upgradeProgress.targetType.agent')
-                  }}
-                </span>
-                <span class="target-name">
-                  {{ getTargetName(target) }}
-                </span>
+                <div class="target-identity">
+                  <h4 class="target-name">
+                    {{
+                      host.isController
+                        ? t('upgradeProgress.targetType.controller')
+                        : getTargetName(host.targets[0]!)
+                    }}
+                  </h4>
+                  <VeyTag type="default">
+                    {{
+                      host.isController
+                        ? t('upgradeProgress.labels.componentCount', { count: host.targets.length })
+                        : t('upgradeProgress.targetType.agent')
+                    }}
+                  </VeyTag>
+                </div>
+                <VeyTag :type="getStatusType(getHostStatus(host))" data-ui="upgrade-host-status">
+                  {{ getStatusLabel(getHostStatus(host)) }}
+                </VeyTag>
               </div>
-              <div v-if="target.nodeId" class="target-node-id code-text">
-                {{ shortNodeId(target.nodeId) }}
+              <p v-if="host.isController" class="host-description">
+                {{ t('upgradeProgress.labels.controllerUnitHint') }}
+              </p>
+              <div v-else class="target-node-id code-text">
+                {{ shortNodeId(host.targets[0]?.nodeId) }}
               </div>
-              <div class="target-details">
-                <div class="detail-row">
-                  <span class="label">{{ t('upgradeProgress.labels.currentVersion') }}:</span>
-                  <span class="val code-text">{{
-                    target.status === 'succeeded'
-                      ? target.targetVersion
-                      : target.currentVersion || t('upgradeProgress.status.unknown')
+              <div class="target-components">
+                <div
+                  v-for="target in host.targets"
+                  :key="target.targetId"
+                  class="component-row"
+                  data-ui="upgrade-component-row"
+                  :data-target-id="target.targetId"
+                >
+                  <span v-if="host.isController" class="component-name">{{
+                    getComponentName(target)
                   }}</span>
+                  <div class="component-field">
+                    <span class="label">{{ t('upgradeProgress.labels.currentVersion') }}</span>
+                    <span class="val code-text">{{
+                      target.status === 'succeeded'
+                        ? target.targetVersion
+                        : target.currentVersion || t('upgradeProgress.status.unknown')
+                    }}</span>
+                  </div>
+                  <div class="component-field">
+                    <span class="label">{{ t('upgradeProgress.labels.targetVersion') }}</span>
+                    <span class="val code-text">{{ target.targetVersion }}</span>
+                  </div>
+                  <div class="component-field component-status">
+                    <span class="label">{{ t('upgradeProgress.labels.currentStatus') }}</span>
+                    <span :class="['status-badge-text', getStatusType(getTargetStatus(target))]">
+                      {{ getStatusLabel(getTargetStatus(target)) }}
+                    </span>
+                  </div>
+                  <div
+                    v-if="target.errorDetail"
+                    class="error-box"
+                    data-ui="upgrade-component-error"
+                  >
+                    {{ target.errorDetail }}
+                  </div>
                 </div>
-                <div class="detail-row">
-                  <span class="label">{{ t('upgradeProgress.labels.targetVersion') }}:</span>
-                  <span class="val code-text">{{ target.targetVersion }}</span>
-                </div>
-                <div class="detail-row status-row">
-                  <span class="label">{{ t('upgradeProgress.labels.currentStatus') }}:</span>
-                  <span :class="['status-badge-text', getStatusType(getTargetStatus(target))]">
-                    {{ getStatusLabel(getTargetStatus(target)) }}
-                  </span>
-                </div>
-              </div>
-              <!-- 错误详情回显 -->
-              <div v-if="target.errorDetail" class="error-box">
-                {{ target.errorDetail }}
               </div>
             </div>
           </div>
@@ -561,6 +634,9 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: var(--vdl-space-5);
+  overflow-y: auto;
+  padding-right: var(--vdl-space-1);
+  scrollbar-gutter: stable;
 }
 
 .brand {
@@ -737,8 +813,7 @@ onUnmounted(() => {
 }
 
 .targets-section {
-  flex: 1 1 260px;
-  min-height: 180px;
+  flex-shrink: 0;
 }
 
 .events-section {
@@ -755,15 +830,14 @@ onUnmounted(() => {
 
 .targets-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
   gap: var(--vdl-space-4);
   min-height: 0;
-  overflow-y: auto;
-  padding-right: var(--vdl-space-1);
-  scrollbar-gutter: stable;
+  align-items: start;
 }
 
 .target-item-card {
+  min-width: 0;
   background: var(--vdl-bg-card);
   border: 1px solid var(--vdl-border-subtle);
   border-radius: var(--vdl-radius-md);
@@ -773,60 +847,86 @@ onUnmounted(() => {
   gap: var(--vdl-space-3);
 }
 
-.target-meta {
+.controller-host {
+  grid-column: 1 / -1;
+}
+
+.target-meta,
+.target-identity {
   display: flex;
   align-items: center;
   gap: var(--vdl-space-2);
-  border-bottom: 1px solid var(--vdl-border-subtle);
-  padding-bottom: var(--vdl-space-2);
+  min-width: 0;
+  flex-wrap: wrap;
 }
 
-.target-type-badge {
-  font-size: var(--vdl-font-caption);
-  font-weight: 600;
-  padding: 2px var(--vdl-space-2);
-  border-radius: var(--vdl-radius-xs);
-}
-
-.target-type-badge.controller {
-  background: color-mix(in srgb, var(--vdl-accent) 16%, transparent);
-  color: var(--vdl-accent);
-}
-
-.target-type-badge.agent {
-  background: var(--vdl-info-soft);
-  color: var(--vdl-primary);
-}
-
-.target-name {
-  font-size: var(--vdl-font-body-sm);
-  font-weight: 600;
-  color: var(--vdl-text-secondary);
-}
-
-.target-node-id {
-  font-size: var(--vdl-font-caption);
-  color: var(--vdl-text-subtle);
-}
-
-.target-details {
-  display: flex;
-  flex-direction: column;
-  gap: var(--vdl-space-2);
-  font-size: var(--vdl-font-caption);
-}
-
-.detail-row {
-  display: flex;
+.target-meta {
   justify-content: space-between;
 }
 
-.detail-row .label {
+.target-name {
+  margin: 0;
+  font-size: var(--vdl-font-body);
+  font-weight: 600;
+  color: var(--vdl-text-primary);
+  overflow-wrap: anywhere;
+}
+
+.target-node-id,
+.host-description {
+  margin: 0;
+  font-size: var(--vdl-font-caption);
+  color: var(--vdl-text-muted);
+  overflow-wrap: anywhere;
+}
+
+.target-components {
+  display: flex;
+  flex-direction: column;
+}
+
+.component-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: center;
+  gap: var(--vdl-space-3);
+  border-top: 1px solid var(--vdl-border-subtle);
+  padding: var(--vdl-space-3) 0;
+  font-size: var(--vdl-font-caption);
+}
+
+.component-row:last-child {
+  padding-bottom: 0;
+}
+
+.controller-host .component-row {
+  grid-template-columns: minmax(130px, 1.1fr) repeat(2, minmax(0, 1fr)) minmax(80px, 0.7fr);
+}
+
+.component-name {
+  color: var(--vdl-text-primary);
+  font-weight: 600;
+}
+
+.component-field {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--vdl-space-1);
+  overflow-wrap: anywhere;
+}
+
+.component-field .label {
   color: var(--vdl-text-muted);
 }
 
-.detail-row .val {
+.component-field .val {
   color: var(--vdl-text-secondary);
+}
+
+.component-row .error-box {
+  grid-column: 1 / -1;
 }
 
 .status-badge-text {
@@ -984,6 +1084,57 @@ onUnmounted(() => {
 
 .code-text {
   font-family: var(--vdl-font-mono);
+}
+
+@media (max-width: 640px) {
+  .upgrade-container {
+    padding: var(--vdl-space-3);
+  }
+
+  .upgrade-card {
+    padding: var(--vdl-space-4);
+    max-height: calc(100dvh - var(--vdl-space-3) * 2);
+    gap: var(--vdl-space-4);
+  }
+
+  .upgrade-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: var(--vdl-space-3);
+  }
+
+  .brand h1 {
+    font-size: var(--vdl-font-title-lg);
+  }
+
+  .plan-info-header,
+  .progress-meta {
+    flex-wrap: wrap;
+    gap: var(--vdl-space-2);
+  }
+
+  .target-ver-badge {
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+
+  .controller-host .component-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .component-name,
+  .component-status {
+    grid-column: 1 / -1;
+  }
+
+  .timeline-item {
+    flex-wrap: wrap;
+  }
+
+  .event-desc {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
