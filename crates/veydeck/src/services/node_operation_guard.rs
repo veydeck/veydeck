@@ -1,6 +1,7 @@
 //! 节点操作守卫：在 API 与最终执行服务中统一校验归属、状态和活动任务。
 
 use crate::models::nodes::{NodeStatus, get_node_by_id};
+use crate::models::upgrades::count_active_node_upgrade_targets;
 use crate::state::DbPool;
 use crate::types::{ApiError, ApiResult};
 use veydeck_contracts::api::ErrorCode;
@@ -81,15 +82,13 @@ pub async fn assert_node_operation(
                   WHERE node_id = ? AND deleted_at IS NULL)
               + (SELECT COUNT(*) FROM suite_instances
                   WHERE node_id = ? AND uninstalled_at IS NULL)
-              + (SELECT COUNT(*) FROM upgrade_targets
-                  WHERE node_id = ? AND status IN ('pending', 'deferred', 'running'))
             "#,
         )
         .bind(node_id)
         .bind(node_id)
-        .bind(node_id)
         .fetch_one(pool)
-        .await?;
+        .await?
+            + count_active_node_upgrade_targets(pool, node_id).await?;
         if reference_count > 0 {
             return Err(ApiError::conflict(
                 ErrorCode::NodeInUse,

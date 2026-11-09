@@ -2,6 +2,7 @@
 
 use crate::models::node_api_types::{NodeCreatePayload, NodeUpdatePayload};
 use crate::models::nodes::{NodeStatus, get_node_by_id};
+use crate::models::upgrades::count_active_node_upgrade_targets;
 use crate::state::DbPool;
 use crate::types::{ApiError, ApiResult};
 use sqlx::{Executor, Row, Sqlite};
@@ -271,12 +272,9 @@ pub async fn delete_node_with_protection(pool: &DbPool, node_id: &str) -> ApiRes
             (SELECT COUNT(*) FROM scheduled_tasks
               WHERE node_id = ? AND deleted_at IS NULL) AS scheduled_tasks,
             (SELECT COUNT(*) FROM suite_instances
-              WHERE node_id = ? AND uninstalled_at IS NULL) AS suite_instances,
-            (SELECT COUNT(*) FROM upgrade_targets
-              WHERE node_id = ? AND status IN ('pending', 'deferred', 'running')) AS active_upgrade_targets
+              WHERE node_id = ? AND uninstalled_at IS NULL) AS suite_instances
         "#,
     )
-    .bind(node_id)
     .bind(node_id)
     .bind(node_id)
     .bind(node_id)
@@ -288,7 +286,8 @@ pub async fn delete_node_with_protection(pool: &DbPool, node_id: &str) -> ApiRes
         active_node_tasks: row.try_get("active_node_tasks")?,
         scheduled_tasks: row.try_get("scheduled_tasks")?,
         suite_instances: row.try_get("suite_instances")?,
-        active_upgrade_targets: row.try_get("active_upgrade_targets")?,
+        active_upgrade_targets: count_active_node_upgrade_targets(&mut *transaction, node_id)
+            .await?,
     };
     if references.total() > 0 {
         return Err(ApiError::conflict(

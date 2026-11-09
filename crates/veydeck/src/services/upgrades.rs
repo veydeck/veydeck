@@ -782,8 +782,8 @@ pub async fn start_plan(
     )?;
     let now = Utc::now().to_rfc3339();
     update_plan_audit_context(pool, plan_id, audit).await?;
-    let started = sqlx::query("UPDATE upgrade_plans SET status='running',started_at=?,finished_at=NULL WHERE plan_id=? AND status IN ('draft','paused') AND NOT EXISTS (SELECT 1 FROM upgrade_plans WHERE status='running')")
-        .bind(&now).bind(plan_id).execute(pool).await?;
+    let started = sqlx::query("UPDATE upgrade_plans SET status='running',started_at=?,finished_at=NULL WHERE plan_id=? AND status IN ('draft','paused') AND NOT EXISTS (SELECT 1 FROM upgrade_plans WHERE status='running') AND NOT EXISTS (SELECT 1 FROM upgrade_targets WHERE status='running' AND plan_id != ?)")
+        .bind(&now).bind(plan_id).bind(plan_id).execute(pool).await?;
     if started.rows_affected() != 1 {
         return Err(ApiError::BadRequest(
             "another upgrade plan is running or this plan has already started".to_string(),
@@ -924,10 +924,22 @@ async fn target_dependencies_ready(pool: &DbPool, target: &UpgradeTargetRecord) 
     let Some(plan) = get_plan(pool, &target.plan_id).await? else {
         return Ok(false);
     };
-    if plan.status != "running" {
+    let targets = list_targets_by_plan(pool, &target.plan_id).await?;
+    let Some(current) = targets
+        .iter()
+        .find(|item| item.target_id == target.target_id)
+    else {
+        return Ok(false);
+    };
+    if current.status == "running" {
+        return Ok(matches!(
+            plan.status.as_str(),
+            "running" | "paused" | "failed" | "canceled"
+        ));
+    }
+    if plan.status != "running" || !matches!(current.status.as_str(), "pending" | "deferred") {
         return Ok(false);
     }
-    let targets = list_targets_by_plan(pool, &target.plan_id).await?;
     Ok(targets.iter().all(|other| {
         let dependency = if target.target_type == "controller" {
             false
@@ -1868,55 +1880,54 @@ async fn reconcile_running_agent_target(
     Ok(())
 }
 
+/// 原子结束计划并取消尚未执行的目标；已经开始的目标继续独立收敛。
 async fn refresh_plan_terminal_status(pool: &DbPool, plan_id: &str) -> ApiResult<()> {
-    let Some(current_plan) = get_plan(pool, plan_id).await? else {
-        return Err(ApiError::NotFound);
-    };
-    if matches!(
-        current_plan.status.as_str(),
-        "succeeded" | "failed" | "canceled"
-    ) {
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let status: String = sqlx::query_scalar("SELECT status FROM upgrade_plans WHERE plan_id=?")
+        .bind(plan_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if matches!(status.as_str(), "succeeded" | "failed" | "canceled") {
         return Ok(());
     }
-    let total = count_targets_by_plan(pool, plan_id).await?;
+    let total = count_targets_by_plan(&mut *transaction, plan_id).await?;
     if total == 0 {
         return Ok(());
     }
-    let succeeded = count_targets_by_plan_status(pool, plan_id, "succeeded").await?;
-    let failed = count_targets_by_plan_status(pool, plan_id, "failed").await?;
-    let canceled = count_targets_by_plan_status(pool, plan_id, "canceled").await?;
-
-    let mut terminal = false;
-    let mut terminal_status = "";
-
-    if succeeded == total {
-        terminal = true;
-        terminal_status = "succeeded";
-    } else if failed + canceled == total || failed > 0 {
-        terminal = true;
-        terminal_status = "failed";
-    }
-
-    if terminal {
-        let now = Utc::now().to_rfc3339();
-        update_plan_status(pool, plan_id, terminal_status, None, Some(&now)).await?;
-        record_event(
-            pool,
-            plan_id,
-            None,
-            &format!("plan_{terminal_status}"),
-            &format!("Upgrade plan {terminal_status}"),
-            json!({
-                "result": terminal_status,
-                "targetCount": total,
-                "succeededCount": succeeded,
-                "failedCount": failed,
-                "canceledCount": canceled,
-            }),
-        )
+    let succeeded = count_targets_by_plan_status(&mut *transaction, plan_id, "succeeded").await?;
+    let failed = count_targets_by_plan_status(&mut *transaction, plan_id, "failed").await?;
+    let mut canceled = count_targets_by_plan_status(&mut *transaction, plan_id, "canceled").await?;
+    let terminal_status = if succeeded == total {
+        "succeeded"
+    } else if failed > 0 || failed + canceled == total {
+        "failed"
+    } else {
+        return Ok(());
+    };
+    let now = Utc::now().to_rfc3339();
+    sqlx::query("UPDATE upgrade_plans SET status=?,finished_at=? WHERE plan_id=?")
+        .bind(terminal_status)
+        .bind(&now)
+        .bind(plan_id)
+        .execute(&mut *transaction)
         .await?;
-        // 不自动删除版本包，升级包物理文件由用户在升级页面手动按需管理和清理
+    if terminal_status == "failed" {
+        let result = sqlx::query("UPDATE upgrade_targets SET status='canceled',sub_status=NULL,finished_at=? WHERE plan_id=? AND status IN ('pending','deferred')")
+            .bind(&now).bind(plan_id).execute(&mut *transaction).await?;
+        canceled += result.rows_affected() as i64;
     }
+    transaction.commit().await?;
+    record_event(
+        pool,
+        plan_id,
+        None,
+        &format!("plan_{terminal_status}"),
+        &format!("Upgrade plan {terminal_status}"),
+        json!({"result": terminal_status, "targetCount": total, "succeededCount": succeeded,
+            "failedCount": failed, "canceledCount": canceled}),
+    )
+    .await?;
     Ok(())
 }
 
@@ -2839,7 +2850,7 @@ fn token_hash(token: &str) -> String {
 /// 运行中的计划使用已验签版本包作为内容依据，执行期间禁止替换或删除。
 async fn ensure_release_not_running(pool: &DbPool, version: &str) -> ApiResult<()> {
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM upgrade_plans WHERE target_version=? AND status='running'",
+        "SELECT COUNT(*) FROM upgrade_plans p WHERE p.target_version=? AND (p.status='running' OR EXISTS (SELECT 1 FROM upgrade_targets t WHERE t.plan_id=p.plan_id AND t.status='running'))",
     )
     .bind(version)
     .fetch_one(pool)
@@ -3354,6 +3365,268 @@ mod tests {
                 .unwrap()
                 .status,
             "pending"
+        );
+    }
+
+    /// 卸载、退役和删除使用同一有效引用规则，不让终态计划的等待记录阻塞节点。
+    #[tokio::test]
+    async fn node_removal_uses_plan_lifecycle_and_preserves_in_flight_protection() {
+        use crate::models::nodes::{NodeStatus, update_node_status};
+        use crate::services::node_inventory::delete_node_with_protection;
+        use crate::services::node_operation_guard::{NodeOperation, assert_node_operation};
+        use veydeck_contracts::api::ErrorCode;
+
+        for plan_status in [
+            "draft",
+            "running",
+            "paused",
+            "succeeded",
+            "failed",
+            "canceled",
+        ] {
+            for target_status in ["pending", "deferred", "running"] {
+                let (pool, audit) = upgrade_fixture().await;
+                let detail = create_plan(
+                    &pool,
+                    current_upgrade_payload(Some(vec!["node-1".to_string()])),
+                    &audit,
+                )
+                .await
+                .unwrap();
+                let target = &detail.targets[0];
+                update_plan_status(&pool, &detail.plan.plan_id, plan_status, None, None)
+                    .await
+                    .unwrap();
+                update_target_status(
+                    &pool,
+                    &target.target_id,
+                    target_status,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                let blocks = target_status == "running"
+                    || matches!(plan_status, "draft" | "running" | "paused");
+                for operation in [NodeOperation::Uninstall, NodeOperation::Retire] {
+                    let result = assert_node_operation(&pool, "node-1", operation, false).await;
+                    if blocks {
+                        assert_eq!(
+                            result.unwrap_err().code,
+                            ErrorCode::NodeInUse,
+                            "{plan_status}/{target_status}"
+                        );
+                    } else {
+                        result.unwrap();
+                    }
+                }
+                update_node_status(&pool, "node-1", NodeStatus::Retired)
+                    .await
+                    .unwrap();
+                let result = delete_node_with_protection(&pool, "node-1").await;
+                if blocks {
+                    assert_eq!(
+                        result.unwrap_err().code,
+                        ErrorCode::NodeInUse,
+                        "{plan_status}/{target_status}"
+                    );
+                } else {
+                    result.unwrap();
+                }
+            }
+        }
+    }
+
+    /// 失败后取消未启动目标，保留历史与故障原因，旧调度快照不能重新启动这些目标。
+    #[tokio::test]
+    async fn failed_plan_cancels_unstarted_targets_and_invalidates_scheduler_snapshot() {
+        let (pool, audit) = upgrade_fixture().await;
+        let detail = create_plan(&pool, current_upgrade_payload(None), &audit)
+            .await
+            .unwrap();
+        start_plan(&pool, &detail.plan.plan_id, &audit)
+            .await
+            .unwrap();
+        let controller = detail
+            .targets
+            .iter()
+            .find(|target| target.target_type == "controller")
+            .unwrap();
+        mark_target_failed(&pool, &controller.target_id, "controller restart failed")
+            .await
+            .unwrap();
+        refresh_plan_terminal_status(&pool, &detail.plan.plan_id)
+            .await
+            .unwrap();
+        let targets = list_targets_by_plan(&pool, &detail.plan.plan_id)
+            .await
+            .unwrap();
+        assert_eq!(targets.len(), detail.targets.len());
+        for target in targets {
+            if target.target_id == controller.target_id {
+                assert_eq!(target.status, "failed");
+                assert_eq!(
+                    target.error_detail.as_deref(),
+                    Some("controller restart failed")
+                );
+            } else {
+                assert_eq!(target.status, "canceled");
+                assert!(target.finished_at.is_some());
+            }
+        }
+        for snapshot in &detail.targets {
+            assert!(!target_dependencies_ready(&pool, snapshot).await.unwrap());
+        }
+        assert!(list_schedulable_targets(&pool).await.unwrap().is_empty());
+        let events = list_events_by_plan(&pool, &detail.plan.plan_id)
+            .await
+            .unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.event_type == "plan_failed")
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&event.metadata).unwrap();
+        assert_eq!(metadata["canceledCount"], 2);
+        refresh_plan_terminal_status(&pool, &detail.plan.plan_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            list_events_by_plan(&pool, &detail.plan.plan_id)
+                .await
+                .unwrap()
+                .len(),
+            events.len()
+        );
+    }
+
+    /// 计划失败后已经执行的目标继续确认结果，收敛前不得启动另一个升级计划。
+    #[tokio::test]
+    async fn terminal_plan_keeps_polling_in_flight_work_and_blocks_new_upgrade() {
+        let (pool, audit) = upgrade_fixture().await;
+        let first = create_plan(&pool, current_upgrade_payload(None), &audit)
+            .await
+            .unwrap();
+        start_plan(&pool, &first.plan.plan_id, &audit)
+            .await
+            .unwrap();
+        let controller = first
+            .targets
+            .iter()
+            .find(|target| target.target_type == "controller")
+            .unwrap();
+        let remote = first
+            .targets
+            .iter()
+            .find(|target| target.node_id.as_deref() == Some("node-1"))
+            .unwrap();
+        update_target_status(
+            &pool,
+            &remote.target_id,
+            "running",
+            Some("restart_scheduled"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        mark_target_failed(&pool, &controller.target_id, "failed")
+            .await
+            .unwrap();
+        refresh_plan_terminal_status(&pool, &first.plan.plan_id)
+            .await
+            .unwrap();
+        assert!(
+            ensure_release_not_running(&pool, &first.plan.target_version)
+                .await
+                .is_err()
+        );
+        let scheduled = list_schedulable_targets(&pool).await.unwrap();
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].target_id, remote.target_id);
+        assert!(
+            target_dependencies_ready(&pool, &scheduled[0])
+                .await
+                .unwrap()
+        );
+        let second = create_plan(
+            &pool,
+            current_upgrade_payload(Some(vec!["node-1".to_string()])),
+            &audit,
+        )
+        .await
+        .unwrap();
+        assert!(
+            start_plan(&pool, &second.plan.plan_id, &audit)
+                .await
+                .is_err()
+        );
+        update_target_status(
+            &pool,
+            &remote.target_id,
+            "succeeded",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(list_schedulable_targets(&pool).await.unwrap().is_empty());
+        assert!(
+            ensure_release_not_running(&pool, &first.plan.target_version)
+                .await
+                .is_ok()
+        );
+        start_plan(&pool, &second.plan.plan_id, &audit)
+            .await
+            .unwrap();
+    }
+
+    /// 未执行目标的取消写入失败时，计划终态必须一起回滚，避免留下不一致状态。
+    #[tokio::test]
+    async fn failed_plan_and_target_cancellation_are_atomic() {
+        let (pool, audit) = upgrade_fixture().await;
+        let detail = create_plan(&pool, current_upgrade_payload(None), &audit)
+            .await
+            .unwrap();
+        start_plan(&pool, &detail.plan.plan_id, &audit)
+            .await
+            .unwrap();
+        let controller = detail
+            .targets
+            .iter()
+            .find(|target| target.target_type == "controller")
+            .unwrap();
+        mark_target_failed(&pool, &controller.target_id, "failed")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER reject_target_cancellation BEFORE UPDATE OF status ON upgrade_targets WHEN NEW.status='canceled' BEGIN SELECT RAISE(ABORT, 'test cancellation failure'); END")
+            .execute(&pool).await.unwrap();
+        assert!(
+            refresh_plan_terminal_status(&pool, &detail.plan.plan_id)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            get_plan(&pool, &detail.plan.plan_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "running"
+        );
+        let targets = list_targets_by_plan(&pool, &detail.plan.plan_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            targets
+                .iter()
+                .filter(|target| target.status == "canceled")
+                .count(),
+            0
         );
     }
 

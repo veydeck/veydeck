@@ -2,7 +2,7 @@
 
 use crate::state::DbPool;
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
+use sqlx::{Executor, FromRow, Sqlite};
 
 /// 升级制品摘要。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -427,8 +427,8 @@ pub async fn list_schedulable_targets(pool: &DbPool) -> sqlx::Result<Vec<Upgrade
         FROM upgrade_targets t
         INNER JOIN upgrade_plans p
           ON p.plan_id = t.plan_id
-        WHERE p.status = 'running'
-          AND t.status IN ('pending', 'deferred', 'running')
+        WHERE (p.status = 'running' AND t.status IN ('pending', 'deferred', 'running'))
+           OR (p.status IN ('paused', 'failed', 'canceled') AND t.status = 'running')
         ORDER BY CASE
             WHEN t.target_type = 'controller' THEN 0
             WHEN t.node_id = 'local' THEN 1
@@ -500,12 +500,40 @@ pub async fn mark_target_failed(
     Ok(())
 }
 
+/// 未结束计划的待执行目标与已经开始的目标仍占用节点，终态计划的等待记录不再占用。
+pub async fn count_active_node_upgrade_targets<'e, E>(
+    executor: E,
+    node_id: &str,
+) -> sqlx::Result<i64>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM upgrade_targets t
+        INNER JOIN upgrade_plans p ON p.plan_id = t.plan_id
+        WHERE t.node_id = ?
+          AND (
+              t.status = 'running'
+              OR (t.status IN ('pending', 'deferred') AND p.status IN ('draft', 'running', 'paused'))
+          )
+        "#,
+    )
+    .bind(node_id)
+    .fetch_one(executor)
+    .await
+}
+
 /// 统计计划内各目标状态数量。
-pub async fn count_targets_by_plan_status(
-    pool: &DbPool,
+pub async fn count_targets_by_plan_status<'e, E>(
+    executor: E,
     plan_id: &str,
     status: &str,
-) -> sqlx::Result<i64> {
+) -> sqlx::Result<i64>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     sqlx::query_scalar(
         r#"
         SELECT COUNT(*)
@@ -516,12 +544,15 @@ pub async fn count_targets_by_plan_status(
     )
     .bind(plan_id)
     .bind(status)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
 /// 统计计划目标总数。
-pub async fn count_targets_by_plan(pool: &DbPool, plan_id: &str) -> sqlx::Result<i64> {
+pub async fn count_targets_by_plan<'e, E>(executor: E, plan_id: &str) -> sqlx::Result<i64>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     sqlx::query_scalar(
         r#"
         SELECT COUNT(*)
@@ -530,7 +561,7 @@ pub async fn count_targets_by_plan(pool: &DbPool, plan_id: &str) -> sqlx::Result
         "#,
     )
     .bind(plan_id)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
