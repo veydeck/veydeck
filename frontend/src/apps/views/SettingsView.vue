@@ -43,7 +43,6 @@ const { t, te } = useI18n()
 const toastStore = useToastStore()
 const windowStore = useWindowManagerStore()
 const confirmationStore = useConfirmationModalStore()
-const appVersion = import.meta.env.VITE_APP_VERSION ?? 'unknown'
 
 const networkBusy = ref(false)
 const monitoringBusy = ref(false)
@@ -84,11 +83,6 @@ const uploadStatusText = computed(() => {
   }
   return t('app.settings.upgrade.uploadProgress', { percent: uploadProgress.value })
 })
-
-const normalizeDisplayVersion = (version: string) => version.trim().replace(/^v/i, '')
-
-const isSameAsCurrentVersion = (version: string) =>
-  normalizeDisplayVersion(version) === normalizeDisplayVersion(appVersion)
 
 // 升级进度百分比计算
 const upgradeProgressPercent = computed(() => {
@@ -437,7 +431,7 @@ const uploadUpgradeRelease = async () => {
   }
 }
 
-const startClusterUpgrade = async (overwriteSameVersion = false) => {
+const startClusterUpgrade = async () => {
   if (!selectedUpgradeVersion.value) {
     toastStore.error(t('app.settings.upgrade.selectVersion'))
     return
@@ -448,7 +442,6 @@ const startClusterUpgrade = async (overwriteSameVersion = false) => {
       targetVersion: selectedUpgradeVersion.value,
       component: 'cluster',
       includeOffline: true,
-      overwriteSameVersion,
     })
     if (!createResponse.success || !createResponse.data) {
       toastStore.error(createResponse.message || t('app.settings.upgrade.startFailed'))
@@ -506,18 +499,15 @@ const isTargetVersionEligible = (targetVersion: string) => {
 }
 
 const startUpgradeForVersion = async (version: string) => {
-  const overwriteSameVersion = isSameAsCurrentVersion(version)
   const confirmed = await confirmationStore.showConfirmation(
-    overwriteSameVersion
-      ? t('app.settings.upgrade.overwriteSameVersionConfirm', { version })
-      : t('app.settings.upgrade.startConfirm', { version }),
+    t('app.settings.upgrade.startConfirm', { version }),
     t('app.settings.upgrade.start'),
     t('common.confirm'),
     t('common.cancel'),
   )
   if (!confirmed) return
   selectedUpgradeVersion.value = version
-  await startClusterUpgrade(overwriteSameVersion)
+  await startClusterUpgrade()
 }
 
 /** 检测目标版本与当前已安装套件的平台契约兼容性。 */

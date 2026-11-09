@@ -481,10 +481,7 @@ onUnmounted(() => {
                   {{ getStatusLabel(getHostStatus(host)) }}
                 </VeyTag>
               </div>
-              <p v-if="host.isController" class="host-description">
-                {{ t('upgradeProgress.labels.controllerUnitHint') }}
-              </p>
-              <div v-else class="target-node-id code-text">
+              <div v-if="!host.isController" class="target-node-id code-text">
                 {{ shortNodeId(host.targets[0]?.nodeId) }}
               </div>
               <div class="target-components">
@@ -872,8 +869,7 @@ onUnmounted(() => {
   overflow-wrap: anywhere;
 }
 
-.target-node-id,
-.host-description {
+.target-node-id {
   margin: 0;
   font-size: var(--vdl-font-caption);
   color: var(--vdl-text-muted);

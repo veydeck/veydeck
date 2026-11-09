@@ -1942,9 +1942,7 @@ const en = {
         deleteFailed: 'Failed to delete release package',
         validating: 'Parsing and validating package, please wait...',
         invalidFormat: 'Invalid package format. Only .tar.gz or .tgz files are supported.',
-        startConfirm: 'Are you sure you want to upgrade the cluster to version {version}?',
-        overwriteSameVersionConfirm:
-          'The controller is already running version {version}. Reinstall this version and continue same-version node upgrades?',
+        startConfirm: 'Upgrade the system to {version}?',
         plan: 'Upgrade Plan',
         targets: 'Targets',
         version: 'Version',
@@ -2982,9 +2980,6 @@ const en = {
         selectedCount: 'Selected {count} online node(s)',
         targetVersion: 'Running Controller Version',
         versionPlaceholder: 'No package for the running controller version',
-        overwriteSameVersion: 'Overwrite same-version nodes',
-        overwriteSameVersionTip:
-          'When enabled, nodes already running the target version will download and reinstall it.',
         submit: 'Start Sync',
         cancel: 'Cancel',
         noReleases: 'Import the running controller version package in system settings first',
@@ -3033,8 +3028,6 @@ const en = {
       totalProgress: 'Upgrade Total Progress',
       hostComponentCount: '{hosts} host(s) · {components} component(s)',
       componentCount: '{count} components',
-      controllerUnitHint:
-        'The controller service and local node agent form one upgrade unit and upgrade in sequence.',
       targetDetail: 'Upgrade Units',
       currentVersion: 'Current Version',
       targetVersion: 'Target Version',

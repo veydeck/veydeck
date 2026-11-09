@@ -29,14 +29,17 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use veydeck_api::response::ApiResponse as RuntimeApiResponse;
 use veydeck_upgrade::{
-    COMPONENT_AGENT, COMPONENT_CONTROLLER, component_artifact_names, compute_sha256_hex,
-    current_target_triple, extract_named_file_from_tar_gz, normalize_target_triple,
-    normalize_version as normalize_semver_version, parse_checksum_text, release_package_names,
-    verify_release_signature, verify_sha256,
+    COMPONENT_AGENT, COMPONENT_CONTROLLER, component_artifact_names, compute_file_sha256,
+    compute_sha256_hex, current_target_triple, extract_named_file_from_tar_gz,
+    normalize_target_triple, normalize_version as normalize_semver_version, parse_checksum_text,
+    release_package_names, running_executable_sha256, verify_release_signature, verify_sha256,
 };
 
 /// 区分主控进程实例，防止同版本覆盖时将发起重启的进程判定为新进程。
 static CONTROLLER_PROCESS_TOKEN: LazyLock<String> = LazyLock::new(new_uuid_v7);
+
+/// 串行化计划启动与版本包变更，保证执行期间读取的签名包不会被替换。
+static RELEASE_ARTIFACT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// 创建升级计划的入参。
 #[derive(Debug, Clone, Deserialize)]
@@ -46,7 +49,6 @@ pub struct UpgradePlanCreatePayload {
     pub component: String,
     pub node_ids: Option<Vec<String>>,
     pub include_offline: Option<bool>,
-    pub overwrite_same_version: Option<bool>,
     pub max_concurrency: Option<u32>,
     pub failure_threshold_percent: Option<u32>,
 }
@@ -137,6 +139,7 @@ pub struct CachedUpgradeArtifact {
     pub path: PathBuf,
     pub file_name: String,
     pub sha256: String,
+    pub binary_sha256: String,
     pub signature: String,
     pub signature_path: PathBuf,
     pub target_triple: String,
@@ -169,6 +172,15 @@ struct AgentUpgradeState {
     target_version: Option<String>,
     status: String,
     error_detail: Option<String>,
+}
+
+/// 完成替换后的运行指纹；仅在新版 Agent 已经启动后用于最终确认。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentUpgradeStatus {
+    #[serde(flatten)]
+    state: AgentUpgradeState,
+    current_binary_sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -506,7 +518,6 @@ pub async fn create_plan(
     let strategy = json!({
         "maxConcurrency": payload.max_concurrency.unwrap_or(3).clamp(1, 100),
         "failureThresholdPercent": payload.failure_threshold_percent.unwrap_or(20).clamp(1, 100),
-        "overwriteSameVersion": payload.overwrite_same_version.unwrap_or(false),
     });
     let now = Utc::now().to_rfc3339();
     let plan = UpgradePlanRecord {
@@ -743,6 +754,7 @@ pub async fn start_plan(
     plan_id: &str,
     audit: &UpgradeAuditContext,
 ) -> ApiResult<UpgradePlanDetail> {
+    let _artifact_guard = RELEASE_ARTIFACT_LOCK.lock().await;
     let plan = get_plan(pool, plan_id).await?.ok_or(ApiError::NotFound)?;
     if plan.status != "draft" && plan.status != "paused" {
         return Err(ApiError::BadRequest(
@@ -933,8 +945,16 @@ async fn reconcile_controller_target(pool: &DbPool, target: &UpgradeTargetRecord
         reconcile_running_controller_target(pool, target).await?;
         return Ok(());
     }
-    let overwrite_same_version = target_plan_overwrites_same_version(pool, &target.plan_id).await?;
-    if !overwrite_same_version && env!("CARGO_PKG_VERSION") == target.target_version {
+    let target_triple = current_target_triple();
+    let artifact =
+        ensure_artifact_cached(pool, &target.target_version, "controller", target_triple).await?;
+    let running_hash = read_running_binary_sha256().await?;
+    if binary_matches_target(
+        target,
+        env!("CARGO_PKG_VERSION"),
+        &running_hash,
+        &artifact.binary_sha256,
+    ) {
         let now = Utc::now().to_rfc3339();
         update_target_status(
             pool,
@@ -951,10 +971,11 @@ async fn reconcile_controller_target(pool: &DbPool, target: &UpgradeTargetRecord
             &target.plan_id,
             Some(&target.target_id),
             "target_succeeded",
-            "Controller upgrade target succeeded (already up-to-date)",
+            "Controller upgrade target succeeded (version and executable SHA-256 match)",
             json!({
                 "currentVersion": env!("CARGO_PKG_VERSION"),
                 "targetVersion": target.target_version,
+                "binarySha256": artifact.binary_sha256,
                 "skipped": true
             }),
         )
@@ -983,10 +1004,6 @@ async fn reconcile_controller_target(pool: &DbPool, target: &UpgradeTargetRecord
     )
     .await?;
 
-    let target_triple = current_target_triple();
-    let artifact =
-        ensure_artifact_cached(pool, &target.target_version, "controller", target_triple).await?;
-
     update_target_status(
         pool,
         &target.target_id,
@@ -998,7 +1015,7 @@ async fn reconcile_controller_target(pool: &DbPool, target: &UpgradeTargetRecord
     )
     .await?;
     let current = std::env::current_exe().map_err(ApiError::Io)?;
-    apply_controller_artifact(&artifact.path).await?;
+    apply_controller_artifact(&artifact).await?;
 
     let restart_started_at = Utc::now().to_rfc3339();
     update_target_status(
@@ -1020,6 +1037,7 @@ async fn reconcile_controller_target(pool: &DbPool, target: &UpgradeTargetRecord
         json!({
             "artifact": artifact.file_name,
             "controllerProcessToken": CONTROLLER_PROCESS_TOKEN.as_str(),
+            "binarySha256": artifact.binary_sha256,
             "restartUnit": format!("veydeck-upgrade-restart-{}", target.target_id),
         }),
     )
@@ -1037,6 +1055,16 @@ async fn reconcile_running_controller_target(
     if target.sub_status.as_deref() != Some("restarting") {
         return Ok(());
     }
+    let expected_hash = target_binary_sha256(pool, target).await?;
+    reconcile_running_controller_with_hash(pool, target, &expected_hash).await
+}
+
+/// 使用已验签目标内容确认进程切换，不从审计字段重建升级目标。
+async fn reconcile_running_controller_with_hash(
+    pool: &DbPool,
+    target: &UpgradeTargetRecord,
+    expected_hash: &str,
+) -> ApiResult<()> {
     let event = list_events_by_plan(pool, &target.plan_id)
         .await?
         .into_iter()
@@ -1054,7 +1082,13 @@ async fn reconcile_running_controller_target(
         .ok_or_else(|| {
             ApiError::Internal("controller restart process token is missing".to_string())
         })?;
-    if !controller_target_restarted_on_target_version(target, source_process) {
+    let running_hash = read_running_binary_sha256().await?;
+    if !controller_target_restarted_on_target_version(
+        target,
+        source_process,
+        expected_hash,
+        &running_hash,
+    ) {
         if crate::config::get().upgrade.controller_auto_restart && upgrade_restart_timed_out(target)
         {
             return Err(ApiError::Internal(
@@ -1092,29 +1126,103 @@ async fn reconcile_running_controller_target(
     Ok(())
 }
 
+/// 对已验签组件包内的可执行文件取摘要，压缩时间戳等包元数据不参与比较。
+fn artifact_binary_sha256(bytes: &[u8], component: &str) -> ApiResult<String> {
+    let binary_name = match component {
+        "controller" => "veydeck",
+        "agent" => "veydeck-agent",
+        _ => {
+            return Err(ApiError::BadRequest(
+                "unknown upgrade component".to_string(),
+            ));
+        }
+    };
+    let binary = extract_named_file_from_tar_gz(bytes, binary_name)
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    Ok(compute_sha256_hex(&binary))
+}
+
+/// 运行版本与可执行文件内容同时一致才允许跳过或完成升级。
+fn binary_matches_target(
+    target: &UpgradeTargetRecord,
+    current_version: &str,
+    current_hash: &str,
+    expected_hash: &str,
+) -> bool {
+    current_version == target.target_version && current_hash == expected_hash
+}
+
+/// 在阻塞线程读取进程映像摘要，原子替换后仍能辨别尚未重启的旧进程。
+async fn read_running_binary_sha256() -> ApiResult<String> {
+    tokio::task::spawn_blocking(running_executable_sha256)
+        .await
+        .map_err(|err| ApiError::Internal(format!("failed to hash running controller: {err}")))?
+        .map_err(ApiError::Io)
+}
+
+/// 目标内容以已验签升级包为准，审计事件只记录执行过程。
+async fn target_binary_sha256(pool: &DbPool, target: &UpgradeTargetRecord) -> ApiResult<String> {
+    let component = if target.target_type == "controller" {
+        "controller"
+    } else {
+        "agent"
+    };
+    let triple =
+        if target.target_type == "controller" || target.node_id.as_deref() == Some("local") {
+            current_target_triple().to_string()
+        } else {
+            node_target_triple(
+                pool,
+                target.node_id.as_deref().ok_or_else(|| {
+                    ApiError::Internal("agent target node is missing".to_string())
+                })?,
+            )
+            .await?
+        };
+    Ok(
+        ensure_artifact_cached(pool, &target.target_version, component, &triple)
+            .await?
+            .binary_sha256,
+    )
+}
+
 /// 只有其他主控进程实例运行目标版本时，才确认本次重启完成。
 fn controller_target_restarted_on_target_version(
     target: &UpgradeTargetRecord,
     source_process: &str,
+    expected_hash: &str,
+    running_hash: &str,
 ) -> bool {
     target.target_type == "controller"
         && target.status == "running"
         && target.sub_status.as_deref() == Some("restarting")
-        && env!("CARGO_PKG_VERSION") == target.target_version
+        && binary_matches_target(
+            target,
+            env!("CARGO_PKG_VERSION"),
+            running_hash,
+            expected_hash,
+        )
         && source_process != CONTROLLER_PROCESS_TOKEN.as_str()
 }
 
-async fn apply_controller_artifact(artifact_path: &Path) -> ApiResult<()> {
+async fn apply_controller_artifact(artifact: &CachedUpgradeArtifact) -> ApiResult<()> {
     let current = std::env::current_exe()
         .map_err(|err| ApiError::Internal(format!("failed to resolve current binary: {err}")))?;
-    replace_local_binary(artifact_path, &current, "veydeck").await
+    replace_local_binary(&artifact.path, &current, "veydeck", &artifact.binary_sha256).await
 }
 
 /// 将已校验制品中的二进制暂存到目标目录，并保留备份后原子替换。
-async fn replace_local_binary(artifact_path: &Path, current: &Path, name: &str) -> ApiResult<()> {
+async fn replace_local_binary(
+    artifact_path: &Path,
+    current: &Path,
+    name: &str,
+    expected_hash: &str,
+) -> ApiResult<()> {
     let archive_bytes = tokio::fs::read(artifact_path).await.map_err(ApiError::Io)?;
     let binary = extract_named_file_from_tar_gz(&archive_bytes, name)
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    verify_sha256(&binary, expected_hash)
+        .map_err(|err| ApiError::BadRequest(format!("staged executable {err}")))?;
     let backup_dir =
         PathBuf::from(&crate::config::get().upgrade.download_cache_dir).join("controller-backup");
     tokio::fs::create_dir_all(&backup_dir)
@@ -1219,14 +1327,21 @@ fn upgrade_restart_timed_out(target: &UpgradeTargetRecord) -> bool {
 /// 同版本覆盖必须确认新会话，避免把仍在运行的旧进程误判为升级完成。
 fn agent_target_running_version_ready(
     target: &UpgradeTargetRecord,
-    state: Option<&AgentUpgradeState>,
+    state: Option<&AgentUpgradeStatus>,
     registered_at: Option<&str>,
-    overwrite: bool,
+    expected_hash: &str,
 ) -> bool {
-    if state.is_none_or(|state| state.current_version != target.target_version) {
+    if state.is_none_or(|state| {
+        !binary_matches_target(
+            target,
+            &state.state.current_version,
+            &state.current_binary_sha256,
+            expected_hash,
+        )
+    }) {
         return false;
     }
-    if !overwrite && target.status != "running" {
+    if target.status != "running" {
         return true;
     }
     match (registered_at, target.started_at.as_deref()) {
@@ -1243,28 +1358,104 @@ fn agent_target_running_version_ready(
     }
 }
 
+/// 查询本地 Agent 服务的实际主进程，拒绝将磁盘安装文件当作运行映像。
+async fn local_agent_main_pid() -> ApiResult<u32> {
+    let output = tokio::process::Command::new("systemctl")
+        .args([
+            "show",
+            "veydeck-agent.service",
+            "--property=MainPID",
+            "--value",
+        ])
+        .output()
+        .await
+        .map_err(ApiError::Io)?;
+    if !output.status.success() {
+        return Err(ApiError::Internal(format!(
+            "failed to read local Agent PID: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| {
+            ApiError::Internal("local Agent service has no running main process".to_string())
+        })
+}
+
+/// 主控直接读取本机 Agent 进程文件，避免升级前依赖 Agent 的新增状态字段。
+async fn read_process_binary_sha256(pid: u32) -> ApiResult<String> {
+    tokio::task::spawn_blocking(move || {
+        compute_file_sha256(&PathBuf::from(format!("/proc/{pid}/exe")))
+    })
+    .await
+    .map_err(|err| ApiError::Internal(format!("failed to hash Agent process: {err}")))?
+    .map_err(ApiError::Io)
+}
+
+/// 同一次观测内保持 PID 稳定，版本读取沿用基本状态协议。
+async fn local_agent_status(client: &NodeRuntimeClient) -> ApiResult<AgentUpgradeStatus> {
+    let pid = local_agent_main_pid().await?;
+    let response = client
+        .get_json::<RuntimeApiResponse<AgentUpgradeState>>("/api/v1/agent/upgrade/status")
+        .await
+        .map_err(|err| ApiError::Internal(format!("local Agent status request failed: {err}")))?;
+    let state = unwrap_runtime_api_response(response)?;
+    let hash = read_process_binary_sha256(pid).await?;
+    if local_agent_main_pid().await? != pid {
+        return Err(ApiError::Internal(
+            "local Agent process changed while reading its fingerprint".to_string(),
+        ));
+    }
+    Ok(AgentUpgradeStatus {
+        state,
+        current_binary_sha256: hash,
+    })
+}
+
 /// 本地节点由主控直接替换 Agent，并通过本地会话确认重启后的运行版本。
 async fn reconcile_local_agent_target(
     pool: &DbPool,
     target: &UpgradeTargetRecord,
 ) -> ApiResult<()> {
     let session = get_active_session_by_node_id(pool, "local").await?;
-    let state = match NodeRuntimeClient::from_node_route(pool, Some("local")).await {
-        Ok(client) => client
-            .get_json::<RuntimeApiResponse<AgentUpgradeState>>("/api/v1/agent/upgrade/status")
-            .await
-            .ok()
-            .and_then(|response| unwrap_runtime_api_response(response).ok()),
-        Err(_) => None,
+    let state = async {
+        let client = NodeRuntimeClient::from_node_route(pool, Some("local")).await?;
+        local_agent_status(&client).await
+    }
+    .await;
+    let state = match state {
+        Ok(state) => Some(state),
+        Err(_) if target.status == "running" && !upgrade_restart_timed_out(target) => None,
+        Err(err) => return Err(err),
     };
-    let overwrite = target_plan_overwrites_same_version(pool, &target.plan_id).await?;
+    let artifact = if target.status == "running" {
+        None
+    } else {
+        Some(
+            ensure_artifact_cached(
+                pool,
+                &target.target_version,
+                "agent",
+                current_target_triple(),
+            )
+            .await?,
+        )
+    };
+    let expected_hash = match &artifact {
+        Some(artifact) => artifact.binary_sha256.clone(),
+        None => target_binary_sha256(pool, target).await?,
+    };
     if agent_target_running_version_ready(
         target,
         state.as_ref(),
         session
             .as_ref()
             .map(|session| session.registered_at.as_str()),
-        overwrite,
+        &expected_hash,
     ) {
         let now = Utc::now().to_rfc3339();
         update_target_status(
@@ -1283,7 +1474,7 @@ async fn reconcile_local_agent_target(
             Some(&target.target_id),
             "target_succeeded",
             "Local node Agent is running the target version",
-            json!({"nodeId": "local", "currentVersion": target.target_version}),
+            json!({"nodeId": "local", "currentVersion": target.target_version, "binarySha256": expected_hash, "skipped": target.status != "running"}),
         )
         .await?;
         refresh_plan_terminal_status(pool, &target.plan_id).await?;
@@ -1298,17 +1489,18 @@ async fn reconcile_local_agent_target(
         }
         return Ok(());
     }
-    let artifact = ensure_artifact_cached(
-        pool,
-        &target.target_version,
-        "agent",
-        current_target_triple(),
-    )
-    .await?;
+    let artifact = artifact
+        .ok_or_else(|| ApiError::Internal("local Agent upgrade artifact is missing".to_string()))?;
     let current = tokio::fs::canonicalize(&crate::config::get().agent_binary)
         .await
         .map_err(ApiError::Io)?;
-    replace_local_binary(&artifact.path, &current, "veydeck-agent").await?;
+    replace_local_binary(
+        &artifact.path,
+        &current,
+        "veydeck-agent",
+        &artifact.binary_sha256,
+    )
+    .await?;
     let now = Utc::now().to_rfc3339();
     update_target_status(
         pool,
@@ -1326,7 +1518,7 @@ async fn reconcile_local_agent_target(
         Some(&target.target_id),
         "target_apply_submitted",
         "Local node Agent binary replaced and restart submitted",
-        json!({"nodeId": "local"}),
+        json!({"nodeId": "local", "binarySha256": artifact.binary_sha256}),
     )
     .await?;
     restart_upgrade_service("veydeck-agent").await
@@ -1373,50 +1565,13 @@ async fn reconcile_agent_target(pool: &DbPool, target: &UpgradeTargetRecord) -> 
         }
         Err(err) => return Err(err),
     };
-    let overwrite_same_version = target_plan_overwrites_same_version(pool, &target.plan_id).await?;
-
-    if !overwrite_same_version
-        && matches!(target.status.as_str(), "pending" | "deferred")
-        && let Ok(RuntimeApiResponse {
-            data: Some(state), ..
-        }) = client
-            .get_json::<RuntimeApiResponse<AgentUpgradeState>>("/api/v1/agent/upgrade/status")
-            .await
-        && state.current_version == target.target_version
-    {
-        let now = Utc::now().to_rfc3339();
-        update_target_status(
-            pool,
-            &target.target_id,
-            "succeeded",
-            None,
-            None,
-            None,
-            Some(&now),
-        )
-        .await?;
-        record_event(
-            pool,
-            &target.plan_id,
-            Some(&target.target_id),
-            "target_succeeded",
-            "Agent upgrade target succeeded (already up-to-date)",
-            json!({
-                "currentVersion": state.current_version,
-                "targetVersion": target.target_version,
-                "skipped": true
-            }),
-        )
-        .await?;
-        refresh_plan_terminal_status(pool, &target.plan_id).await?;
-        return Ok(());
-    }
-
     if target.status == "running" {
         reconcile_running_agent_target(pool, target, &client).await?;
         return Ok(());
     }
-
+    let target_triple = node_target_triple(pool, node_id).await?;
+    let artifact =
+        ensure_artifact_cached(pool, &target.target_version, "agent", &target_triple).await?;
     let now = Utc::now().to_rfc3339();
     update_target_status(
         pool,
@@ -1438,9 +1593,6 @@ async fn reconcile_agent_target(pool: &DbPool, target: &UpgradeTargetRecord) -> 
     )
     .await?;
 
-    let target_triple = node_target_triple(pool, node_id).await?;
-    let artifact =
-        ensure_artifact_cached(pool, &target.target_version, "agent", &target_triple).await?;
     let token = issue_artifact_download_token(
         pool,
         &target.plan_id,
@@ -1515,7 +1667,31 @@ async fn reconcile_agent_target(pool: &DbPool, target: &UpgradeTargetRecord) -> 
             return Err(ApiError::Internal(detail));
         }
     };
-    unwrap_runtime_api_response(prepare)?;
+    let prepared = unwrap_runtime_api_response(prepare)?;
+    if prepared_target_is_unchanged(target, &prepared)? {
+        let now = Utc::now().to_rfc3339();
+        update_target_status(
+            pool,
+            &target.target_id,
+            "succeeded",
+            None,
+            None,
+            None,
+            Some(&now),
+        )
+        .await?;
+        record_event(
+            pool,
+            &target.plan_id,
+            Some(&target.target_id),
+            "target_succeeded",
+            "Agent verified matching executable content; replacement skipped",
+            json!({"nodeId": node_id, "binarySha256": artifact.binary_sha256, "skipped": true}),
+        )
+        .await?;
+        refresh_plan_terminal_status(pool, &target.plan_id).await?;
+        return Ok(());
+    }
     record_event(
         pool,
         &target.plan_id,
@@ -1553,10 +1729,32 @@ async fn reconcile_agent_target(pool: &DbPool, target: &UpgradeTargetRecord) -> 
         Some(&target.target_id),
         "target_apply_submitted",
         "Agent upgrade apply submitted",
-        json!({ "nodeId": node_id, "agentStatus": state.status }),
+        json!({ "nodeId": node_id, "agentStatus": state.status, "binarySha256": artifact.binary_sha256 }),
     )
     .await?;
     Ok(())
+}
+
+/// 准备阶段由执行端确认是否需要替换；此时尚不要求升级后进程的指纹响应。
+fn prepared_target_is_unchanged(
+    target: &UpgradeTargetRecord,
+    prepared: &AgentUpgradeState,
+) -> ApiResult<bool> {
+    if prepared.target_id.as_deref() != Some(&target.target_id)
+        || prepared.target_version.as_deref() != Some(&target.target_version)
+    {
+        return Err(ApiError::BadRequest(
+            "agent prepare state does not match target scope".to_string(),
+        ));
+    }
+    match prepared.status.as_str() {
+        "unchanged" if prepared.current_version == target.target_version => Ok(true),
+        "prepared" => Ok(false),
+        _ => Err(ApiError::BadRequest(format!(
+            "agent did not prepare upgrade: {}",
+            prepared.status
+        ))),
+    }
 }
 
 async fn reconcile_running_agent_target(
@@ -1565,9 +1763,9 @@ async fn reconcile_running_agent_target(
     client: &NodeRuntimeClient,
 ) -> ApiResult<()> {
     let status = client
-        .get_json::<RuntimeApiResponse<AgentUpgradeState>>("/api/v1/agent/upgrade/status")
+        .get_json::<RuntimeApiResponse<AgentUpgradeStatus>>("/api/v1/agent/upgrade/status")
         .await;
-    let state = match status {
+    let fingerprint = match status {
         Ok(response) => unwrap_runtime_api_response(response)?,
         Err(_)
             if target.sub_status.as_deref() == Some("restart_scheduled")
@@ -1581,6 +1779,7 @@ async fn reconcile_running_agent_target(
             )));
         }
     };
+    let state = &fingerprint.state;
     if state.target_id.as_deref() != Some(&target.target_id)
         || state.target_version.as_deref() != Some(&target.target_version)
     {
@@ -1588,18 +1787,17 @@ async fn reconcile_running_agent_target(
             "agent upgrade state does not match target scope".to_string(),
         ));
     }
-    let overwrite = target_plan_overwrites_same_version(pool, &target.plan_id).await?;
+    let expected_hash = target_binary_sha256(pool, target).await?;
     let session =
         get_active_session_by_node_id(pool, target.node_id.as_deref().unwrap_or_default()).await?;
-    let ready = agent_target_running_version_ready(
+    let succeeded = agent_target_running_version_ready(
         target,
-        Some(&state),
+        Some(&fingerprint),
         session
             .as_ref()
             .map(|session| session.registered_at.as_str()),
-        overwrite,
+        &expected_hash,
     );
-    let succeeded = state.current_version == target.target_version && (!overwrite || ready);
     if upgrade_restart_timed_out(target) && !succeeded {
         return Err(ApiError::Internal(
             "agent is not running the target version after 300 seconds".to_string(),
@@ -1633,6 +1831,7 @@ async fn reconcile_running_agent_target(
     } else if matches!(state.status.as_str(), "failed" | "rollbacked_no_restart") {
         let detail = state
             .error_detail
+            .clone()
             .unwrap_or_else(|| "agent reported upgrade failure".to_string());
         mark_target_failed(pool, &target.target_id, &detail).await?;
         record_event(
@@ -1667,18 +1866,6 @@ async fn reconcile_running_agent_target(
         .await?;
     }
     Ok(())
-}
-
-async fn target_plan_overwrites_same_version(pool: &DbPool, plan_id: &str) -> ApiResult<bool> {
-    let Some(plan) = get_plan(pool, plan_id).await? else {
-        return Err(ApiError::NotFound);
-    };
-    let strategy =
-        serde_json::from_str::<serde_json::Value>(&plan.strategy).unwrap_or_else(|_| json!({}));
-    Ok(strategy
-        .get("overwriteSameVersion")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false))
 }
 
 async fn refresh_plan_terminal_status(pool: &DbPool, plan_id: &str) -> ApiResult<()> {
@@ -1955,10 +2142,18 @@ pub async fn ensure_artifact_cached(
         .map_err(ApiError::Io)?;
     verify_release_signature(&bytes, &signature)
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    let component_name = component.to_string();
+    let binary_sha256 =
+        tokio::task::spawn_blocking(move || artifact_binary_sha256(&bytes, &component_name))
+            .await
+            .map_err(|err| {
+                ApiError::Internal(format!("failed to inspect upgrade executable: {err}"))
+            })??;
     Ok(CachedUpgradeArtifact {
         path,
         file_name: names.artifact,
         sha256,
+        binary_sha256,
         signature,
         signature_path,
         target_triple,
@@ -2178,6 +2373,12 @@ pub async fn upload_release_package(
 
     let bytes = tokio::fs::read(&temp_path).await.map_err(ApiError::Io)?;
     let sha256 = compute_sha256_hex(&bytes);
+
+    let _artifact_guard = RELEASE_ARTIFACT_LOCK.lock().await;
+    if let Err(err) = ensure_release_not_running(pool, &version).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(err);
+    }
 
     // 解包并在内部依次校验其子组件包的签名
     if let Err(err) = unpack_and_cache_release_package(&version, &target_triple, &temp_path).await {
@@ -2635,8 +2836,26 @@ fn token_hash(token: &str) -> String {
     compute_sha256_hex(token.as_bytes())
 }
 
+/// 运行中的计划使用已验签版本包作为内容依据，执行期间禁止替换或删除。
+async fn ensure_release_not_running(pool: &DbPool, version: &str) -> ApiResult<()> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upgrade_plans WHERE target_version=? AND status='running'",
+    )
+    .bind(version)
+    .fetch_one(pool)
+    .await?;
+    if count > 0 {
+        return Err(ApiError::BadRequest(format!(
+            "release {version} is in use by a running upgrade plan"
+        )));
+    }
+    Ok(())
+}
+
 /// 删除版本包及其在主控本地的二进制文件缓存目录。
 pub async fn delete_release(pool: &DbPool, version: &str) -> ApiResult<()> {
+    let _artifact_guard = RELEASE_ARTIFACT_LOCK.lock().await;
+    ensure_release_not_running(pool, version).await?;
     crate::models::upgrades::delete_release_by_version(pool, version)
         .await
         .map_err(ApiError::from)?;
@@ -2718,7 +2937,6 @@ mod tests {
             .to_string(),
             node_ids,
             include_offline: Some(true),
-            overwrite_same_version: Some(false),
             max_concurrency: None,
             failure_threshold_percent: None,
         }
@@ -2753,7 +2971,18 @@ mod tests {
             .unwrap();
         assert!(!target_dependencies_ready(&pool, local).await.unwrap());
         assert!(!target_dependencies_ready(&pool, remote).await.unwrap());
-        reconcile_controller_target(&pool, controller)
+        update_target_status(
+            &pool,
+            &controller.target_id,
+            "succeeded",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        refresh_plan_terminal_status(&pool, &detail.plan.plan_id)
             .await
             .unwrap();
         assert_eq!(
@@ -2906,9 +3135,63 @@ mod tests {
         assert_eq!(scheduled[1].node_id.as_deref(), Some("local"));
     }
 
-    /// 验证旧版本与同版本旧进程均不能通过升级完成判定。
+    /// 构造包元数据可变的测试归档，单独验证可执行文件指纹语义。
+    fn test_component_archive(name: &str, binary: &[u8], modified_at: u64) -> Vec<u8> {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(binary.len() as u64);
+        header.set_mode(0o755);
+        header.set_mtime(modified_at);
+        header.set_cksum();
+        archive.append_data(&mut header, name, binary).unwrap();
+        archive.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// 同版本是否跳过取决于二进制内容，而非压缩包元数据或构建版本字符串。
     #[test]
-    fn local_agent_success_requires_running_version_and_new_session_after_replace() {
+    fn matching_version_skips_only_identical_executable_content() {
+        let first = test_component_archive("veydeck", b"same executable", 1);
+        let repacked = test_component_archive("veydeck", b"same executable", 2);
+        let rebuilt = test_component_archive("veydeck", b"new executable same version", 2);
+        assert_ne!(compute_sha256_hex(&first), compute_sha256_hex(&repacked));
+        let expected = artifact_binary_sha256(&first, "controller").unwrap();
+        assert_eq!(
+            expected,
+            artifact_binary_sha256(&repacked, "controller").unwrap()
+        );
+        assert_ne!(
+            expected,
+            artifact_binary_sha256(&rebuilt, "controller").unwrap()
+        );
+        let target = controller_target(
+            "plan",
+            "controller",
+            "pending",
+            None,
+            env!("CARGO_PKG_VERSION"),
+        );
+        assert!(binary_matches_target(
+            &target,
+            env!("CARGO_PKG_VERSION"),
+            &expected,
+            &expected
+        ));
+        assert!(!binary_matches_target(
+            &target,
+            env!("CARGO_PKG_VERSION"),
+            &expected,
+            &artifact_binary_sha256(&rebuilt, "controller").unwrap()
+        ));
+        assert!(!binary_matches_target(
+            &target, "0.0.1", &expected, &expected
+        ));
+        assert!(artifact_binary_sha256(&first, "agent").is_err());
+    }
+
+    /// 版本、运行映像哈希与重启后的新会话必须同时匹配。
+    #[test]
+    fn agent_completion_requires_target_hash_and_new_session() {
         let mut target = controller_target(
             "plan",
             "local-agent",
@@ -2917,52 +3200,161 @@ mod tests {
             "0.1.0-alpha.3",
         );
         target.started_at = Some("2026-11-09T01:00:00Z".to_string());
-        let mut state = AgentUpgradeState {
-            current_version: "0.1.0-alpha.2".to_string(),
-            target_id: None,
-            target_version: None,
-            status: "idle".to_string(),
-            error_detail: None,
+        let expected = compute_sha256_hex(b"target binary");
+        let old_hash = compute_sha256_hex(b"old binary");
+        let mut state = AgentUpgradeStatus {
+            current_binary_sha256: old_hash.clone(),
+            state: AgentUpgradeState {
+                current_version: target.target_version.clone(),
+                target_id: None,
+                target_version: None,
+                status: "idle".to_string(),
+                error_detail: None,
+            },
         };
         let new_session = Some("2026-11-09T01:00:01Z");
         assert!(!agent_target_running_version_ready(
             &target,
             Some(&state),
             new_session,
-            false
+            &expected
         ));
-        state.current_version = target.target_version.clone();
+        state.current_binary_sha256 = expected.clone();
         assert!(!agent_target_running_version_ready(
             &target,
             Some(&state),
             Some("2026-11-09T00:59:59Z"),
-            true
+            &expected
         ));
         assert!(!agent_target_running_version_ready(
             &target,
             None,
             new_session,
-            false
+            &expected
         ));
         assert!(agent_target_running_version_ready(
             &target,
             Some(&state),
             new_session,
-            true
+            &expected
         ));
         target.status = "pending".to_string();
         assert!(agent_target_running_version_ready(
             &target,
             Some(&state),
             None,
-            false
+            &expected
         ));
+        state.current_binary_sha256 = old_hash;
         assert!(!agent_target_running_version_ready(
             &target,
             Some(&state),
             None,
-            true
+            &expected
         ));
+        state.current_binary_sha256 = expected.clone();
+        state.state.current_version = "0.1.0-alpha.2".to_string();
+        assert!(!agent_target_running_version_ready(
+            &target,
+            Some(&state),
+            None,
+            &expected
+        ));
+    }
+
+    /// 升级前的基础响应无需运行指纹，哈希只在替换后的最终状态中强制要求。
+    #[test]
+    fn prepare_phase_uses_workflow_state_before_runtime_fingerprint() {
+        let mut target = controller_target(
+            "plan",
+            "agent-target",
+            "pending",
+            None,
+            env!("CARGO_PKG_VERSION"),
+        );
+        target.target_type = "agent".to_string();
+        let mut state: AgentUpgradeState = serde_json::from_value(json!({
+            "currentVersion": env!("CARGO_PKG_VERSION"), "targetId": "agent-target",
+            "targetVersion": env!("CARGO_PKG_VERSION"), "status": "prepared"
+        }))
+        .unwrap();
+        assert!(!prepared_target_is_unchanged(&target, &state).unwrap());
+        state.status = "unchanged".to_string();
+        assert!(prepared_target_is_unchanged(&target, &state).unwrap());
+        state.current_version = "0.0.1".to_string();
+        assert!(prepared_target_is_unchanged(&target, &state).is_err());
+        let without_hash = json!({"currentVersion": env!("CARGO_PKG_VERSION"), "status": "idle"});
+        assert!(serde_json::from_value::<AgentUpgradeState>(without_hash.clone()).is_ok());
+        assert!(serde_json::from_value::<AgentUpgradeStatus>(without_hash).is_err());
+    }
+
+    /// 目标包在执行期间不可变，审计事件不承担保存升级内容的职责。
+    #[tokio::test]
+    async fn running_plan_prevents_replacing_or_removing_its_package() {
+        let (pool, audit) = upgrade_fixture().await;
+        let detail = create_plan(&pool, current_upgrade_payload(None), &audit)
+            .await
+            .unwrap();
+        assert!(
+            ensure_release_not_running(&pool, &detail.plan.target_version)
+                .await
+                .is_ok()
+        );
+        start_plan(&pool, &detail.plan.plan_id, &audit)
+            .await
+            .unwrap();
+        assert!(
+            ensure_release_not_running(&pool, &detail.plan.target_version)
+                .await
+                .is_err()
+        );
+        assert!(ensure_release_not_running(&pool, "9.0.0").await.is_ok());
+        cancel_plan(&pool, &detail.plan.plan_id, &audit)
+            .await
+            .unwrap();
+        assert!(
+            ensure_release_not_running(&pool, &detail.plan.target_version)
+                .await
+                .is_ok()
+        );
+    }
+
+    /// 本地指纹直接来自进程文件，不要求 Agent 升级前提供新增字段。
+    #[tokio::test]
+    async fn local_fingerprint_reads_actual_process_file() {
+        assert_eq!(
+            read_process_binary_sha256(std::process::id())
+                .await
+                .unwrap(),
+            running_executable_sha256().unwrap()
+        );
+        assert!(read_process_binary_sha256(u32::MAX).await.is_err());
+    }
+
+    /// 本地 Agent 无法报告运行映像摘要时，不得按相同版本直接成功。
+    #[tokio::test]
+    async fn local_agent_status_failure_cannot_skip_upgrade() {
+        let (pool, audit) = upgrade_fixture().await;
+        let detail = create_plan(&pool, current_upgrade_payload(None), &audit)
+            .await
+            .unwrap();
+        let target = detail
+            .targets
+            .iter()
+            .find(|target| target.node_id.as_deref() == Some("local"))
+            .unwrap();
+        assert!(reconcile_local_agent_target(&pool, target).await.is_err());
+        let targets = list_targets_by_plan(&pool, &detail.plan.plan_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            targets
+                .iter()
+                .find(|candidate| candidate.target_id == target.target_id)
+                .unwrap()
+                .status,
+            "pending"
+        );
     }
 
     /// 验证系统升级入口拒绝混入节点选择范围。
@@ -2986,7 +3378,7 @@ mod tests {
             target_version: target_version.to_string(),
             component: "cluster".to_string(),
             scope: "{}".to_string(),
-            strategy: json!({ "overwriteSameVersion": true }).to_string(),
+            strategy: "{}".to_string(),
             status: "running".to_string(),
             requested_by_user_id: 1,
             requested_by: "tester".to_string(),
@@ -3122,73 +3514,76 @@ mod tests {
     /// 同版本替换后，发起重启的主控进程不能自行完成升级目标。
     #[tokio::test]
     async fn same_controller_process_waits_for_restart_before_completing_target() {
-        for overwrite in [false, true] {
-            let (pool, audit) = upgrade_fixture().await;
-            let mut payload = current_upgrade_payload(None);
-            payload.overwrite_same_version = Some(overwrite);
-            let detail = create_plan(&pool, payload, &audit).await.unwrap();
-            start_plan(&pool, &detail.plan.plan_id, &audit)
-                .await
-                .unwrap();
-            let target = detail
-                .targets
-                .iter()
-                .find(|target| target.target_type == "controller")
-                .unwrap();
-            let now = Utc::now().to_rfc3339();
-            update_target_status(
-                &pool,
-                &target.target_id,
-                "running",
-                Some("restarting"),
-                None,
-                Some(&now),
-                None,
-            )
+        let (pool, audit) = upgrade_fixture().await;
+        let payload = current_upgrade_payload(None);
+        let detail = create_plan(&pool, payload, &audit).await.unwrap();
+        start_plan(&pool, &detail.plan.plan_id, &audit)
             .await
             .unwrap();
-            record_event(
+        let target = detail
+            .targets
+            .iter()
+            .find(|target| target.target_type == "controller")
+            .unwrap();
+        let now = Utc::now().to_rfc3339();
+        update_target_status(
+            &pool,
+            &target.target_id,
+            "running",
+            Some("restarting"),
+            None,
+            Some(&now),
+            None,
+        )
+        .await
+        .unwrap();
+        record_event(
                 &pool,
                 &detail.plan.plan_id,
                 Some(&target.target_id),
                 "target_apply_submitted",
                 "restart submitted",
-                json!({"controllerProcessToken": CONTROLLER_PROCESS_TOKEN.as_str()}),
+                json!({"controllerProcessToken": CONTROLLER_PROCESS_TOKEN.as_str(), "binarySha256": running_executable_sha256().unwrap()}),
             )
             .await
             .unwrap();
-            let target = list_targets_by_plan(&pool, &detail.plan.plan_id)
+        let target = list_targets_by_plan(&pool, &detail.plan.plan_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|target| target.target_type == "controller")
+            .unwrap();
+        reconcile_running_controller_with_hash(
+            &pool,
+            &target,
+            &running_executable_sha256().unwrap(),
+        )
+        .await
+        .unwrap();
+        let targets = list_targets_by_plan(&pool, &detail.plan.plan_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            targets
+                .iter()
+                .find(|target| target.target_type == "controller")
+                .unwrap()
+                .status,
+            "running"
+        );
+        let local = targets
+            .iter()
+            .find(|target| target.node_id.as_deref() == Some("local"))
+            .unwrap();
+        assert!(!target_dependencies_ready(&pool, local).await.unwrap());
+        assert_eq!(
+            get_plan(&pool, &detail.plan.plan_id)
                 .await
                 .unwrap()
-                .into_iter()
-                .find(|target| target.target_type == "controller")
-                .unwrap();
-            reconcile_controller_target(&pool, &target).await.unwrap();
-            let targets = list_targets_by_plan(&pool, &detail.plan.plan_id)
-                .await
-                .unwrap();
-            assert_eq!(
-                targets
-                    .iter()
-                    .find(|target| target.target_type == "controller")
-                    .unwrap()
-                    .status,
-                "running"
-            );
-            let local = targets
-                .iter()
-                .find(|target| target.node_id.as_deref() == Some("local"))
-                .unwrap();
-            assert!(!target_dependencies_ready(&pool, local).await.unwrap());
-            assert_eq!(
-                get_plan(&pool, &detail.plan.plan_id)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .status,
-                "running"
-            );
-        }
+                .unwrap()
+                .status,
+            "running"
+        );
     }
 
     #[tokio::test]
@@ -3224,7 +3619,13 @@ mod tests {
         .await
         .unwrap();
 
-        reconcile_controller_target(&pool, &target).await.unwrap();
+        reconcile_running_controller_with_hash(
+            &pool,
+            &target,
+            &running_executable_sha256().unwrap(),
+        )
+        .await
+        .unwrap();
 
         let targets = list_targets_by_plan(&pool, plan_id).await.unwrap();
         let recovered = targets
@@ -3250,6 +3651,7 @@ mod tests {
     #[test]
     fn controller_recovery_requires_restart_sub_status_and_matching_version() {
         let target_version = env!("CARGO_PKG_VERSION");
+        let hash = running_executable_sha256().unwrap();
         let recovering = controller_target(
             "plan",
             "target",
@@ -3259,11 +3661,22 @@ mod tests {
         );
         assert!(controller_target_restarted_on_target_version(
             &recovering,
-            "previous-process"
+            "previous-process",
+            &hash,
+            &hash
         ));
         assert!(!controller_target_restarted_on_target_version(
             &recovering,
-            CONTROLLER_PROCESS_TOKEN.as_str()
+            CONTROLLER_PROCESS_TOKEN.as_str(),
+            &hash,
+            &hash
+        ));
+
+        assert!(!controller_target_restarted_on_target_version(
+            &recovering,
+            "previous-process",
+            &hash,
+            &compute_sha256_hex(b"old executable")
         ));
 
         let applying = controller_target(
@@ -3275,14 +3688,18 @@ mod tests {
         );
         assert!(!controller_target_restarted_on_target_version(
             &applying,
-            "previous-process"
+            "previous-process",
+            &hash,
+            &hash
         ));
 
         let other_version =
             controller_target("plan", "target", "running", Some("restarting"), "0.0.0");
         assert!(!controller_target_restarted_on_target_version(
             &other_version,
-            "previous-process"
+            "previous-process",
+            &hash,
+            &hash
         ));
     }
 }

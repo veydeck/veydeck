@@ -1164,7 +1164,6 @@ const upgradeSubmitting = ref(false)
 const releases = ref<UpgradeReleaseRecord[]>([])
 const upgradeForm = reactive({
   targetVersion: '',
-  overwriteSameVersion: false,
 })
 
 const releaseOptions = computed(() =>
@@ -1183,7 +1182,6 @@ const openUpgradeDialog = async () => {
   if (selectedNodeIds.value.length === 0) return
   upgradeForm.targetVersion = ''
   releases.value = []
-  upgradeForm.overwriteSameVersion = false
   isUpgradeDialogOpen.value = true
   try {
     const res = await upgradesApi.listReleases()
@@ -1205,7 +1203,6 @@ const submitUpgradePlan = async () => {
       targetVersion: upgradeForm.targetVersion,
       component: 'agent' as const,
       nodeIds: selectedNodeIds.value,
-      overwriteSameVersion: upgradeForm.overwriteSameVersion,
     }
     const createResponse = await upgradesApi.createPlan(payload)
     if (!createResponse.success || !createResponse.data) {
@@ -1750,15 +1747,6 @@ onMounted(() => {
             :placeholder="t('app.nodes.upgradeDialog.versionPlaceholder')"
             style="width: 100%"
           />
-        </div>
-
-        <div class="form-group" style="margin-top: 10px">
-          <VeyCheckbox v-model="upgradeForm.overwriteSameVersion">
-            {{ t('app.nodes.upgradeDialog.overwriteSameVersion') }}
-          </VeyCheckbox>
-          <div class="form-hint">
-            {{ t('app.nodes.upgradeDialog.overwriteSameVersionTip') }}
-          </div>
         </div>
       </div>
 

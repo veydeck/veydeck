@@ -7,8 +7,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use veydeck_upgrade::{
-    extract_named_file_from_tar_gz, verify_release_signature,
-    verify_sha256 as verify_upgrade_sha256,
+    compute_sha256_hex, extract_named_file_from_tar_gz, running_executable_sha256,
+    verify_release_signature, verify_sha256 as verify_upgrade_sha256,
 };
 
 const STATE_FILE_NAME: &str = "upgrade-state.json";
@@ -56,11 +56,33 @@ pub struct AgentUpgradeState {
     pub updated_at: String,
 }
 
+/// 运行时指纹仅属于状态响应，不写入可跨进程读取的升级工作状态。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentUpgradeStatus {
+    #[serde(flatten)]
+    pub state: AgentUpgradeState,
+    pub current_binary_sha256: String,
+}
+
+/// 在阻塞线程计算运行中 Agent 的摘要，读取失败时拒绝继续版本判定。
+async fn read_running_binary_sha256() -> ApiResult<String> {
+    tokio::task::spawn_blocking(running_executable_sha256)
+        .await
+        .map_err(|err| AgentError::Internal(format!("failed to hash running Agent: {err}")))?
+        .map_err(AgentError::from)
+        .map_err(Into::into)
+}
+
 /// 返回当前升级状态。
-pub async fn status() -> ApiResult<AgentUpgradeState> {
+pub async fn status() -> ApiResult<AgentUpgradeStatus> {
+    let hash = read_running_binary_sha256().await?;
     let mut state = load_state().await.unwrap_or_else(|_| default_idle_state());
     state.current_version = env!("CARGO_PKG_VERSION").to_string();
-    Ok(state)
+    Ok(AgentUpgradeStatus {
+        state,
+        current_binary_sha256: hash,
+    })
 }
 
 /// 下载并校验目标二进制，暂存到运行目录。
@@ -260,6 +282,19 @@ pub async fn prepare(payload: UpgradePrepareRequest) -> ApiResult<AgentUpgradeSt
             return Err(err.into());
         }
     };
+    let running_hash = match read_running_binary_sha256().await {
+        Ok(hash) => hash,
+        Err(err) => {
+            persist_failed_prepare_state(&mut current_state, err.to_string()).await;
+            return Err(err);
+        }
+    };
+    if prepared_binary_is_current(&payload.target_version, &binary, &running_hash) {
+        current_state.status = "unchanged".to_string();
+        current_state.updated_at = chrono::Utc::now().to_rfc3339();
+        save_state(&current_state).await?;
+        return Ok(current_state);
+    }
     let mut file = match tokio::fs::File::create(&staged_binary).await {
         Ok(file) => file,
         Err(err) => {
@@ -299,6 +334,11 @@ pub async fn prepare(payload: UpgradePrepareRequest) -> ApiResult<AgentUpgradeSt
     current_state.updated_at = chrono::Utc::now().to_rfc3339();
     save_state(&current_state).await?;
     Ok(current_state)
+}
+
+/// 在准备阶段校验实际运行映像，内容一致时无需替换文件或重启服务。
+fn prepared_binary_is_current(target_version: &str, binary: &[u8], running_hash: &str) -> bool {
+    target_version == env!("CARGO_PKG_VERSION") && compute_sha256_hex(binary) == running_hash
 }
 
 /// 原子替换当前二进制；生产布局下会异步重启 systemd 服务。
@@ -497,4 +537,52 @@ fn schedule_agent_restart() {
             tracing::error!("failed to restart veydeck-agent after upgrade: {}", err);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 升级状态必须报告实际运行进程的版本与摘要，供主控统一决定是否跳过。
+    #[tokio::test]
+    async fn status_reports_running_executable_fingerprint() {
+        let state = status().await.unwrap();
+        assert_eq!(state.state.current_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            state.current_binary_sha256,
+            veydeck_upgrade::compute_file_sha256(Path::new("/proc/self/exe")).unwrap()
+        );
+        assert_eq!(state.current_binary_sha256.len(), 64);
+    }
+    /// 准备阶段按签名包内的文件决定是否跳过，版本一致不足以判定内容一致。
+    #[test]
+    fn prepare_skip_requires_matching_running_executable() {
+        let binary = b"verified executable";
+        let hash = compute_sha256_hex(binary);
+        assert!(prepared_binary_is_current(
+            env!("CARGO_PKG_VERSION"),
+            binary,
+            &hash
+        ));
+        assert!(!prepared_binary_is_current(
+            env!("CARGO_PKG_VERSION"),
+            b"different build",
+            &hash
+        ));
+        assert!(!prepared_binary_is_current("0.0.1", binary, &hash));
+    }
+
+    /// 升级工作状态独立于当前进程指纹，应用后可由新进程继续读取。
+    #[test]
+    fn persisted_workflow_state_does_not_require_runtime_fingerprint() {
+        let mut state = default_idle_state();
+        state.target_id = Some("upgrade-target".to_string());
+        state.target_version = Some(env!("CARGO_PKG_VERSION").to_string());
+        state.status = "restart_scheduled".to_string();
+        let serialized = serde_json::to_value(&state).unwrap();
+        assert!(serialized.get("currentBinarySha256").is_none());
+        let loaded: AgentUpgradeState = serde_json::from_value(serialized).unwrap();
+        assert_eq!(loaded.target_id.as_deref(), Some("upgrade-target"));
+        assert_eq!(loaded.status, "restart_scheduled");
+    }
 }

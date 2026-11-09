@@ -186,6 +186,7 @@ describe('NodeManagerView', () => {
     const submit = Array.from(document.body.querySelectorAll('button')).find(
       (button) => button.textContent?.trim() === '开始同步',
     )!
+    expect(document.body.textContent).not.toContain('覆盖同版本节点')
     expect(submit).toBeDefined()
     expect(submit.disabled).toBe(false)
     submit.click()
@@ -194,7 +195,6 @@ describe('NodeManagerView', () => {
       component: 'agent',
       targetVersion: '0.1.0-alpha.3',
       nodeIds: ['node-1'],
-      overwriteSameVersion: false,
     })
     expect(upgradesApi.startPlan).toHaveBeenCalledWith('sync-plan')
     wrapper.unmount()

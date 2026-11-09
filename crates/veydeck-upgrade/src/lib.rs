@@ -12,6 +12,9 @@ pub use artifact_names::{
     COMPONENT_AGENT, COMPONENT_CONTROLLER, ComponentArtifactNames, ReleasePackageNames,
     component_artifact_names, normalize_version, release_package_names,
 };
-pub use checksum::{compute_sha256_hex, parse_checksum_text, verify_sha256};
+pub use checksum::{
+    compute_file_sha256, compute_sha256_hex, parse_checksum_text, running_executable_sha256,
+    verify_sha256,
+};
 pub use signature::{verify_detached_signature, verify_release_signature};
 pub use target_triple::{current_target_triple, normalize_target_triple};

@@ -108,7 +108,6 @@ export interface UpgradePlanCreatePayload {
   component: 'cluster' | 'agent'
   nodeIds?: string[]
   includeOffline?: boolean
-  overwriteSameVersion?: boolean
   maxConcurrency?: number
   failureThresholdPercent?: number
 }
