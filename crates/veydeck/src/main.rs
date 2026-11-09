@@ -76,6 +76,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() {
+    services::upgrades::initialize_controller_process_identity();
     load_env();
     let _log_guard = init_logging();
     config::init();

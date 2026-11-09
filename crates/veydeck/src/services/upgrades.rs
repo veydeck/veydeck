@@ -16,7 +16,7 @@ use crate::models::upgrades::{
 use crate::state::DbPool;
 use crate::types::{ApiError, ApiResult, new_uuid_v7};
 use axum::extract::Multipart;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use flate2::read::GzDecoder;
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,14 @@ use veydeck_upgrade::{
 
 /// 区分主控进程实例，防止同版本覆盖时将发起重启的进程判定为新进程。
 static CONTROLLER_PROCESS_TOKEN: LazyLock<String> = LazyLock::new(new_uuid_v7);
+/// 在主控入口记录启动时间，为旧版升级事件提供进程切换依据。
+static CONTROLLER_PROCESS_STARTED_AT: LazyLock<DateTime<Utc>> = LazyLock::new(Utc::now);
+
+/// 必须在服务启动前初始化，避免首次恢复时才记录时间而误判同一进程。
+pub fn initialize_controller_process_identity() {
+    LazyLock::force(&CONTROLLER_PROCESS_STARTED_AT);
+    LazyLock::force(&CONTROLLER_PROCESS_TOKEN);
+}
 
 /// 串行化计划启动与版本包变更，保证执行期间读取的签名包不会被替换。
 static RELEASE_ARTIFACT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -1088,16 +1096,12 @@ async fn reconcile_running_controller_with_hash(
         .ok_or_else(|| ApiError::Internal("controller restart event is missing".to_string()))?;
     let metadata: serde_json::Value = serde_json::from_str(&event.metadata)
         .map_err(|err| ApiError::Internal(format!("invalid controller restart metadata: {err}")))?;
-    let source_process = metadata
-        .get("controllerProcessToken")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| {
-            ApiError::Internal("controller restart process token is missing".to_string())
-        })?;
+    let restarted =
+        controller_restart_observed(&metadata, &event.created_at, *CONTROLLER_PROCESS_STARTED_AT)?;
     let running_hash = read_running_binary_sha256().await?;
     if !controller_target_restarted_on_target_version(
         target,
-        source_process,
+        restarted,
         expected_hash,
         &running_hash,
     ) {
@@ -1198,10 +1202,31 @@ async fn target_binary_sha256(pool: &DbPool, target: &UpgradeTargetRecord) -> Ap
     )
 }
 
+/// 新事件使用进程标记；旧事件必须早于当前主控入口时间才证明发生过重启。
+fn controller_restart_observed(
+    metadata: &serde_json::Value,
+    submitted_at: &str,
+    process_started_at: DateTime<Utc>,
+) -> ApiResult<bool> {
+    if let Some(value) = metadata.get("controllerProcessToken") {
+        let token = value
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ApiError::Internal("controller restart process token is invalid".to_string())
+            })?;
+        return Ok(token != CONTROLLER_PROCESS_TOKEN.as_str());
+    }
+    let submitted_at = DateTime::parse_from_rfc3339(submitted_at).map_err(|err| {
+        ApiError::Internal(format!("invalid controller restart event time: {err}"))
+    })?;
+    Ok(process_started_at > submitted_at)
+}
+
 /// 只有其他主控进程实例运行目标版本时，才确认本次重启完成。
 fn controller_target_restarted_on_target_version(
     target: &UpgradeTargetRecord,
-    source_process: &str,
+    restarted: bool,
     expected_hash: &str,
     running_hash: &str,
 ) -> bool {
@@ -1214,7 +1239,7 @@ fn controller_target_restarted_on_target_version(
             running_hash,
             expected_hash,
         )
-        && source_process != CONTROLLER_PROCESS_TOKEN.as_str()
+        && restarted
 }
 
 async fn apply_controller_artifact(artifact: &CachedUpgradeArtifact) -> ApiResult<()> {
@@ -3861,63 +3886,111 @@ mod tests {
 
     #[tokio::test]
     async fn running_controller_target_recovers_after_restart() {
-        let pool = crate::test_support::setup_test_db().await;
-        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (1, 'tester', 'hash')")
+        for legacy in [false, true] {
+            let pool = crate::test_support::setup_test_db().await;
+            sqlx::query(
+                "INSERT INTO users (id, username, password_hash) VALUES (1, 'tester', 'hash')",
+            )
             .execute(&pool)
             .await
             .unwrap();
-        let plan_id = "plan-controller-restart";
-        let target_id = "target-controller-restart";
-        let target_version = env!("CARGO_PKG_VERSION");
-        let plan = upgrade_plan(plan_id, target_version);
-        let target = controller_target(
-            plan_id,
-            target_id,
-            "running",
-            Some("restarting"),
-            target_version,
-        );
+            let plan_id = "plan-controller-restart";
+            let target_id = "target-controller-restart";
+            let target_version = env!("CARGO_PKG_VERSION");
+            let plan = upgrade_plan(plan_id, target_version);
+            let target = controller_target(
+                plan_id,
+                target_id,
+                "running",
+                Some("restarting"),
+                target_version,
+            );
 
-        insert_plan(&pool, &plan).await.unwrap();
-        insert_target(&pool, &target).await.unwrap();
+            insert_plan(&pool, &plan).await.unwrap();
+            insert_target(&pool, &target).await.unwrap();
 
-        record_event(
-            &pool,
-            plan_id,
-            Some(target_id),
-            "target_apply_submitted",
-            "restart submitted",
-            json!({"controllerProcessToken": "previous-process"}),
-        )
-        .await
-        .unwrap();
+            record_event(
+                &pool,
+                plan_id,
+                Some(target_id),
+                "target_apply_submitted",
+                "restart submitted",
+                if legacy {
+                    json!({"artifact": "veydeck.tar.gz"})
+                } else {
+                    json!({"controllerProcessToken": "previous-process"})
+                },
+            )
+            .await
+            .unwrap();
 
-        reconcile_running_controller_with_hash(
-            &pool,
-            &target,
-            &running_executable_sha256().unwrap(),
-        )
-        .await
-        .unwrap();
+            if legacy {
+                let submitted_at =
+                    (*CONTROLLER_PROCESS_STARTED_AT - chrono::Duration::seconds(1)).to_rfc3339();
+                sqlx::query("UPDATE upgrade_events SET created_at = ? WHERE plan_id = ? AND event_type = 'target_apply_submitted'")
+                .bind(submitted_at).bind(plan_id).execute(&pool).await.unwrap();
+            }
 
-        let targets = list_targets_by_plan(&pool, plan_id).await.unwrap();
-        let recovered = targets
-            .iter()
-            .find(|item| item.target_id == target_id)
-            .expect("controller target should exist");
-        assert_eq!(recovered.status, "succeeded");
-        assert!(recovered.sub_status.is_none());
-        assert!(recovered.finished_at.is_some());
+            reconcile_running_controller_with_hash(
+                &pool,
+                &target,
+                &running_executable_sha256().unwrap(),
+            )
+            .await
+            .unwrap();
 
-        let updated_plan = get_plan(&pool, plan_id).await.unwrap().unwrap();
-        assert_eq!(updated_plan.status, "succeeded");
-        assert!(updated_plan.finished_at.is_some());
-
-        let events = list_events_by_plan(&pool, plan_id).await.unwrap();
-        assert!(
-            events
+            let targets = list_targets_by_plan(&pool, plan_id).await.unwrap();
+            let recovered = targets
                 .iter()
-                .any(|event| event.event_type == "target_succeeded")
+                .find(|item| item.target_id == target_id)
+                .expect("controller target should exist");
+            assert_eq!(recovered.status, "succeeded");
+            assert!(recovered.sub_status.is_none());
+            assert!(recovered.finished_at.is_some());
+
+            let updated_plan = get_plan(&pool, plan_id).await.unwrap().unwrap();
+            assert_eq!(updated_plan.status, "succeeded");
+            assert!(updated_plan.finished_at.is_some());
+
+            let events = list_events_by_plan(&pool, plan_id).await.unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.event_type == "target_succeeded")
+            );
+        }
+    }
+
+    /// 旧事件仅在当前进程确实晚于提交时恢复，已有标记不能退化成时间判断。
+    #[test]
+    fn controller_restart_identity_supports_legacy_events_without_false_completion() {
+        let started = Utc::now();
+        let before = (started - chrono::Duration::seconds(1)).to_rfc3339();
+        let after = (started + chrono::Duration::seconds(1)).to_rfc3339();
+        let legacy = json!({"artifact": "veydeck.tar.gz"});
+        assert!(controller_restart_observed(&legacy, &before, started).unwrap());
+        assert!(!controller_restart_observed(&legacy, &after, started).unwrap());
+        assert!(!controller_restart_observed(&legacy, &started.to_rfc3339(), started).unwrap());
+        assert!(controller_restart_observed(&legacy, "invalid", started).is_err());
+        assert!(
+            !controller_restart_observed(
+                &json!({"controllerProcessToken": CONTROLLER_PROCESS_TOKEN.as_str()}),
+                &before,
+                started
+            )
+            .unwrap()
+        );
+        assert!(
+            controller_restart_observed(
+                &json!({"controllerProcessToken": "previous-process"}),
+                &after,
+                started
+            )
+            .unwrap()
+        );
+        assert!(
+            controller_restart_observed(&json!({"controllerProcessToken": ""}), &before, started)
+                .is_err()
         );
     }
 
@@ -3934,20 +4007,20 @@ mod tests {
         );
         assert!(controller_target_restarted_on_target_version(
             &recovering,
-            "previous-process",
+            true,
             &hash,
             &hash
         ));
         assert!(!controller_target_restarted_on_target_version(
             &recovering,
-            CONTROLLER_PROCESS_TOKEN.as_str(),
+            false,
             &hash,
             &hash
         ));
 
         assert!(!controller_target_restarted_on_target_version(
             &recovering,
-            "previous-process",
+            true,
             &hash,
             &compute_sha256_hex(b"old executable")
         ));
@@ -3960,17 +4033,14 @@ mod tests {
             target_version,
         );
         assert!(!controller_target_restarted_on_target_version(
-            &applying,
-            "previous-process",
-            &hash,
-            &hash
+            &applying, true, &hash, &hash
         ));
 
         let other_version =
             controller_target("plan", "target", "running", Some("restarting"), "0.0.0");
         assert!(!controller_target_restarted_on_target_version(
             &other_version,
-            "previous-process",
+            true,
             &hash,
             &hash
         ));
