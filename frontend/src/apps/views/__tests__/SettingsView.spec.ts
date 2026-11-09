@@ -15,7 +15,12 @@ const api = vi.hoisted(() => ({
   fetchSecurity: vi.fn(),
   listReleases: vi.fn(),
   checkSuiteCompatibility: vi.fn(),
+  createPlan: vi.fn(),
+  startPlan: vi.fn(),
+  deleteRelease: vi.fn(),
 }))
+
+const confirmation = vi.hoisted(() => ({ showConfirmation: vi.fn() }))
 
 const windowManager = vi.hoisted(() => ({
   updateWindowRuntimeState: vi.fn(),
@@ -49,10 +54,10 @@ vi.mock('@/api/modules/upgrades', () => ({
   upgradesApi: {
     listReleases: api.listReleases,
     uploadRelease: vi.fn(),
-    createPlan: vi.fn(),
-    startPlan: vi.fn(),
+    createPlan: api.createPlan,
+    startPlan: api.startPlan,
     detail: vi.fn(),
-    deleteRelease: vi.fn(),
+    deleteRelease: api.deleteRelease,
     checkSuiteCompatibility: api.checkSuiteCompatibility,
   },
 }))
@@ -62,7 +67,7 @@ vi.mock('@/stores/window-manager', () => ({
 }))
 
 vi.mock('@/stores/confirmation-modal', () => ({
-  useConfirmationModalStore: () => ({ showConfirmation: vi.fn() }),
+  useConfirmationModalStore: () => confirmation,
 }))
 
 const MenuStub = defineComponent({
@@ -93,10 +98,30 @@ const CardStub = defineComponent({
 
 const success = <T>(data: T) => ({ success: true, code: 200, message: '', data })
 
+const ButtonStub = defineComponent({
+  props: { disabled: Boolean, loading: Boolean },
+  emits: ['click'],
+  template: `<button :disabled="disabled || loading" @click="$emit('click')"><slot /></button>`,
+})
+
+/** 构造完整版本信息，确保条目布局不丢失原表格字段。 */
+const release = (version = '1.0.0') => ({
+  releaseId: `release-${version}`,
+  version,
+  channel: 'prerelease',
+  checksumStatus: 'verified',
+  signatureStatus: 'verified',
+  publishedAt: '2026-11-09T07:00:00Z',
+  upgradeEligible: true,
+})
+
 const mountSettings = async (sectionStubs: Record<string, unknown> = {}) => {
   const router = createRouter({
     history: createMemoryHistory(),
-    routes: [{ path: '/', component: { template: '<div />' } }],
+    routes: [
+      { path: '/', component: { template: '<div />' } },
+      { path: '/upgrade-progress', component: { template: '<div />' } },
+    ],
   })
   await router.push('/')
   await router.isReady()
@@ -113,6 +138,9 @@ const mountSettings = async (sectionStubs: Record<string, unknown> = {}) => {
         KeepAlive: false,
         VeyCard: CardStub,
         VeyMenu: MenuStub,
+        VeyButton: ButtonStub,
+        VeyTag: { template: '<span><slot /></span>' },
+        VeyAlert: { props: ['title'], template: '<div>{{ title }}</div>' },
         SystemMonitoringSettings: true,
         ...sectionStubs,
       },
@@ -122,6 +150,7 @@ const mountSettings = async (sectionStubs: Record<string, unknown> = {}) => {
 
 describe('SettingsView', () => {
   beforeEach(() => {
+    confirmation.showConfirmation.mockResolvedValue(true)
     api.fetchAbout.mockResolvedValue(success(null))
     api.fetchInterfaces.mockResolvedValue(success([]))
     api.fetchNetwork.mockResolvedValue(
@@ -259,5 +288,116 @@ describe('SettingsView', () => {
 
     expect(api.listReleases).toHaveBeenCalledTimes(1)
     expect(setIntervalSpy).not.toHaveBeenCalled()
+  })
+  it('纵向版本条目保留全部信息与直接可用的操作', async () => {
+    api.listReleases.mockResolvedValue(success([release()]))
+    const wrapper = await mountSettings()
+    await wrapper.get('[data-menu-key="upgrade"]').trigger('click')
+    await flushPromises()
+    const item = wrapper.get('[data-ui="upgrade-release-item"]')
+    expect(item.text()).toContain('1.0.0')
+    expect(item.text()).toContain('预发布')
+    expect(item.text()).toContain('校验')
+    expect(item.text()).toContain('签名')
+    expect(item.text()).toContain('已通过')
+    expect(item.text()).toContain('2026-11-09')
+    expect(item.get('[data-ui="upgrade-release-start"]').text()).toBe('立即升级')
+    expect(item.get('[data-ui="suite-compatibility-check"]').text()).toBe('检测套件')
+    expect(item.get('[data-ui="upgrade-release-delete"]').text()).toBe('删除')
+    wrapper.unmount()
+  })
+
+  it('套件检测结果展示在对应版本条目内', async () => {
+    api.listReleases.mockResolvedValue(success([release('1.0.0'), release('0.9.0')]))
+    const wrapper = await mountSettings()
+    await wrapper.get('[data-menu-key="upgrade"]').trigger('click')
+    await flushPromises()
+    await wrapper
+      .get('[data-version="1.0.0"] [data-ui="suite-compatibility-check"]')
+      .trigger('click')
+    await flushPromises()
+    expect(api.checkSuiteCompatibility).toHaveBeenCalledWith('1.0.0')
+    expect(
+      wrapper.get('[data-version="1.0.0"]').find('[data-ui="suite-compatibility-report"]').exists(),
+    ).toBe(true)
+    expect(
+      wrapper.get('[data-version="0.9.0"]').find('[data-ui="suite-compatibility-report"]').exists(),
+    ).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('完整显示选择的长文件名', async () => {
+    const wrapper = await mountSettings()
+    await wrapper.get('[data-menu-key="upgrade"]').trigger('click')
+    await flushPromises()
+    const filename =
+      'veydeck-0.1.0-alpha.3-linux-aarch64-custom-build-with-long-release-name.tar.gz'
+    const input = wrapper.get('input[type="file"]')
+    Object.defineProperty(input.element, 'files', { value: [new File(['package'], filename)] })
+    await input.trigger('change')
+    expect(wrapper.get('[data-ui="upgrade-file-name"]').text()).toBe(filename)
+    expect(wrapper.get('[data-ui="upgrade-upload-submit"]').attributes('disabled')).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it('执行详情归组主控组件并保留完整错误与计划编号', async () => {
+    api.listReleases.mockResolvedValue(success([release()]))
+    const detail = {
+      plan: {
+        planId: 'plan-with-long-identifier-0123456789abcdef',
+        targetVersion: '1.0.0',
+        status: 'failed',
+      },
+      targets: [
+        {
+          targetId: 'controller',
+          targetType: 'controller',
+          status: 'succeeded',
+          currentVersion: '0.9.0',
+          targetVersion: '1.0.0',
+        },
+        {
+          targetId: 'local-agent',
+          targetType: 'agent',
+          nodeId: 'local',
+          status: 'failed',
+          currentVersion: '0.9.0',
+          targetVersion: '1.0.0',
+          errorDetail: '本地 Agent 重启超时，错误详情应完整显示',
+        },
+        {
+          targetId: 'node-agent',
+          targetType: 'agent',
+          nodeId: 'node-1',
+          status: 'pending',
+          currentVersion: '0.9.0',
+          targetVersion: '1.0.0',
+        },
+      ],
+      events: [],
+      nodeNames: { 'node-1': '测试节点' },
+    }
+    api.createPlan.mockResolvedValue(success(detail))
+    api.startPlan.mockResolvedValue(success(detail))
+    const wrapper = await mountSettings()
+    await wrapper.get('[data-menu-key="upgrade"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-ui="upgrade-release-start"]').trigger('click')
+    await flushPromises()
+    expect(api.createPlan).toHaveBeenCalledWith({
+      component: 'cluster',
+      targetVersion: '1.0.0',
+      includeOffline: true,
+    })
+    const host = wrapper.get('[data-host-id="local"]')
+    expect(host.findAll('[data-ui="settings-upgrade-component"]')).toHaveLength(2)
+    expect(host.text()).toContain('主控服务')
+    expect(host.text()).toContain('本地节点 Agent')
+    expect(host.get('[data-ui="settings-upgrade-error"]').text()).toBe(
+      detail.targets[1]!.errorDetail,
+    )
+    expect(wrapper.text()).toContain(detail.plan.planId)
+    expect(wrapper.get('[data-host-id="node-1"]').text()).toContain('测试节点')
+    wrapper.unmount()
   })
 })

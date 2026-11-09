@@ -9,6 +9,7 @@ import {
   type SuiteCompatibilityReport,
   type UpgradePlanDetail,
   type UpgradeReleaseRecord,
+  type UpgradeTargetRecord,
 } from '@/api/modules/upgrades'
 import { useToastStore } from '@/stores/toast'
 import { useWindowManagerStore } from '@/stores/window-manager'
@@ -23,10 +24,8 @@ import {
   VeyInput,
   VeyEmpty,
   VeyLoading,
-  VeyTable,
   VeyTag,
 } from '@/components/ui'
-import type { VeyTableColumn } from '@/components/ui/VeyTable.vue'
 import AboutSettings from './settings/AboutSettings.vue'
 import NetworkSettings from './settings/NetworkSettings.vue'
 import PersonalizationSettings from './settings/PersonalizationSettings.vue'
@@ -87,8 +86,8 @@ const uploadStatusText = computed(() => {
 // 升级进度百分比计算
 const upgradeProgressPercent = computed(() => {
   if (!upgradePlan.value || upgradePlan.value.targets.length === 0) return 0
-  const finished = upgradePlan.value.targets.filter(
-    (t) => t.status === 'succeeded' || t.status === 'failed',
+  const finished = upgradePlan.value.targets.filter((target) =>
+    ['succeeded', 'failed', 'canceled'].includes(target.status),
   ).length
   return Math.round((finished * 100) / upgradePlan.value.targets.length)
 })
@@ -156,52 +155,56 @@ const implementedMenuKeys = new Set([
   'theme',
 ])
 
-const releaseColumns = computed<VeyTableColumn[]>(() => [
-  { prop: 'version', label: t('app.settings.upgrade.version'), minWidth: 120, align: 'center' },
-  {
-    prop: 'channel',
-    label: t('app.settings.upgrade.channel'),
-    width: 110,
-    slot: 'channel',
-    align: 'center',
-  },
-  {
-    prop: 'checksumStatus',
-    label: t('app.settings.upgrade.checksum'),
-    width: 120,
-    slot: 'checksum',
-    align: 'center',
-  },
-  {
-    prop: 'signatureStatus',
-    label: t('app.settings.upgrade.signature'),
-    width: 120,
-    slot: 'signature',
-    align: 'center',
-  },
-  {
-    prop: 'publishedAt',
-    label: t('app.settings.upgrade.publishedAt'),
-    minWidth: 160,
-    slot: 'publishedAt',
-    align: 'center',
-  },
-  {
-    prop: 'version',
-    label: t('app.settings.upgrade.actions'),
-    width: 290,
-    slot: 'actions',
-    align: 'center',
-  },
-])
+/** 升级目标按主机组织，主控服务和本地节点 Agent 共享一个升级单元。 */
+const upgradeHosts = computed(() => {
+  const targets = upgradePlan.value?.targets ?? []
+  const controller = targets.find((target) => target.targetType === 'controller')
+  const local = targets.find((target) => target.nodeId === 'local')
+  const localTargets = [controller, local].filter((target): target is UpgradeTargetRecord =>
+    Boolean(target),
+  )
+  const hosts = localTargets.length
+    ? [{ id: 'local', name: t('upgradeProgress.targetType.controller'), targets: localTargets }]
+    : []
+  return hosts.concat(
+    targets
+      .filter((target) => target.targetType !== 'controller' && target.nodeId !== 'local')
+      .map((target) => ({
+        id: target.nodeId ?? target.targetId,
+        name:
+          upgradePlan.value?.nodeNames?.[target.nodeId ?? ''] ??
+          target.nodeId ??
+          t('upgradeProgress.targetType.unknownNode'),
+        targets: [target],
+      })),
+  )
+})
 
-const targetColumns = computed<VeyTableColumn[]>(() => [
-  { prop: 'targetType', label: t('app.settings.upgrade.targetType'), width: 120 },
-  { prop: 'nodeId', label: t('app.settings.upgrade.nodeId'), minWidth: 160, slot: 'nodeId' },
-  { prop: 'targetVersion', label: t('app.settings.upgrade.targetVersion'), width: 120 },
-  { prop: 'status', label: t('app.settings.upgrade.status'), width: 120, slot: 'status' },
-  { prop: 'errorDetail', label: t('app.settings.upgrade.error'), minWidth: 180, slot: 'error' },
-])
+/** 校验结果使用用户可读状态，不展示服务端枚举值。 */
+const verificationLabel = (status: string) => {
+  const key = `app.settings.upgrade.verification.${status}`
+  return te(key) ? t(key) : t('app.settings.upgrade.verification.unknown')
+}
+
+/** 将计划与组件的执行阶段转换为本地化状态。 */
+const upgradeStatusLabel = (status: string) => {
+  if (status.startsWith('downloading:')) {
+    return t('upgradeProgress.status.downloadingPercent', {
+      percent: status.slice('downloading:'.length),
+    })
+  }
+  const normalized = status === 'restart_scheduled' ? 'restarting' : status
+  const key = `upgradeProgress.status.${normalized}`
+  return te(key) ? t(key) : t('upgradeProgress.status.unknown')
+}
+
+/** 主控单元内部区分服务与 Agent，其他主机沿用节点名称。 */
+const componentName = (target: UpgradeTargetRecord) => {
+  if (target.targetType === 'controller') return t('upgradeProgress.targetType.controllerService')
+  return target.nodeId === 'local'
+    ? t('upgradeProgress.targetType.localAgent')
+    : t('upgradeProgress.targetType.agent')
+}
 
 const generateSafeEntryValue = () => {
   const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
@@ -530,7 +533,9 @@ const checkSuiteCompatibility = async (version: string) => {
 
 const isUpgradeFinished = (status?: string) => {
   if (!status) return false
-  return status === 'succeeded' || status === 'failed' || status === 'unknown'
+  return (
+    status === 'succeeded' || status === 'failed' || status === 'canceled' || status === 'unknown'
+  )
 }
 
 const resetUpgradeFlow = () => {
@@ -608,7 +613,12 @@ onBeforeUnmount(stopUpgradeRefreshTimer)
 </script>
 
 <template>
-  <div class="settings" data-page="settings" data-veydeck-app="settings">
+  <div
+    class="settings"
+    :class="{ 'settings-upgrade-active': activeMenu === 'upgrade' }"
+    data-page="settings"
+    data-veydeck-app="settings"
+  >
     <div class="sidebar" data-slot="navigation">
       <VeyMenu v-model="activeMenu" class="settings-menu" :items="menuItems" />
     </div>
@@ -744,10 +754,14 @@ onBeforeUnmount(stopUpgradeRefreshTimer)
           <div class="upgrade-wrapper" data-page="settings-upgrade">
             <!-- 状态 A：没有正在执行的升级计划 -->
             <div v-if="!upgradePlan" class="upgrade-main-flow">
-              <p class="description">{{ t('app.settings.upgrade.description') }}</p>
-
-              <div class="fine-grained-upgrade-link" data-ui="node-upgrade-guide">
-                <VeyButton type="secondary" size="small" @click="goToNodeUpgradeGuide">
+              <div class="upgrade-toolbar">
+                <h3 class="sub-title">{{ t('app.settings.upgrade.releases') }}</h3>
+                <VeyButton
+                  type="secondary"
+                  size="small"
+                  data-ui="node-upgrade-guide"
+                  @click="goToNodeUpgradeGuide"
+                >
                   {{ t('app.settings.upgrade.fineGrainedLink') }}
                 </VeyButton>
               </div>
@@ -762,32 +776,38 @@ onBeforeUnmount(stopUpgradeRefreshTimer)
                 />
 
                 <div class="upload-control-row">
-                  <!-- 长条文本框：显示选中文件名 -->
-                  <VeyInput
-                    :model-value="uploadFile ? uploadFile.name : ''"
-                    readonly
-                    :placeholder="t('app.settings.upgrade.placeholder')"
-                    class="upload-path-input"
-                    data-slot="upload-path-input"
-                  />
-                  <!-- 选择文件按钮 -->
-                  <VeyButton
-                    type="secondary"
-                    data-ui="upgrade-file-select"
-                    @click="triggerFileSelect"
-                  >
-                    {{ t('app.settings.upgrade.selectFileButton') }}
-                  </VeyButton>
-                  <!-- 上传按钮 -->
-                  <VeyButton
-                    type="primary"
-                    :loading="upgradeUploading && !isValidating"
-                    :disabled="!uploadFile"
-                    data-ui="upgrade-upload-submit"
-                    @click="uploadUpgradeRelease"
-                  >
-                    {{ t('app.settings.upgrade.upload') }}
-                  </VeyButton>
+                  <div class="upload-file-summary" data-slot="upload-path-input">
+                    <span class="upload-file-label">{{
+                      t('app.settings.upgrade.packageFile')
+                    }}</span>
+                    <span
+                      class="upload-file-name"
+                      :class="{ 'is-empty': !uploadFile }"
+                      data-ui="upgrade-file-name"
+                    >
+                      {{ uploadFile?.name || t('app.settings.upgrade.noFileSelected') }}
+                    </span>
+                  </div>
+                  <div class="upload-actions">
+                    <!-- 选择文件按钮 -->
+                    <VeyButton
+                      type="secondary"
+                      data-ui="upgrade-file-select"
+                      @click="triggerFileSelect"
+                    >
+                      {{ t('app.settings.upgrade.selectFileButton') }}
+                    </VeyButton>
+                    <!-- 上传按钮 -->
+                    <VeyButton
+                      type="primary"
+                      :loading="upgradeUploading && !isValidating"
+                      :disabled="!uploadFile"
+                      data-ui="upgrade-upload-submit"
+                      @click="uploadUpgradeRelease"
+                    >
+                      {{ t('app.settings.upgrade.upload') }}
+                    </VeyButton>
+                  </div>
                 </div>
 
                 <!-- 上传进度条 -->
@@ -807,112 +827,134 @@ onBeforeUnmount(stopUpgradeRefreshTimer)
                 />
               </div>
 
-              <!-- 下方的版本表格 -->
               <div class="releases-section" data-slot="upgrade-releases-list">
-                <h3 class="sub-title">{{ t('app.settings.upgrade.releases') }}</h3>
-                <VeyTable
+                <div
                   v-if="upgradeReleases.length > 0"
-                  :data="upgradeReleases"
-                  :columns="releaseColumns"
-                  border
+                  class="release-list"
+                  data-ui="upgrade-release-list"
                 >
-                  <template #channel="{ row }">
-                    <VeyTag :type="row.channel === 'stable' ? 'success' : 'warning'">
-                      {{ row.channel }}
-                    </VeyTag>
-                  </template>
-                  <template #checksum="{ row }">
-                    <VeyTag :type="statusTagType(row.checksumStatus)">
-                      {{ row.checksumStatus }}
-                    </VeyTag>
-                  </template>
-                  <template #signature="{ row }">
-                    <VeyTag :type="statusTagType(row.signatureStatus)">
-                      {{ row.signatureStatus }}
-                    </VeyTag>
-                  </template>
-                  <template #publishedAt="{ row }">
-                    {{ row.publishedAt ? formatDateTime(row.publishedAt) : '--' }}
-                  </template>
-                  <template #actions="{ row }">
-                    <div class="table-actions-row">
-                      <VeyButton
-                        size="small"
-                        type="primary"
-                        :loading="upgradeStarting && selectedUpgradeVersion === row.version"
-                        :disabled="!isTargetVersionEligible(row.version)"
-                        @click="startUpgradeForVersion(row.version)"
-                      >
-                        {{ t('app.settings.upgrade.startUpgrade') }}
-                      </VeyButton>
-                      <VeyButton
-                        size="small"
-                        type="secondary"
-                        :loading="compatibilityCheckingVersion === row.version"
-                        data-ui="suite-compatibility-check"
-                        @click="checkSuiteCompatibility(row.version)"
-                      >
-                        {{ t('app.settings.upgrade.checkCompatibility') }}
-                      </VeyButton>
-                      <VeyButton
-                        size="small"
-                        type="danger"
-                        @click="deleteReleaseForVersion(row.version)"
-                      >
-                        {{ t('app.settings.upgrade.delete') }}
-                      </VeyButton>
+                  <div
+                    v-for="release in upgradeReleases"
+                    :key="release.releaseId"
+                    class="release-item"
+                    data-ui="upgrade-release-item"
+                    :data-version="release.version"
+                  >
+                    <div class="release-heading">
+                      <div class="release-identity">
+                        <h4 class="release-version code-text">{{ release.version }}</h4>
+                        <VeyTag :type="release.channel === 'stable' ? 'success' : 'warning'">
+                          {{
+                            release.channel === 'stable'
+                              ? t('app.settings.upgrade.stableChannel')
+                              : t('app.settings.upgrade.prereleaseChannel')
+                          }}
+                        </VeyTag>
+                      </div>
+                      <div class="release-actions">
+                        <VeyButton
+                          size="small"
+                          type="primary"
+                          :loading="upgradeStarting && selectedUpgradeVersion === release.version"
+                          :disabled="!isTargetVersionEligible(release.version) || upgradeStarting"
+                          data-ui="upgrade-release-start"
+                          @click="startUpgradeForVersion(release.version)"
+                        >
+                          {{ t('app.settings.upgrade.startUpgrade') }}
+                        </VeyButton>
+                        <VeyButton
+                          size="small"
+                          type="secondary"
+                          :loading="compatibilityCheckingVersion === release.version"
+                          data-ui="suite-compatibility-check"
+                          @click="checkSuiteCompatibility(release.version)"
+                        >
+                          {{ t('app.settings.upgrade.checkCompatibility') }}
+                        </VeyButton>
+                        <VeyButton
+                          size="small"
+                          type="danger"
+                          data-ui="upgrade-release-delete"
+                          @click="deleteReleaseForVersion(release.version)"
+                        >
+                          {{ t('app.settings.upgrade.delete') }}
+                        </VeyButton>
+                      </div>
                     </div>
-                  </template>
-                </VeyTable>
-
+                    <dl class="release-details">
+                      <div>
+                        <dt>{{ t('app.settings.upgrade.checksum') }}</dt>
+                        <dd>
+                          <VeyTag :type="statusTagType(release.checksumStatus)">{{
+                            verificationLabel(release.checksumStatus)
+                          }}</VeyTag>
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>{{ t('app.settings.upgrade.signature') }}</dt>
+                        <dd>
+                          <VeyTag :type="statusTagType(release.signatureStatus)">{{
+                            verificationLabel(release.signatureStatus)
+                          }}</VeyTag>
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>{{ t('app.settings.upgrade.publishedAt') }}</dt>
+                        <dd class="code-text">
+                          {{ release.publishedAt ? formatDateTime(release.publishedAt) : '--' }}
+                        </dd>
+                      </div>
+                    </dl>
+                    <div
+                      v-if="compatibilityReport?.releaseVersion === release.version"
+                      class="compatibility-report"
+                      data-ui="suite-compatibility-report"
+                    >
+                      <VeyAlert
+                        :type="compatibilityReport.compatible ? 'success' : 'warning'"
+                        :title="
+                          t(
+                            compatibilityReport.compatible
+                              ? 'app.settings.upgrade.compatibilityPassed'
+                              : 'app.settings.upgrade.compatibilityWarning',
+                            {
+                              version: compatibilityReport.releaseVersion,
+                              total: compatibilityReport.summary.total,
+                              incompatible: compatibilityReport.summary.incompatible,
+                              contracts:
+                                compatibilityReport.supportedSuiteContractVersions.join(', '),
+                            },
+                          )
+                        "
+                        show-icon
+                      />
+                      <ul
+                        v-if="compatibilityReport.summary.incompatible > 0"
+                        class="compatibility-instances"
+                        data-slot="incompatible-suite-instances"
+                      >
+                        <li
+                          v-for="instance in compatibilityReport.instances.filter(
+                            (item) => item.status === 'incompatible',
+                          )"
+                          :key="instance.instanceId"
+                        >
+                          {{ instance.suiteName }} · {{ instance.nodeName }} ·
+                          {{
+                            t('app.settings.upgrade.contractVersion', {
+                              version: instance.platformContractVersion,
+                            })
+                          }}
+                        </li>
+                      </ul>
+                    </div>
+                  </div>
+                </div>
                 <VeyEmpty
                   v-else
                   class="releases-empty"
                   :description="t('app.settings.upgrade.noReleases')"
                 />
-
-                <div
-                  v-if="compatibilityReport"
-                  class="compatibility-report"
-                  data-ui="suite-compatibility-report"
-                >
-                  <VeyAlert
-                    :type="compatibilityReport.compatible ? 'success' : 'warning'"
-                    :title="
-                      t(
-                        compatibilityReport.compatible
-                          ? 'app.settings.upgrade.compatibilityPassed'
-                          : 'app.settings.upgrade.compatibilityWarning',
-                        {
-                          version: compatibilityReport.releaseVersion,
-                          total: compatibilityReport.summary.total,
-                          incompatible: compatibilityReport.summary.incompatible,
-                          contracts: compatibilityReport.supportedSuiteContractVersions.join(', '),
-                        },
-                      )
-                    "
-                    show-icon
-                  />
-                  <ul
-                    v-if="compatibilityReport.summary.incompatible > 0"
-                    class="compatibility-instances"
-                    data-slot="incompatible-suite-instances"
-                  >
-                    <li
-                      v-for="instance in compatibilityReport.instances.filter(
-                        (item) => item.status === 'incompatible',
-                      )"
-                      :key="instance.instanceId"
-                    >
-                      {{ instance.suiteName }} · {{ instance.nodeName }} ·
-                      {{
-                        t('app.settings.upgrade.contractVersion', {
-                          version: instance.platformContractVersion,
-                        })
-                      }}
-                    </li>
-                  </ul>
-                </div>
               </div>
             </div>
 
@@ -923,7 +965,7 @@ onBeforeUnmount(stopUpgradeRefreshTimer)
                   <h3 class="execution-title">
                     {{ t('app.settings.upgrade.plan') }}
                     <VeyTag :type="statusTagType(upgradePlan.plan.status)" class="status-tag">
-                      {{ upgradePlan.plan.status }}
+                      {{ upgradeStatusLabel(upgradePlan.plan.status) }}
                     </VeyTag>
                   </h3>
                   <VeyButton
@@ -965,21 +1007,65 @@ onBeforeUnmount(stopUpgradeRefreshTimer)
                 </div>
               </div>
 
-              <!-- 节点与事件列表 -->
               <div class="upgrade-detail" data-slot="upgrade-plan-detail">
-                <div class="upgrade-panel">
-                  <h3 class="sub-title">{{ t('app.settings.upgrade.targets') }}</h3>
-                  <VeyTable :data="upgradePlan.targets" :columns="targetColumns" border>
-                    <template #nodeId="{ row }">
-                      {{ row.nodeId || 'local' }}
-                    </template>
-                    <template #status="{ row }">
-                      <VeyTag :type="statusTagType(row.status)">{{ row.status }}</VeyTag>
-                    </template>
-                    <template #error="{ row }">
-                      <span class="error-text">{{ row.errorDetail || '--' }}</span>
-                    </template>
-                  </VeyTable>
+                <h3 class="sub-title">{{ t('app.settings.upgrade.targets') }}</h3>
+                <div
+                  v-for="host in upgradeHosts"
+                  :key="host.id"
+                  class="upgrade-host"
+                  data-ui="settings-upgrade-host"
+                  :data-host-id="host.id"
+                >
+                  <div class="upgrade-host-heading">
+                    <h4>{{ host.name }}</h4>
+                    <VeyTag type="default">{{
+                      t('upgradeProgress.labels.componentCount', { count: host.targets.length })
+                    }}</VeyTag>
+                  </div>
+                  <div v-if="host.id !== 'local'" class="upgrade-host-id code-text">
+                    {{ host.id }}
+                  </div>
+                  <div
+                    v-for="target in host.targets"
+                    :key="target.targetId"
+                    class="upgrade-component"
+                    data-ui="settings-upgrade-component"
+                    :data-target-id="target.targetId"
+                  >
+                    <div class="upgrade-component-heading">
+                      <span>{{ componentName(target) }}</span>
+                      <VeyTag :type="statusTagType(target.status)">{{
+                        upgradeStatusLabel(
+                          target.status === 'running'
+                            ? target.subStatus || target.status
+                            : target.status,
+                        )
+                      }}</VeyTag>
+                    </div>
+                    <dl class="release-details component-details">
+                      <div>
+                        <dt>{{ t('upgradeProgress.labels.currentVersion') }}</dt>
+                        <dd class="code-text">
+                          {{
+                            target.status === 'succeeded'
+                              ? target.targetVersion
+                              : target.currentVersion || t('upgradeProgress.status.unknown')
+                          }}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>{{ t('app.settings.upgrade.targetVersion') }}</dt>
+                        <dd class="code-text">{{ target.targetVersion }}</dd>
+                      </div>
+                    </dl>
+                    <div
+                      v-if="target.errorDetail"
+                      class="error-text"
+                      data-ui="settings-upgrade-error"
+                    >
+                      {{ target.errorDetail }}
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -1008,6 +1094,7 @@ onBeforeUnmount(stopUpgradeRefreshTimer)
 
 <style scoped>
 .settings {
+  container-type: inline-size;
   display: flex;
   height: 100%;
   background: var(--vdl-bg-canvas);
@@ -1162,16 +1249,20 @@ onBeforeUnmount(stopUpgradeRefreshTimer)
   height: 100%;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  overflow-y: auto;
+  overflow-x: hidden;
+  container-type: inline-size;
+  padding-right: var(--vdl-space-1);
+  scrollbar-gutter: stable;
 }
 
 .upgrade-main-flow,
 .upgrade-execution-flow {
-  flex: 1;
+  flex: 0 0 auto;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: var(--vdl-space-4);
-  min-height: 0;
 }
 
 .upgrade-upload-area {
@@ -1186,33 +1277,119 @@ onBeforeUnmount(stopUpgradeRefreshTimer)
   flex-shrink: 0;
 }
 
-.upload-control-row {
+.upgrade-toolbar,
+.upload-control-row,
+.release-heading,
+.release-identity,
+.release-actions,
+.upload-actions,
+.upgrade-host-heading,
+.upgrade-component-heading {
   display: flex;
-  gap: var(--vdl-space-3);
   align-items: center;
-}
-
-.upload-path-input {
-  flex: 1;
-}
-
-.releases-section {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
+  flex-wrap: wrap;
   gap: var(--vdl-space-2);
-  min-height: 0;
+  min-width: 0;
+}
+
+.upgrade-toolbar,
+.upload-control-row,
+.release-heading,
+.upgrade-component-heading {
+  justify-content: space-between;
+}
+
+.upgrade-toolbar .sub-title {
+  margin: 0;
+}
+
+.upload-file-summary {
+  flex: 1 1 200px;
+  min-width: 0;
+  display: grid;
+  gap: var(--vdl-space-1);
+}
+
+.upload-file-label {
+  color: var(--vdl-text-secondary);
+  font-size: var(--vdl-font-body-sm);
+  font-weight: 600;
+}
+
+.upload-file-name {
+  color: var(--vdl-text-primary);
+  font-size: var(--vdl-font-caption);
+  overflow-wrap: anywhere;
+}
+
+.upload-file-name.is-empty {
+  color: var(--vdl-text-muted);
+}
+
+.upload-actions,
+.release-actions {
+  flex-shrink: 0;
+  max-width: 100%;
+}
+
+.releases-section,
+.release-list {
+  display: grid;
+  gap: var(--vdl-space-4);
+  min-width: 0;
+}
+
+.release-item {
+  display: grid;
+  gap: var(--vdl-space-4);
+  min-width: 0;
+  padding: var(--vdl-space-4);
+  border: 1px solid var(--vdl-border-default);
+  border-radius: var(--vdl-radius-md);
+}
+
+.release-identity {
+  flex: 1 1 160px;
+}
+
+.release-version {
+  margin: 0;
+  font-size: var(--vdl-font-body);
+  font-weight: 600;
+  color: var(--vdl-text-primary);
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.release-details {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 140px), 1fr));
+  gap: var(--vdl-space-3);
+  margin: 0;
+  min-width: 0;
+}
+
+.release-details > div {
+  display: grid;
+  align-content: start;
+  gap: var(--vdl-space-2);
+  min-width: 0;
+}
+
+.release-details dt {
+  color: var(--vdl-text-muted);
+  font-size: var(--vdl-font-caption);
+}
+
+.release-details dd {
+  margin: 0;
+  font-size: var(--vdl-font-body-sm);
+  color: var(--vdl-text-primary);
+  overflow-wrap: anywhere;
 }
 
 .releases-empty {
   min-height: 160px;
-}
-
-.table-actions-row {
-  display: flex;
-  gap: var(--vdl-space-2);
-  justify-content: center;
-  align-items: center;
 }
 
 .compatibility-report {
@@ -1273,16 +1450,8 @@ onBeforeUnmount(stopUpgradeRefreshTimer)
   transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-.fine-grained-upgrade-link {
-  margin-bottom: var(--vdl-space-4);
-}
-
 /* 状态 B 的 execution 头部面板 */
 .execution-header-panel {
-  background: var(--vdl-bg-card);
-  border: 1px solid var(--vdl-border-subtle);
-  border-radius: var(--vdl-radius-md);
-  padding: var(--vdl-space-5);
   display: flex;
   flex-direction: column;
   gap: var(--vdl-space-4);
@@ -1290,6 +1459,8 @@ onBeforeUnmount(stopUpgradeRefreshTimer)
 
 .execution-title-row {
   display: flex;
+  flex-wrap: wrap;
+  gap: var(--vdl-space-2);
   justify-content: space-between;
   align-items: center;
 }
@@ -1305,11 +1476,14 @@ onBeforeUnmount(stopUpgradeRefreshTimer)
 }
 
 .execution-metrics-row {
-  display: flex;
-  gap: var(--vdl-space-6);
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
+  gap: var(--vdl-space-4);
 }
 
 .metric-block {
+  min-width: 0;
+  overflow-wrap: anywhere;
   display: flex;
   flex-direction: column;
   gap: var(--vdl-space-1);
@@ -1326,37 +1500,40 @@ onBeforeUnmount(stopUpgradeRefreshTimer)
   font-weight: 600;
 }
 
-.upgrade-panel {
+.upgrade-host {
   min-width: 0;
-  background: var(--vdl-bg-card);
-  border: 1px solid var(--vdl-border-subtle);
-  border-radius: var(--vdl-radius-md);
-  padding: var(--vdl-space-4);
+  border-top: 1px solid var(--vdl-border-subtle);
+  padding-top: var(--vdl-space-4);
 }
 
-.plan-summary {
+.upgrade-host-heading h4 {
+  margin: 0;
+  font-size: var(--vdl-font-body-sm);
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.upgrade-host-id {
+  margin-top: var(--vdl-space-1);
+  font-size: var(--vdl-font-caption);
+  color: var(--vdl-text-muted);
+  overflow-wrap: anywhere;
+}
+
+.upgrade-component {
   display: grid;
   gap: var(--vdl-space-3);
+  padding: var(--vdl-space-3) 0;
+  min-width: 0;
 }
 
-.metric-item {
-  display: grid;
-  gap: var(--vdl-space-1);
+.upgrade-component + .upgrade-component {
+  border-top: 1px solid var(--vdl-border-subtle);
 }
 
-.metric-label {
-  color: var(--vdl-text-muted);
-  font-size: var(--vdl-font-caption);
-}
-
-.metric-value {
-  color: var(--vdl-text-primary);
+.upgrade-component-heading {
   font-size: var(--vdl-font-body-sm);
-  word-break: break-all;
-}
-
-.plan-empty {
-  min-height: 128px;
+  color: var(--vdl-text-secondary);
 }
 
 .upgrade-detail {
@@ -1382,18 +1559,47 @@ onBeforeUnmount(stopUpgradeRefreshTimer)
   border: 0;
 }
 
+@container (max-width: 800px) {
+  .settings-upgrade-active > .sidebar {
+    width: 176px;
+  }
+
+  .settings-upgrade-active .settings-menu {
+    padding: var(--vdl-space-3) var(--vdl-space-2);
+  }
+
+  .settings-upgrade-active .card :deep(.vl-card-content) {
+    padding: var(--vdl-space-4);
+  }
+}
+
+@container (max-width: 520px) {
+  .release-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: var(--vdl-space-3);
+  }
+
+  .release-identity {
+    flex: 0 1 auto;
+  }
+
+  .upload-actions {
+    width: 100%;
+  }
+}
 @media (max-width: 1024px) {
-  .settings {
+  .settings:not(.settings-upgrade-active) {
     flex-direction: column;
     overflow-y: auto;
   }
 
-  .sidebar {
+  .settings:not(.settings-upgrade-active) > .sidebar {
     width: 100%;
     height: auto;
   }
 
-  .content {
+  .settings:not(.settings-upgrade-active) > .content {
     flex: none;
     height: auto;
   }
