@@ -85,7 +85,7 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let (app, pools_for_shutdown, controller_runtime) = match create_router().await {
+    let (app, pools_for_shutdown, controller_runtime, app_state) = match create_router().await {
         Ok(app) => app,
         Err(err) => {
             tracing::error!("Veydeck Agent startup failed: {err:#}");
@@ -112,42 +112,9 @@ async fn main() {
 
     if use_uds {
         let socket_path = agent_socket_path();
-        if tokio::fs::metadata(&socket_path).await.is_ok() {
-            // 尝试连接已存在的套接字
-            match tokio::net::UnixStream::connect(&socket_path).await {
-                Ok(_) => {
-                    // 连接成功，表明另一个实例正在运行
-                    tracing::error!(
-                        "Failed to start Agent: Another instance is already running and listening on UDS socket at {}.",
-                        socket_path.display()
-                    );
-                    std::process::exit(1);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                    // 连接被拒，说明旧实例已退出，只残留了垃圾文件，可以安全清理
-                    tracing::info!(
-                        socket_path = %socket_path.display(),
-                        "Detected stale UDS socket file (connection refused). Removing it..."
-                    );
-                    if let Err(err) = tokio::fs::remove_file(&socket_path).await {
-                        tracing::error!(
-                            "Failed to remove stale socket file at {}: {}",
-                            socket_path.display(),
-                            err
-                        );
-                        std::process::exit(1);
-                    }
-                }
-                Err(e) => {
-                    // 其他系统或权限错误，为避免破坏活跃服务，打印错误并退出
-                    tracing::error!(
-                        "Failed to check UDS socket status at {}: {}. If you are sure no other instance is running, please remove this file manually.",
-                        socket_path.display(),
-                        e
-                    );
-                    std::process::exit(1);
-                }
-            }
+        if let Err(err) = services::suite_lifecycle::prepare_socket(&socket_path).await {
+            tracing::error!(path = %socket_path.display(), error = %err, "Agent socket path is unavailable");
+            std::process::exit(1);
         }
 
         // 创建目录（如果不存在）
@@ -184,6 +151,8 @@ async fn main() {
             "Starting Agent server at {:?}",
             listener.local_addr().unwrap()
         );
+        let suite_handle =
+            services::suite_lifecycle::spawn(Arc::clone(&app_state), runtime_stop_tx.subscribe());
         let runtime_handle = tokio::spawn(run_runtime_supervisor(
             pools_for_shutdown.clone(),
             runtime_stop_rx
@@ -202,6 +171,7 @@ async fn main() {
             })
             .await
             .unwrap();
+        let _ = suite_handle.await;
         wait_for_runtime_supervisor(runtime_handle).await;
         tracing::info!("Attempting to close agent database connection pool...");
         pools_for_shutdown.close().await;
@@ -235,6 +205,8 @@ async fn main() {
         controller_runtime,
     ));
 
+    let suite_handle =
+        services::suite_lifecycle::spawn(Arc::clone(&app_state), runtime_stop_tx.subscribe());
     tracing::info!("Starting Agent TLS server at {:?}", listen_addr);
     let handle = axum_server::Handle::new();
     let shutdown_handle = handle.clone();
@@ -277,6 +249,7 @@ async fn main() {
     }
 
     let _ = runtime_stop_tx.send(true);
+    let _ = suite_handle.await;
     wait_for_runtime_supervisor(runtime_handle).await;
 
     tracing::info!("Attempting to close agent database connection pool...");

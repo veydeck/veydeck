@@ -17,7 +17,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use veydeck_contracts::{
     api::ErrorCode,
-    files::{CreateFileStatisticsRequest, FileStatistics, FileStatisticsError, FileStatisticsStatus},
+    files::{
+        CreateFileStatisticsRequest, FileStatistics, FileStatisticsError, FileStatisticsStatus,
+    },
 };
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -67,13 +69,20 @@ pub fn cancel(id: &str) -> ApiResult<FileStatistics> {
 impl StatisticsService {
     /// 创建有界内存查询，并以独立租约看门狗回收无订阅者扫描。
     async fn create(&self, request: CreateFileStatisticsRequest) -> ApiResult<FileStatistics> {
-        let permit = self.permits.clone().try_acquire_owned().map_err(|_| busy())?;
+        let permit = self
+            .permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| busy())?;
         let path = files::normalize_absolute_path(&request.path)?;
         let metadata = tokio::fs::symlink_metadata(&path)
             .await
             .map_err(|error| files::map_io_error(error, "inspect statistics source"))?;
         if files::revision(&metadata) != request.expected_revision {
-            return Err(ApiError::conflict(ErrorCode::FileChanged, "statistics source changed"));
+            return Err(ApiError::conflict(
+                ErrorCode::FileChanged,
+                "statistics source changed",
+            ));
         }
         let target = tokio::fs::canonicalize(&path)
             .await
@@ -82,13 +91,18 @@ impl StatisticsService {
             .await
             .map_err(|error| files::map_io_error(error, "inspect statistics directory"))?;
         if !root.is_dir() {
-            return Err(ApiError::validation("statistics source must be a directory"));
+            return Err(ApiError::validation(
+                "statistics source must be a directory",
+            ));
         }
         let latest = tokio::fs::symlink_metadata(&path)
             .await
             .map_err(|error| files::map_io_error(error, "verify statistics source"))?;
         if files::revision(&latest) != request.expected_revision {
-            return Err(ApiError::conflict(ErrorCode::FileChanged, "statistics source changed"));
+            return Err(ApiError::conflict(
+                ErrorCode::FileChanged,
+                "statistics source changed",
+            ));
         }
         let id = Uuid::now_v7().to_string();
         let view = FileStatistics {
@@ -118,14 +132,29 @@ impl StatisticsService {
         {
             let mut sessions = self.sessions.lock().unwrap();
             sessions.retain(|_, entry| {
-                entry.lock().unwrap().finished_at.is_none_or(|time| time.elapsed() < RESULT_TTL)
+                entry
+                    .lock()
+                    .unwrap()
+                    .finished_at
+                    .is_none_or(|time| time.elapsed() < RESULT_TTL)
             });
             if sessions.len() >= MAX_SESSIONS {
-                let oldest = sessions.iter()
-                    .filter_map(|(id, entry)| entry.lock().unwrap().finished_at.map(|time| (id.clone(), time)))
+                let oldest = sessions
+                    .iter()
+                    .filter_map(|(id, entry)| {
+                        entry
+                            .lock()
+                            .unwrap()
+                            .finished_at
+                            .map(|time| (id.clone(), time))
+                    })
                     .min_by_key(|(_, time)| *time)
                     .map(|(id, _)| id);
-                if let Some(id) = oldest { sessions.remove(&id); } else { return Err(busy()); }
+                if let Some(id) = oldest {
+                    sessions.remove(&id);
+                } else {
+                    return Err(busy());
+                }
             }
             sessions.insert(id.clone(), session.clone());
         }
@@ -134,7 +163,8 @@ impl StatisticsService {
             let result = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 scan(&target, &root, &worker_session);
-            }).await;
+            })
+            .await;
             if result.is_err() {
                 finish(&session, FileStatisticsStatus::Failed);
             }
@@ -143,7 +173,9 @@ impl StatisticsService {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
-                if service.maintain(&id) { return; }
+                if service.maintain(&id) {
+                    return;
+                }
             }
         });
         Ok(view)
@@ -152,10 +184,15 @@ impl StatisticsService {
     /// 看门狗与测试共用租约判定；终态保留期结束后真正释放注册表引用。
     fn maintain(&self, id: &str) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
-        let Some(session) = sessions.get(id) else { return true; };
+        let Some(session) = sessions.get(id) else {
+            return true;
+        };
         let remove = {
             let mut session = session.lock().unwrap();
-            if session.finished_at.is_some_and(|time| time.elapsed() >= RESULT_TTL) {
+            if session
+                .finished_at
+                .is_some_and(|time| time.elapsed() >= RESULT_TTL)
+            {
                 true
             } else {
                 if session.finished_at.is_none() && session.used_at.elapsed() >= IDLE_TIMEOUT {
@@ -165,15 +202,26 @@ impl StatisticsService {
                 false
             }
         };
-        if remove { sessions.remove(id); }
+        if remove {
+            sessions.remove(id);
+        }
         remove
     }
 
     /// 续租与取消均在同一把状态锁内完成，避免覆盖扫描器已确认的终态。
     fn get(&self, id: &str, cancel: bool) -> ApiResult<FileStatistics> {
-        let session = self.sessions.lock().unwrap().get(id).cloned().ok_or_else(expired)?;
+        let session = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(expired)?;
         let mut session = session.lock().unwrap();
-        if session.finished_at.is_some_and(|time| time.elapsed() >= RESULT_TTL) {
+        if session
+            .finished_at
+            .is_some_and(|time| time.elapsed() >= RESULT_TTL)
+        {
             return Err(expired());
         }
         session.used_at = Instant::now();
@@ -193,20 +241,35 @@ fn scan(root_path: &Path, root: &Metadata, session: &Arc<Mutex<Session>>) {
 /// 根目录身份与文件系统边界独立校验，避免跨设备遍历和目录身份替换。
 fn scan_on_device(root_path: &Path, root: &Metadata, device: u64, session: &Arc<Mutex<Session>>) {
     let cancellation = session.lock().unwrap().cancellation.clone();
-    let mut stack = vec![(root_path.to_path_buf(), PathBuf::new(), root.dev(), root.ino())];
+    let mut stack = vec![(
+        root_path.to_path_buf(),
+        PathBuf::new(),
+        root.dev(),
+        root.ino(),
+    )];
     let mut allocated_inodes = HashSet::from([(root.dev(), root.ino())]);
     session.lock().unwrap().view.allocated_bytes = root.blocks().saturating_mul(512);
     while let Some((path, relative, expected_dev, expected_ino)) = stack.pop() {
-        if cancellation.is_cancelled() { break; }
-        let directory = match fs::OpenOptions::new().read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(&path)
+        if cancellation.is_cancelled() {
+            break;
+        }
+        let directory = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&path)
         {
             Ok(directory) => directory,
-            Err(error) => { record_error(session, &relative, error); continue; }
+            Err(error) => {
+                record_error(session, &relative, error);
+                continue;
+            }
         };
         let current = match directory.metadata() {
             Ok(metadata) => metadata,
-            Err(error) => { record_error(session, &relative, error); continue; }
+            Err(error) => {
+                record_error(session, &relative, error);
+                continue;
+            }
         };
         if current.dev() != expected_dev || current.ino() != expected_ino {
             record_error(session, &relative, io::Error::from(io::ErrorKind::NotFound));
@@ -216,29 +279,48 @@ fn scan_on_device(root_path: &Path, root: &Metadata, device: u64, session: &Arc<
         let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
         let reader = match fs::read_dir(&descriptor_path) {
             Ok(reader) => reader,
-            Err(error) => { record_error(session, &relative, error); continue; }
+            Err(error) => {
+                record_error(session, &relative, error);
+                continue;
+            }
         };
         for entry in reader {
-            if cancellation.is_cancelled() { break; }
+            if cancellation.is_cancelled() {
+                break;
+            }
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(error) => { record_error(session, &relative, error); continue; }
+                Err(error) => {
+                    record_error(session, &relative, error);
+                    continue;
+                }
             };
             let child_relative = relative.join(entry.file_name());
             let metadata = match fs::symlink_metadata(entry.path()) {
                 Ok(metadata) => metadata,
-                Err(error) => { record_error(session, &child_relative, error); continue; }
+                Err(error) => {
+                    record_error(session, &child_relative, error);
+                    continue;
+                }
             };
             let mut state = session.lock().unwrap();
             let view = &mut state.view;
-            if metadata.is_dir() && (metadata.dev() != device || allocated_inodes.contains(&(metadata.dev(), metadata.ino()))) {
+            if metadata.is_dir()
+                && (metadata.dev() != device
+                    || allocated_inodes.contains(&(metadata.dev(), metadata.ino())))
+            {
                 view.skipped_mount_count += 1;
                 view.partial = true;
                 continue;
             }
             if metadata.is_dir() {
                 view.directory_count += 1;
-                stack.push((root_path.join(&child_relative), child_relative, metadata.dev(), metadata.ino()));
+                stack.push((
+                    root_path.join(&child_relative),
+                    child_relative,
+                    metadata.dev(),
+                    metadata.ino(),
+                ));
             } else if metadata.is_file() {
                 view.file_count += 1;
                 view.logical_bytes = view.logical_bytes.saturating_add(metadata.len());
@@ -253,7 +335,9 @@ fn scan_on_device(root_path: &Path, root: &Metadata, device: u64, session: &Arc<
             if (!metadata.is_dir() && metadata.nlink() <= 1)
                 || allocated_inodes.insert((metadata.dev(), metadata.ino()))
             {
-                view.allocated_bytes = view.allocated_bytes.saturating_add(metadata.blocks().saturating_mul(512));
+                view.allocated_bytes = view
+                    .allocated_bytes
+                    .saturating_add(metadata.blocks().saturating_mul(512));
             }
         }
     }
@@ -264,12 +348,18 @@ fn scan_on_device(root_path: &Path, root: &Metadata, device: u64, session: &Arc<
 fn record_error(session: &Arc<Mutex<Session>>, relative: &Path, error: io::Error) {
     let mut session = session.lock().unwrap();
     let view = &mut session.view;
-    if error.kind() == io::ErrorKind::NotFound { view.vanished_count += 1; }
-    else { view.unreadable_count += 1; }
+    if error.kind() == io::ErrorKind::NotFound {
+        view.vanished_count += 1;
+    } else {
+        view.unreadable_count += 1;
+    }
     view.partial = true;
     if view.errors.len() < 10 {
         view.errors.push(FileStatisticsError {
-            path: Path::new(&view.path).join(relative).to_string_lossy().into_owned(),
+            path: Path::new(&view.path)
+                .join(relative)
+                .to_string_lossy()
+                .into_owned(),
             code: files::map_io_error(error, "scan directory statistics").code,
         });
     }
@@ -280,19 +370,29 @@ fn finish(session: &Arc<Mutex<Session>>, status: FileStatisticsStatus) {
     let mut session = session.lock().unwrap();
     session.view.status = if session.cancellation.is_cancelled() {
         FileStatisticsStatus::Cancelled
-    } else { status };
+    } else {
+        status
+    };
     session.view.finished_at = Some(chrono::Utc::now().to_rfc3339());
     session.finished_at = Some(Instant::now());
 }
 
 /// 统一返回可重试的统计并发冲突。
 fn busy() -> ApiError {
-    ApiError::new(StatusCode::TOO_MANY_REQUESTS, ErrorCode::FileStatisticsBusy, "directory statistics busy")
+    ApiError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        ErrorCode::FileStatisticsBusy,
+        "directory statistics busy",
+    )
 }
 
 /// 过期与不存在的统计均要求客户端重新计算。
 fn expired() -> ApiError {
-    ApiError::new(StatusCode::GONE, ErrorCode::FileStatisticsExpired, "directory statistics expired")
+    ApiError::new(
+        StatusCode::GONE,
+        ErrorCode::FileStatisticsExpired,
+        "directory statistics expired",
+    )
 }
 
 #[cfg(test)]
@@ -318,14 +418,19 @@ mod tests {
         }
     }
     impl Drop for Directory {
-        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
     /// 等待真正扫描终态，不以创建或取消接口返回代替终态。
     async fn complete(service: &StatisticsService, id: &str) -> FileStatistics {
         for _ in 0..1000 {
             let value = service.get(id, false).unwrap();
-            if !matches!(value.status, FileStatisticsStatus::Running | FileStatisticsStatus::Cancelling) {
+            if !matches!(
+                value.status,
+                FileStatisticsStatus::Running | FileStatisticsStatus::Cancelling
+            ) {
                 return value;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -353,8 +458,18 @@ mod tests {
         assert_eq!(result.directory_count, 1);
         assert_eq!(result.symlink_count, 2);
         assert_eq!(result.logical_bytes, 16 * 1024 * 1024 + 10);
-        let expected_blocks: u64 = ["", "nested", "data", "empty", "nested/sparse", "directory-link", "broken"]
-            .iter().map(|name| fs::symlink_metadata(root.0.join(name)).unwrap().blocks()).sum();
+        let expected_blocks: u64 = [
+            "",
+            "nested",
+            "data",
+            "empty",
+            "nested/sparse",
+            "directory-link",
+            "broken",
+        ]
+        .iter()
+        .map(|name| fs::symlink_metadata(root.0.join(name)).unwrap().blocks())
+        .sum();
         assert_eq!(result.allocated_bytes, expected_blocks * 512);
         assert!(!result.partial);
     }
@@ -366,20 +481,34 @@ mod tests {
         symlink("actual", root.0.join("alias")).unwrap();
         let link = root.0.join("alias");
         let service = StatisticsService::default();
-        let result = service.create(CreateFileStatisticsRequest {
-            path: link.to_string_lossy().into_owned(),
-            expected_revision: files::revision(&fs::symlink_metadata(&link).unwrap()),
-        }).await.unwrap();
-        assert_eq!(complete(&service, &result.id).await.path, link.to_string_lossy());
+        let result = service
+            .create(CreateFileStatisticsRequest {
+                path: link.to_string_lossy().into_owned(),
+                expected_revision: files::revision(&fs::symlink_metadata(&link).unwrap()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            complete(&service, &result.id).await.path,
+            link.to_string_lossy()
+        );
         let mut stale = root.request();
         stale.expected_revision = "stale".into();
-        assert_eq!(service.create(stale).await.unwrap_err().code, ErrorCode::FileChanged);
+        assert_eq!(
+            service.create(stale).await.unwrap_err().code,
+            ErrorCode::FileChanged
+        );
         let file = root.0.join("file");
         fs::write(&file, b"test").unwrap();
-        assert!(service.create(CreateFileStatisticsRequest {
-            path: file.to_string_lossy().into_owned(),
-            expected_revision: files::revision(&fs::metadata(&file).unwrap()),
-        }).await.is_err());
+        assert!(
+            service
+                .create(CreateFileStatisticsRequest {
+                    path: file.to_string_lossy().into_owned(),
+                    expected_revision: files::revision(&fs::metadata(&file).unwrap()),
+                })
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -387,7 +516,10 @@ mod tests {
         let root = Directory::new();
         let service = StatisticsService::default();
         let permit = service.permits.clone().acquire_many_owned(2).await.unwrap();
-        assert_eq!(service.create(root.request()).await.unwrap_err().status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            service.create(root.request()).await.unwrap_err().status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
         drop(permit);
         let created = service.create(root.request()).await.unwrap();
         complete(&service, &created.id).await;
@@ -399,10 +531,19 @@ mod tests {
             session.used_at = Instant::now() - IDLE_TIMEOUT;
         }
         assert!(!service.maintain(&created.id));
-        assert_eq!(service.get(&created.id, false).unwrap().status, FileStatisticsStatus::Cancelling);
+        assert_eq!(
+            service.get(&created.id, false).unwrap().status,
+            FileStatisticsStatus::Cancelling
+        );
         finish(&session, FileStatisticsStatus::Succeeded);
-        assert_eq!(service.get(&created.id, false).unwrap().status, FileStatisticsStatus::Cancelled);
-        assert_eq!(service.get(&created.id, true).unwrap().status, FileStatisticsStatus::Cancelled);
+        assert_eq!(
+            service.get(&created.id, false).unwrap().status,
+            FileStatisticsStatus::Cancelled
+        );
+        assert_eq!(
+            service.get(&created.id, true).unwrap().status,
+            FileStatisticsStatus::Cancelled
+        );
         session.lock().unwrap().finished_at = Some(Instant::now() - RESULT_TTL);
         assert!(service.get(&created.id, false).is_err());
         assert!(service.maintain(&created.id));
@@ -417,15 +558,26 @@ mod tests {
         complete(&service, &created.id).await;
         let session = service.sessions.lock().unwrap()[&created.id].clone();
         for _ in 0..15 {
-            record_error(&session, Path::new("missing"), io::Error::from(io::ErrorKind::NotFound));
+            record_error(
+                &session,
+                Path::new("missing"),
+                io::Error::from(io::ErrorKind::NotFound),
+            );
         }
-        record_error(&session, Path::new("private"), io::Error::from(io::ErrorKind::PermissionDenied));
+        record_error(
+            &session,
+            Path::new("private"),
+            io::Error::from(io::ErrorKind::PermissionDenied),
+        );
         let result = service.get(&created.id, false).unwrap();
         assert!(result.partial);
         assert_eq!(result.vanished_count, 15);
         assert_eq!(result.unreadable_count, 1);
         assert_eq!(result.errors.len(), 10);
-        assert_eq!(result.errors[0].path, root.0.join("missing").to_string_lossy());
+        assert_eq!(
+            result.errors[0].path,
+            root.0.join("missing").to_string_lossy()
+        );
     }
 
     #[tokio::test]

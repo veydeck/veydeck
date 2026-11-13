@@ -9,7 +9,10 @@ use veydeck_contracts::{
     disks::{
         CreateDiskOperationRequest, DiskDetail, DiskInventory, DiskOperation, ManagedDiskVolume,
     },
-    files::{CreateFileStatisticsRequest, FileEntryDetail, FileStatistics, FileDocument, FileSaveResult, UpdateFileContentRequest},
+    files::{
+        CreateFileStatisticsRequest, FileDocument, FileEntryDetail, FileSaveResult, FileStatistics,
+        UpdateFileContentRequest,
+    },
     firewall::{FirewallRuleDetail, FirewallRuleListPage},
     logging::{
         AgentOperationEvent, OperationEventLabel, OperationImpact, OperationLogDetail,

@@ -337,7 +337,11 @@ fn owner_names(uid: u32, gid: u32) -> (Option<String>, Option<String>) {
             && !user_result.is_null()
             && !user.pw_name.is_null()
         {
-            Some(std::ffi::CStr::from_ptr(user.pw_name).to_string_lossy().into_owned())
+            Some(
+                std::ffi::CStr::from_ptr(user.pw_name)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
         } else {
             None
         };
@@ -353,7 +357,11 @@ fn owner_names(uid: u32, gid: u32) -> (Option<String>, Option<String>) {
             && !group_result.is_null()
             && !group.gr_name.is_null()
         {
-            Some(std::ffi::CStr::from_ptr(group.gr_name).to_string_lossy().into_owned())
+            Some(
+                std::ffi::CStr::from_ptr(group.gr_name)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
         } else {
             None
         };
@@ -986,7 +994,10 @@ mod tests {
         assert_eq!(value.mode & 0o7777, 0o640);
         assert_eq!(value.allocated_bytes, metadata.blocks() * 512);
         assert_eq!(value.summary.size_bytes, Some(16 * 1024 * 1024));
-        assert_eq!(value.accessed_at, metadata.accessed().ok().and_then(timestamp));
+        assert_eq!(
+            value.accessed_at,
+            metadata.accessed().ok().and_then(timestamp)
+        );
         let expected = owner_names(metadata.uid(), metadata.gid());
         assert_eq!((value.user_name, value.group_name), expected);
         std::os::unix::fs::symlink("sparse", root.0.join("alias")).unwrap();
@@ -994,7 +1005,10 @@ mod tests {
         let linked = detail(&pool, &root.0.join("alias")).await.unwrap();
         assert_eq!(linked.mode, link_metadata.mode());
         assert_eq!(linked.allocated_bytes, link_metadata.blocks() * 512);
-        assert_eq!(linked.summary.symlink_target_kind, Some(FileEntryKind::File));
+        assert_eq!(
+            linked.summary.symlink_target_kind,
+            Some(FileEntryKind::File)
+        );
     }
 
     struct TestDirectory(PathBuf);
@@ -1174,9 +1188,7 @@ mod tests {
     async fn list_snapshots_include_symlink_targets_and_keep_link_semantics() {
         let pool = crate::test_support::setup_test_db().await;
         let root = TestDirectory::new("list-links").await;
-        tokio::fs::create_dir(root.0.join("actual"))
-            .await
-            .unwrap();
+        tokio::fs::create_dir(root.0.join("actual")).await.unwrap();
         tokio::fs::write(root.0.join("start.sh"), b"echo test")
             .await
             .unwrap();
@@ -1280,7 +1292,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(serde_json::to_value(cached.entries).unwrap(), json["entries"]);
+        assert_eq!(
+            serde_json::to_value(cached.entries).unwrap(),
+            json["entries"]
+        );
     }
 
     #[tokio::test]

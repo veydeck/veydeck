@@ -1,9 +1,15 @@
 //! Docker Compose 套件运行接口：安装、启停、卸载与入口代理。
 
 use crate::api::docker::context::DockerOperationContext;
+mod lifecycle;
+
+pub(crate) use lifecycle::reconcile_projects;
+use lifecycle::{apply_managed_suite, set_desired_state};
+
 use crate::api::suite_workloads;
 use crate::config;
 use crate::services::agent_runtime::CommandTransport;
+use crate::services::suite_lifecycle;
 use crate::state::AppState;
 use crate::types::{AgentError, ApiError, ApiResponse, ApiResult};
 use axum::body::Body;
@@ -297,6 +303,8 @@ pub async fn install_suite(
     validate_id("instance_id", &payload.instance_id)?;
     validate_project_name(&payload.compose_project_name)?;
     validate_agent_access(payload.agent_access.as_ref())?;
+    let _lifecycle = suite_lifecycle::change_guard()?;
+    let _project = suite_lifecycle::project_guard(&payload.compose_project_name).await;
     let log_metadata = install_log_metadata(&payload);
     upsert_install_progress(SuiteInstallProgress {
         suite_id: payload.suite_id.clone(),
@@ -522,6 +530,10 @@ async fn install_suite_inner(
     .execute(&state.metadata_db)
     .await?;
 
+    if payload.agent_access.is_some() {
+        sqlx::query("INSERT INTO suite_lifecycle (project_name) VALUES (?)")
+            .bind(&payload.compose_project_name).execute(&state.metadata_db).await?;
+    }
     Ok(())
 }
 
@@ -581,14 +593,18 @@ pub async fn enable_suite(
     Json(payload): Json<SuiteActionRequest>,
 ) -> ApiResult<Response> {
     validate_suite_project(&project, &payload.compose_project_name)?;
-    ensure_suite_network(&state).await?;
-    rotate_suite_runtime_token(&project, true).await?;
-    let compose_file = suite_project_dir(&project).join(COMPOSE_FILE_NAME);
-    let result =
-        run_compose_command(&payload.compose_project_name, &compose_file, &["up", "-d"]).await;
+    let _lifecycle = suite_lifecycle::change_guard()?;
+    let _project = suite_lifecycle::project_guard(&project).await;
     let result = async {
-        result?;
-        wait_for_suite_entries_ready(&state, &project, &payload.compose_project_name).await
+        if read_suite_metadata(&project).await?.agent_access.is_some() {
+            set_desired_state(&state, &project, true).await?;
+            apply_managed_suite(&state, &project).await?;
+        } else {
+            ensure_suite_network(&state).await?;
+            let compose_file = suite_project_dir(&project).join(COMPOSE_FILE_NAME);
+            run_compose_command(&project, &compose_file, &["up", "-d"]).await?;
+        }
+        wait_for_suite_entries_ready(&state, &project, &project).await
     }
     .await;
     let error = result.as_ref().err().map(ToString::to_string);
@@ -617,13 +633,26 @@ pub async fn disable_suite(
     Json(payload): Json<SuiteActionRequest>,
 ) -> ApiResult<Response> {
     validate_suite_project(&project, &payload.compose_project_name)?;
-    let compose_file = suite_project_dir(&project).join(COMPOSE_FILE_NAME);
+    let _lifecycle = suite_lifecycle::change_guard()?;
+    let _project = suite_lifecycle::project_guard(&project).await;
     let result = async {
-        rotate_suite_runtime_token(&project, false).await?;
-        let docker = state.docker_client().await?;
-        suite_workloads::cleanup_suite_workloads_by_instance(&docker, &payload.suite_instance_id)
+        if read_suite_metadata(&project).await?.agent_access.is_some() {
+            set_desired_state(&state, &project, false).await?;
+            apply_managed_suite(&state, &project).await
+        } else {
+            let docker = state.docker_client().await?;
+            suite_workloads::cleanup_suite_workloads_by_instance(
+                &docker,
+                &payload.suite_instance_id,
+            )
             .await?;
-        run_compose_command(&payload.compose_project_name, &compose_file, &["stop"]).await
+            run_compose_command(
+                &project,
+                &suite_project_dir(&project).join(COMPOSE_FILE_NAME),
+                &["stop"],
+            )
+            .await
+        }
     }
     .await;
     let error = result.as_ref().err().map(ToString::to_string);
@@ -652,7 +681,12 @@ pub async fn uninstall_suite(
     Json(payload): Json<SuiteActionRequest>,
 ) -> ApiResult<Response> {
     validate_suite_project(&project, &payload.compose_project_name)?;
+    let _lifecycle = suite_lifecycle::change_guard()?;
+    let _project = suite_lifecycle::project_guard(&project).await;
     let result = async {
+        if read_suite_metadata(&project).await?.agent_access.is_some() {
+            set_desired_state(&state, &project, false).await?;
+        }
         rotate_suite_runtime_token(&project, false).await?;
         let docker = state.docker_client().await?;
         suite_workloads::cleanup_suite_workloads_by_instance(&docker, &payload.suite_instance_id)
@@ -1212,7 +1246,7 @@ async fn prepare_suite_runtime_files(
         capabilities: access.capabilities.clone(),
         runtime_images: payload.runtime_images.clone(),
         token_hash: hash_access_token(&token),
-        enabled: true,
+        enabled: false,
     }))
 }
 
@@ -1228,7 +1262,13 @@ async fn write_suite_runtime_descriptor(
         .map_err(|err| ApiError::Internal(format!("failed to load agent identity: {err}")))?;
     let endpoint = match runtime.command_transport {
         CommandTransport::Uds => SuiteRuntimeEndpoint::Unix {
-            socket_path: "/run/veydeck-agent.sock".to_string(),
+            socket_path: format!(
+                "/run/veydeck-agent-socket/{}",
+                veydeck_contracts::types::agent_socket_path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| ApiError::Internal("invalid socket filename".into()))?
+            ),
             base_url: "http://local".to_string(),
         },
         CommandTransport::Https => SuiteRuntimeEndpoint::Https {
@@ -1271,33 +1311,52 @@ async fn write_suite_runtime_override(
     access: &SuiteAgentAccess,
     transport: CommandTransport,
 ) -> ApiResult<()> {
-    let runtime_mount = serde_json::to_string(&format!(
-        "{}:/run/veydeck-agent:ro",
-        runtime_dir.to_string_lossy()
-    ))
-    .map_err(|err| ApiError::Internal(err.to_string()))?;
-    let socket_mount = serde_json::to_string(&format!(
-        "{}:/run/veydeck-agent.sock",
-        veydeck_contracts::types::agent_socket_path().to_string_lossy()
-    ))
-    .map_err(|err| ApiError::Internal(err.to_string()))?;
-    let mut output = String::from("services:\n");
-    for service in &access.services {
-        output.push_str(&format!(
-            "  {service}:\n    environment:\n      VEYDECK_SUITE_ID: {}\n      VEYDECK_SUITE_INSTANCE_ID: {}\n      VEYDECK_AGENT_RUNTIME: /run/veydeck-agent/runtime.json\n    volumes:\n      - {runtime_mount}\n",
-            payload.suite_id, payload.instance_id
-        ));
-        match transport {
-            CommandTransport::Uds => {
-                output.push_str(&format!("      - {socket_mount}\n"));
+    let compose: serde_yaml::Value =
+        serde_yaml::from_str(&tokio::fs::read_to_string(dir.join(COMPOSE_FILE_NAME)).await?)
+            .map_err(|error| ApiError::Internal(error.to_string()))?;
+    let services = compose
+        .get("services")
+        .and_then(serde_yaml::Value::as_mapping)
+        .ok_or_else(|| ApiError::BadRequest("suite compose services are missing".into()))?;
+    let socket = veydeck_contracts::types::agent_socket_path();
+    let socket_dir = socket
+        .parent()
+        .ok_or_else(|| ApiError::Internal("socket directory is missing".into()))?;
+    let mut overrides = serde_json::Map::new();
+    for name in services.keys() {
+        let name = name
+            .as_str()
+            .ok_or_else(|| ApiError::BadRequest("invalid service name".into()))?;
+        let mut service = json!({"restart": "no", "labels": {"veydeck.agent.required": "true", "veydeck.suite.id": payload.suite_id, "veydeck.suite.instance": payload.instance_id}});
+        if access.services.iter().any(|item| item == name) {
+            let mut volumes = vec![json!({"type": "bind", "source": runtime_dir,
+                "target": "/run/veydeck-agent", "read_only": true, "bind": {"create_host_path": false}})];
+            if transport == CommandTransport::Uds {
+                volumes.push(json!({"type": "bind", "source": socket_dir,
+                    "target": "/run/veydeck-agent-socket", "read_only": true, "bind": {"create_host_path": false}}));
+            } else {
+                service["extra_hosts"] = json!(["host.docker.internal:host-gateway"]);
             }
-            CommandTransport::Https => {
-                output
-                    .push_str("    extra_hosts:\n      - \"host.docker.internal:host-gateway\"\n");
-            }
+            service["environment"] = json!({
+                "VEYDECK_SUITE_ID": payload.suite_id,
+                "VEYDECK_SUITE_INSTANCE_ID": payload.instance_id,
+                "VEYDECK_AGENT_RUNTIME": "/run/veydeck-agent/runtime.json"
+            });
+            service["volumes"] = json!(volumes);
+        }
+        overrides.insert(name.to_string(), service);
+    }
+    for name in &access.services {
+        if !overrides.contains_key(name) {
+            return Err(ApiError::BadRequest(format!(
+                "Agent access service does not exist: {name}"
+            )));
         }
     }
-    atomic_write(&dir.join(SUITE_RUNTIME_OVERRIDE_FILE), output.as_bytes()).await
+    // JSON 是 YAML 的子集，保留结构化编码避免路径与服务名转义错误。
+    let output = serde_json::to_vec_pretty(&json!({"services": overrides}))
+        .map_err(|error| ApiError::Internal(error.to_string()))?;
+    atomic_write(&dir.join(SUITE_RUNTIME_OVERRIDE_FILE), &output).await
 }
 
 fn validate_agent_access(access: Option<&SuiteAgentAccess>) -> ApiResult<()> {
@@ -1611,6 +1670,13 @@ fn command_error_detail(output: &std::process::Output) -> String {
 }
 
 async fn run_compose_command(project: &str, compose_file: &FsPath, args: &[&str]) -> ApiResult<()> {
+    compose_output(project, compose_file, args)
+        .await
+        .map(|_| ())
+}
+
+/// 执行有超时且取消时终止子进程的 Compose 操作。
+async fn compose_output(project: &str, compose_file: &FsPath, args: &[&str]) -> ApiResult<Vec<u8>> {
     if tokio::fs::metadata(compose_file).await.is_err() {
         return Err(ApiError::BadRequest(format!(
             "compose file does not exist: {}",
@@ -1632,7 +1698,16 @@ async fn run_compose_command(project: &str, compose_file: &FsPath, args: &[&str]
     if tokio::fs::metadata(&runtime_override).await.is_ok() {
         command.arg("-f").arg(&runtime_override);
     }
-    let output = command.args(["-p", project]).args(args).output().await?;
+    let output = timeout(
+        Duration::from_secs(120),
+        command
+            .kill_on_drop(true)
+            .args(["-p", project])
+            .args(args)
+            .output(),
+    )
+    .await
+    .map_err(|_| ApiError::Internal("suite Compose operation timed out".into()))??;
 
     if !output.status.success() {
         let detail = command_error_detail(&output);
@@ -1649,7 +1724,7 @@ async fn run_compose_command(project: &str, compose_file: &FsPath, args: &[&str]
             "suite compose command failed: {detail}"
         )));
     }
-    Ok(())
+    Ok(output.stdout)
 }
 
 #[cfg(test)]

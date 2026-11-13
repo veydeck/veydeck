@@ -25,9 +25,24 @@ pub fn agent_socket_path() -> PathBuf {
         return PathBuf::from(value);
     }
     if use_production_layout() {
-        production_home().join("run/veydeck-agent.sock")
+        env::var_os("VEYDECK_RUN_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| production_home().join("run"))
+            .join("agent/agent.sock")
     } else {
-        dev_base_dir().join("veydeck-agent.sock")
+        dev_base_dir().join("run/agent/agent.sock")
+    }
+}
+
+/// Agent 生命周期锁路径，不放入容器可见的通信目录。
+pub fn agent_lifecycle_lock_path() -> PathBuf {
+    if use_production_layout() {
+        env::var_os("VEYDECK_RUN_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| production_home().join("run"))
+            .join(".agent-lifecycle.lock")
+    } else {
+        dev_base_dir().join("run/.agent-lifecycle.lock")
     }
 }
 

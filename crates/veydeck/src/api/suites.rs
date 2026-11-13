@@ -1580,6 +1580,66 @@ pub async fn enable_instance(
     Ok(ApiResponse::success_with_raw("Suite enabled", enabled).into_response())
 }
 
+/// 接受节点执行结果并同步入口；错误不丢失已持久化的启停意图。
+pub(crate) async fn apply_runtime_suite_state(
+    state: &Arc<AppState>,
+    node: &str,
+    report: &veydeck_contracts::suite_lifecycle::SuiteStateReport,
+) -> ApiResult<()> {
+    let instance = fetch_instance(&state.metadata_db, &report.instance_id)
+        .await?
+        .filter(|instance| {
+            instance.node_id == node && instance.compose_project_name == report.compose_project_name
+        })
+        .ok_or_else(|| ApiError::BadRequest("suite report does not belong to this node".into()))?;
+    // 卸载请求负责收尾，后台结果不能重新创建已移除的应用入口。
+    if instance.status == "uninstalling" {
+        return Err(ApiError::BadRequest(
+            "suite uninstall is still in progress".into(),
+        ));
+    }
+    let status = if report.error.is_some() {
+        "error"
+    } else if report.desired_enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    if report.error.is_none() && instance.status != status {
+        let (manifest, _) = fetch_package_payload(&state.metadata_db, &instance.package_id)
+            .await?
+            .ok_or_else(|| ApiError::BadRequest("suite package is missing".into()))?;
+        if report.desired_enabled {
+            let entries = build_app_entry_records(
+                &instance,
+                &manifest.metadata.icon,
+                &manifest.app_entries,
+                &manifest,
+                None,
+            );
+            replace_instance_app_entries(&state.metadata_db, &instance.instance_id, &entries)
+                .await?;
+        } else {
+            let ids = build_suite_app_ids(&instance.instance_id, &manifest.app_entries);
+            hide_suite_desktop_apps(&state.metadata_db, &instance.node_id, &ids).await?;
+            delete_instance_app_entries(&state.metadata_db, &instance.instance_id).await?;
+        }
+    }
+    update_instance_status(
+        &state.metadata_db,
+        &instance.instance_id,
+        status,
+        report.error.as_deref(),
+    )
+    .await?;
+    sqlx::query("UPDATE suite_instances SET enabled=? WHERE instance_id=?")
+        .bind(report.desired_enabled)
+        .bind(&instance.instance_id)
+        .execute(&state.metadata_db)
+        .await?;
+    Ok(())
+}
+
 /// 停用套件实例并隐藏应用入口。
 pub async fn disable_instance(
     State(state): State<Arc<AppState>>,

@@ -866,6 +866,17 @@ async fn execute_container_action(
             .inspect_container(id, None::<query_parameters::InspectContainerOptions>)
             .await?;
         name = display_container_name(&inspect, id);
+        let labels = inspect.config.as_ref().and_then(|config| config.labels.as_ref());
+        let project = labels.and_then(|labels| labels.get("com.docker.compose.project"));
+        let registered_suite = if let Some(project) = project {
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM docker_compose_projects WHERE name=? AND management_kind='suite')")
+                .bind(project).fetch_one(&state.metadata_db).await?
+        } else { false };
+        if registered_suite || labels.is_some_and(|labels| labels.get("veydeck.owner").map(String::as_str) == Some("suite")
+            || labels.get("veydeck.agent.required").map(String::as_str) == Some("true")) {
+            return Err(ApiError::BadRequest("Manage suite container lifecycles through the suite center".into()));
+        }
+
         let current_state = state_from_value(
             inspect
                 .state

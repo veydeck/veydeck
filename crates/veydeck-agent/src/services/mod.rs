@@ -23,6 +23,7 @@ pub mod runtime_logs;
 pub mod script_runs;
 pub mod script_terminal;
 pub mod settings;
+pub mod suite_lifecycle;
 pub mod system_metrics;
 pub mod system_monitoring;
 mod system_monitoring_resources;

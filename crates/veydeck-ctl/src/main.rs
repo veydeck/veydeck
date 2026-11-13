@@ -1,6 +1,8 @@
 //! `veydeckctl` 命令行工具，用于管理和操作 Veydeck 服务。
 //! 支持服务的停止、重启、状态查询、系统信息展示及服务的卸载等操作。
 
+mod agent_dependencies;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rusqlite::OpenFlags;
@@ -83,6 +85,9 @@ enum Commands {
         /// 是否清理所有相关数据目录
         #[arg(long)]
         purge: bool,
+        /// 仅检查卸载条件，不停止服务或删除文件。
+        #[arg(long, conflicts_with = "purge")]
+        check: bool,
     },
     /// 管理 veydeckctl 自身
     #[command(name = "self")]
@@ -213,7 +218,7 @@ fn normalize_listen_host(host: &str) -> String {
 /// 打印命令行工具用法。
 fn print_usage() {
     eprintln!(
-        "Usage:\n  veydeckctl stop [veydeck|agent]\n  veydeckctl restart <veydeck|agent>\n  veydeckctl status\n  veydeckctl info\n  veydeckctl passwd [--username <username>] [password]\n  veydeckctl user --username <username>\n  veydeckctl entry [--regenerate|--set <entry>|--disable]\n  veydeckctl uninstall [--purge]\n  veydeckctl self uninstall"
+        "Usage:\n  veydeckctl stop [veydeck|agent]\n  veydeckctl restart <veydeck|agent>\n  veydeckctl status\n  veydeckctl info\n  veydeckctl passwd [--username <username>] [password]\n  veydeckctl user --username <username>\n  veydeckctl entry [--regenerate|--set <entry>|--disable]\n  veydeckctl uninstall [--purge|--check]\n  veydeckctl self uninstall"
     );
 }
 
@@ -448,7 +453,7 @@ impl Context {
 
         let agent_socket = std::env::var("VEYDECK_AGENT_SOCKET")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| run_dir.join("veydeck-agent.sock"));
+            .unwrap_or_else(|_| run_dir.join("agent/agent.sock"));
 
         Ok(Self {
             veydeck_home,
@@ -1091,9 +1096,49 @@ fn run_app(cli: Cli, context: Context) -> Result<()> {
         } => {
             context.entry(regenerate, set, disable)?;
         }
-        Commands::Uninstall { purge } => {
+        Commands::Uninstall { purge, check } => {
+            // 整个事务以 root 身份持锁，避免 sudo 子命令之间出现检查窗口。
+            if context.use_sudo {
+                let status = std::process::Command::new("sudo")
+                    .arg("env")
+                    .arg(format!("VEYDECK_HOME={}", context.veydeck_home.display()))
+                    .arg(format!(
+                        "VEYDECK_CONFIG_DIR={}",
+                        context.config_dir.display()
+                    ))
+                    .arg(format!("VEYDECK_DB_DIR={}", context.db_dir.display()))
+                    .arg(format!("VEYDECK_LOG_DIR={}", context.log_dir.display()))
+                    .arg(format!("VEYDECK_RUN_DIR={}", context.run_dir.display()))
+                    .arg(format!(
+                        "VEYDECK_AGENT_SOCKET={}",
+                        context.agent_socket.display()
+                    ))
+                    .arg(std::env::current_exe()?)
+                    .args(std::env::args_os().skip(1))
+                    .status()?;
+                if !status.success() {
+                    anyhow::bail!("Uninstall did not complete");
+                }
+                return Ok(());
+            }
             let role = context.detect_node_role();
             let targets = select_uninstall_targets(&role)?;
+            let _lifecycle = if targets.contains(&"agent") {
+                let guard = veydeck_contracts::agent_lifecycle::acquire(
+                    &context.run_dir.join(".agent-lifecycle.lock"),
+                    true,
+                )?;
+                agent_dependencies::ensure_clear(&context)?;
+                Some(guard)
+            } else {
+                None
+            };
+
+            if check {
+                context.ensure_uninstall_allowed(&targets)?;
+                println!("veydeckctl: uninstall checks passed; services and data were not modified");
+                return Ok(());
+            }
             run_uninstall_sequence(
                 &targets,
                 purge,

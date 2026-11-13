@@ -146,6 +146,17 @@ async fn require_runtime_node(
         .node_id)
 }
 
+/// 校验节点归属后同步执行结果，不在 Master 重复执行恢复动作。
+async fn report_suite_state(
+    State(state): State<Arc<AppState>>,
+    Json(report): Json<veydeck_contracts::suite_lifecycle::SuiteStateReport>,
+) -> ApiResult<Response> {
+    let node =
+        require_runtime_node(&state.metadata_db, &report.agent_id, &report.session_id).await?;
+    crate::api::suites::apply_runtime_suite_state(&state, &node, &report).await?;
+    Ok(ApiResponse::ok("Suite state reported").into_response())
+}
+
 /// 将 Master 内部镜像任务转换为稳定的运行时契约。
 fn runtime_image_task(task: crate::services::image_acquisition::ImageTask) -> RuntimeImageTask {
     use crate::services::image_acquisition::{ImageSource, ImageStage, ImageTaskStatus};
@@ -1076,6 +1087,7 @@ pub fn runtime_router() -> Router<Arc<AppState>> {
         .route("/scheduled-tasks/runs/report", post(report_task_runs))
         .route("/script-runs/report", post(report_script_runs))
         .route("/operation-events/report", post(report_operation_events))
+        .route("/suites/state/report", post(report_suite_state))
         .route("/docker/image-tasks", post(create_runtime_image_task))
         .route(
             "/docker/image-tasks/{task_id}",

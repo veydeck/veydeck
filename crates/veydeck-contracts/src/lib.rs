@@ -1,5 +1,6 @@
 //! 共享契约：统一维护前后端与节点间的 DTO、错误码与埋点模型。
 
+pub mod agent_lifecycle;
 pub mod api;
 pub mod auth;
 pub mod disks;
@@ -13,6 +14,7 @@ pub mod runtime_docker;
 pub mod runtime_logs;
 pub mod scheduled_tasks;
 pub mod scripts;
+pub mod suite_lifecycle;
 pub mod suite_resources;
 pub mod telemetry;
 pub mod terminal;

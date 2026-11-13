@@ -154,6 +154,7 @@ async fn start_workload(
     headers: HeaderMap,
     Json(payload): Json<StartWorkloadRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    let _lifecycle = crate::services::suite_lifecycle::change_guard()?;
     let principal = require_suite_capability(&headers, "workloads.manage").await?;
     validate_workload_request(&payload, &principal.runtime_images)?;
     ensure_workload_ports_available(&payload.ports).await?;

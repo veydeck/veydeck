@@ -54,7 +54,7 @@ fn controller_api_router() -> Router<Arc<AppState>> {
 }
 
 /// 按 principal 边界组装 Agent API，避免通过 URI 字符串推断授权方式。
-fn state_api_router(state: Arc<AppState>) -> Router {
+pub(crate) fn state_api_router(state: Arc<AppState>) -> Router {
     let controller_routes = controller_api_router().layer(axum::middleware::from_fn_with_state(
         Arc::clone(&state),
         require_command_credential,
@@ -78,6 +78,7 @@ pub async fn create_router() -> Result<(
     Router,
     DbPool,
     Arc<crate::services::controller_runtime::ControllerRuntime>,
+    Arc<AppState>,
 )> {
     // 建立数据库连接池。
     let pool = db::establish_connection().await?;
@@ -170,7 +171,7 @@ pub async fn create_router() -> Result<(
             10 * 1024 * 1024 * 1024, /* 10GB */
         ));
 
-    Ok((router, pool_for_shutdown, controller_runtime))
+    Ok((router, pool_for_shutdown, controller_runtime, app_state))
 }
 
 /// 校验 Master→Agent 管理请求；该中间件只挂载于 Controller 路由。

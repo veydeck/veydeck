@@ -30,6 +30,7 @@ struct ControllerSession {
 #[derive(Clone, Default)]
 pub struct ControllerRuntime {
     session: Arc<RwLock<Option<ControllerSession>>>,
+    suite_reports: Arc<RwLock<std::collections::HashMap<String, (String, std::time::Instant)>>>,
 }
 
 impl ControllerRuntime {
@@ -40,6 +41,7 @@ impl ControllerRuntime {
 
     /// 发布新建立的活动会话。
     pub async fn set_session(&self, veydeck_url: &str, agent_id: &str, session_id: &str) {
+        self.suite_reports.write().await.clear();
         *self.session.write().await = Some(ControllerSession {
             veydeck_url: veydeck_url.to_string(),
             agent_id: agent_id.to_string(),
@@ -50,6 +52,59 @@ impl ControllerRuntime {
     /// 清除已失效的活动会话。
     pub async fn clear_session(&self) {
         *self.session.write().await = None;
+    }
+
+    /// 回报持久化意图的执行结果；变化立即回报，相同结果每 30 秒校准一次，离线不影响本地恢复。
+    pub async fn report_suite_state(
+        &self,
+        instance: &str,
+        project: &str,
+        enabled: bool,
+        error: Option<String>,
+    ) -> anyhow::Result<()> {
+        let Some(session) = self.session.read().await.clone() else {
+            return Ok(());
+        };
+        let signature = serde_json::to_string(&(session.session_id.clone(), enabled, &error))?;
+        if self
+            .suite_reports
+            .read()
+            .await
+            .get(project)
+            .is_some_and(|(previous, sent)| {
+                previous == &signature && sent.elapsed() < Duration::from_secs(30)
+            })
+        {
+            return Ok(());
+        }
+        let response = tls_client_builder()?
+            .connect_timeout(CONTROLLER_CONNECT_TIMEOUT)
+            .timeout(CONTROLLER_REQUEST_TIMEOUT)
+            .build()?
+            .post(format!(
+                "{}/api/v1/runtime/suites/state/report",
+                session.veydeck_url.trim_end_matches('/')
+            ))
+            .json(&veydeck_contracts::suite_lifecycle::SuiteStateReport {
+                agent_id: session.agent_id,
+                session_id: session.session_id,
+                instance_id: instance.to_string(),
+                compose_project_name: project.to_string(),
+                desired_enabled: enabled,
+                error,
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        let response = response.json::<ApiResponse<serde_json::Value>>().await?;
+        if !response.success {
+            return Err(anyhow!(response.message));
+        }
+        self.suite_reports
+            .write()
+            .await
+            .insert(project.to_string(), (signature, std::time::Instant::now()));
+        Ok(())
     }
 
     /// 通过 Master 为当前子节点准备镜像，并持续回传任务快照。

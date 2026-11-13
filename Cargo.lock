@@ -4914,6 +4914,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
  "shadow-rs",
  "sqlx",
@@ -4977,6 +4978,8 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "toml",
+ "veydeck-contracts",
 ]
 
 [[package]]
