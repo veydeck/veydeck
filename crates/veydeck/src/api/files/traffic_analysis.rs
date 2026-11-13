@@ -403,7 +403,7 @@ mod tests {
         };
         let pool = crate::test_support::setup_test_db().await;
         let manifest: SuiteManifest = serde_json::from_value(json!({
-            "apiVersion": "veydeck.io/v1alpha1", "kind": "ComposeSuite",
+            "kind": "ComposeSuite",
             "metadata": {"suiteId": SUITE_ID, "slug": "packet", "version": "1.0.0", "name": "流量解析", "icon": "assets/icon.png", "minVeydeckVersion": "0.1.0"},
             "compatibility": {"platformContractVersion": 1},
             "runtime": {"type": "compose", "composeFile": "compose.yaml"},

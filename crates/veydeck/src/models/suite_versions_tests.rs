@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 /// 构造具有版本专属入口和资源的套件包。
 fn fixture(version: &str) -> (SuiteManifest, SuitePackageSnapshot) {
     let manifest = serde_json::from_value(serde_json::json!({
-        "apiVersion": "veydeck.io/v1alpha1", "kind": "ComposeSuite",
+        "kind": "ComposeSuite",
         "metadata": {
             "suiteId": "versioned-suite", "slug": "versioned-suite", "version": version,
             "name": format!("套件 {version}"), "icon": "assets/icon.png",

@@ -11,7 +11,6 @@ use veydeck_contracts::api::ErrorCode;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SuiteManifest {
-    pub api_version: String,
     pub kind: String,
     pub metadata: SuiteManifestInfo,
     pub compatibility: SuiteCompatibility,
@@ -1201,7 +1200,6 @@ mod install_task_tests {
     async fn catalog_counts_instances_across_all_nodes() {
         let pool = setup_test_db().await;
         let manifest = serde_json::json!({
-            "apiVersion": "veydeck.io/v1alpha1",
             "kind": "Suite",
             "metadata": {
                 "suiteId": "suite-count",

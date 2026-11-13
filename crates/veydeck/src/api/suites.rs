@@ -2044,11 +2044,6 @@ fn strip_common_package_root(files: &mut [SuitePackageFile]) {
 }
 
 fn validate_manifest(manifest: &SuiteManifest, files: &[SuitePackageFile]) -> ApiResult<()> {
-    if manifest.api_version != "veydeck.io/v1alpha1" {
-        return Err(ApiError::BadRequest(
-            "suite apiVersion must be veydeck.io/v1alpha1".to_string(),
-        ));
-    }
     if manifest.kind != "ComposeSuite" {
         return Err(ApiError::BadRequest(
             "suite kind must be ComposeSuite".to_string(),
@@ -2748,7 +2743,6 @@ mod suite_asset_tests {
     fn agent_access_requires_known_capabilities_and_existing_services() {
         let manifest = serde_yaml::from_str::<SuiteManifest>(
             r#"
-apiVersion: veydeck.io/v1alpha1
 kind: ComposeSuite
 metadata:
   suiteId: suite.example
